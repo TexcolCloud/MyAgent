@@ -61,7 +61,13 @@ interface CompletedAttempt {
 }
 
 export class AdvanceRunService {
+  private readonly activeAbortSafety = new Map<RunId, boolean>();
+
   constructor(private readonly options: AdvanceRunServiceOptions) {}
+
+  isAbortSafe(runId: RunId): boolean {
+    return this.activeAbortSafety.get(runId) ?? true;
+  }
 
   async advance(
     runId: RunId,
@@ -113,6 +119,7 @@ export class AdvanceRunService {
         { skillName: string; skillVersion: number; contentSha256: string }
       >();
       let result;
+      this.activeAbortSafety.set(runId, latestTool.effect !== "side_effect");
       try {
         result = await definition.execute(latestTool.arguments, {
           agentId: context.run.agentId,
@@ -131,8 +138,17 @@ export class AdvanceRunService {
             });
           },
         });
-      } catch (error) {
-        result = { ok: false, summary: error instanceof Error ? error.message : "tool_execution_failed", content: {}, capturedBytes: 0, truncated: false };
+      } catch {
+        if (signal.aborted) throw signal.reason;
+        result = {
+          ok: false,
+          summary: "tool_execution_failed",
+          content: { code: "tool_execution_failed" },
+          capturedBytes: 0,
+          truncated: false,
+        };
+      } finally {
+        this.activeAbortSafety.delete(runId);
       }
       this.options.tools.completeExecution({
         runId, toolCallId: latestTool.toolCallId, leaseOwner, result,
@@ -141,6 +157,9 @@ export class AdvanceRunService {
         maxRunToolOutputBytes: context.revision.limits.maxRunToolOutputBytes,
         occurredAt: this.options.clock.now(),
       });
+      if (this.options.runs.getRun(runId).state === "failed") {
+        return { type: "terminal", runId, state: "failed" };
+      }
       return { type: "advanced", runId };
     }
     if (latestTool?.state === "waiting_approval") {
@@ -273,74 +292,15 @@ export class AdvanceRunService {
         modelTurnLimit: context.revision.limits.modelTurns,
         occurredAt: this.options.clock.now(),
       });
+      let completed: CompletedAttempt;
       try {
-        const completed = await this.collectAttempt(
+        completed = await this.collectAttempt(
           runId,
           leaseOwner,
           attemptId,
           request,
           signal,
         );
-        if (completed.toolCall !== undefined) {
-          if (context.run.budget.toolCalls >= context.revision.limits.toolCalls) {
-            const occurredAt = this.options.clock.now();
-            this.options.runs.failModelAttempt({
-              runId,
-              leaseOwner,
-              attemptId,
-              code: "run_budget_exceeded",
-              transient: false,
-              occurredAt,
-            });
-            return this.failForBudget(runId, leaseOwner, occurredAt);
-          }
-          const proposal = await normalizeToolProposal({
-            registry: this.options.registry,
-            toolName: completed.toolCall.name,
-            arguments: completed.toolCall.arguments,
-            context: {
-              agentId: context.run.agentId,
-              revision: context.revision,
-            },
-          });
-          const decision = this.options.policy.decide({
-            agentId: context.run.agentId,
-            toolName: proposal.toolName,
-            policy: context.revision.policy,
-            policyFacts: proposal.policyFacts,
-          });
-          this.options.tools.recordProposal({
-            runId,
-            leaseOwner,
-            toolCallId: this.options.ids.toolCallId(),
-            toolName: proposal.toolName,
-            effect: proposal.effect,
-            arguments: proposal.arguments,
-            canonicalArguments: proposal.canonicalArguments,
-            argumentsSha256: proposal.argumentsSha256,
-            policyFacts: proposal.policyFacts,
-            policyEffect: decision.effect,
-            matchedRule: decision.matchedRule,
-            toolCallLimit: context.revision.limits.toolCalls,
-            ...(decision.effect === "ask" ? {
-              approvalId: this.options.ids.approvalId(),
-              approvalExpiresAt: new Date(this.options.clock.now().getTime() + 24 * 60 * 60 * 1_000),
-            } : {}),
-            occurredAt: this.options.clock.now(),
-          });
-          if (decision.effect === "ask") {
-            return { type: "waiting", runId, state: "waiting_approval" };
-          }
-          return { type: "advanced", runId };
-        }
-        const run = this.options.runs.completeRun({
-          runId,
-          leaseOwner,
-          attemptId,
-          ...completed,
-          occurredAt: this.options.clock.now(),
-        });
-        return { type: "terminal", runId, state: run.state as "completed" };
       } catch (error) {
         if (signal.aborted) {
           throw signal.reason;
@@ -370,7 +330,68 @@ export class AdvanceRunService {
           retryDelay(attemptNumber, providerError.retryAfterMs),
           signal,
         );
+        continue;
       }
+      if (completed.toolCall !== undefined) {
+        if (context.run.budget.toolCalls >= context.revision.limits.toolCalls) {
+          const occurredAt = this.options.clock.now();
+          this.options.runs.failModelAttempt({
+            runId,
+            leaseOwner,
+            attemptId,
+            code: "run_budget_exceeded",
+            transient: false,
+            occurredAt,
+          });
+          return this.failForBudget(runId, leaseOwner, occurredAt);
+        }
+        const proposal = await normalizeToolProposal({
+          registry: this.options.registry,
+          toolName: completed.toolCall.name,
+          arguments: completed.toolCall.arguments,
+          context: {
+            agentId: context.run.agentId,
+            revision: context.revision,
+          },
+        });
+        const decision = this.options.policy.decide({
+          agentId: context.run.agentId,
+          toolName: proposal.toolName,
+          policy: context.revision.policy,
+          policyFacts: proposal.policyFacts,
+        });
+        this.options.tools.recordProposal({
+          runId,
+          leaseOwner,
+          toolCallId: this.options.ids.toolCallId(),
+          toolName: proposal.toolName,
+          effect: proposal.effect,
+          arguments: proposal.arguments,
+          canonicalArguments: proposal.canonicalArguments,
+          argumentsSha256: proposal.argumentsSha256,
+          policyFacts: proposal.policyFacts,
+          policyEffect: decision.effect,
+          matchedRule: decision.matchedRule,
+          toolCallLimit: context.revision.limits.toolCalls,
+          ...(decision.effect === "ask" ? {
+            approvalId: this.options.ids.approvalId(),
+            approvalExpiresAt: new Date(this.options.clock.now().getTime() + 24 * 60 * 60 * 1_000),
+          } : {}),
+          occurredAt: this.options.clock.now(),
+        });
+        if (decision.effect === "ask") {
+          return { type: "waiting", runId, state: "waiting_approval" };
+        }
+        return { type: "advanced", runId };
+      }
+      const run = this.options.runs.completeRun({
+        runId,
+        leaseOwner,
+        attemptId,
+        ...completed,
+        occurredAt: this.options.clock.now(),
+      });
+      return { type: "terminal", runId, state: run.state as "completed" };
     }
     throw new Error("unreachable_model_attempt_loop");
   }

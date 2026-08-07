@@ -12,6 +12,7 @@ export interface FakeToolOptions {
   policyFacts?: ToolPolicyFacts;
   result?: ToolResult;
   activateSkill?: string;
+  error?: unknown;
 }
 
 export class FakeTool implements ToolDefinition {
@@ -44,6 +45,9 @@ export class FakeTool implements ToolDefinition {
     this.executions += 1;
     if (this.options.activateSkill !== undefined) {
       context.activateSkill(this.options.activateSkill);
+    }
+    if (this.options.error !== undefined) {
+      throw this.options.error;
     }
     return this.options.result ?? {
       ok: true,

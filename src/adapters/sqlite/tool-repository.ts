@@ -133,9 +133,10 @@ export class SqliteToolRepository implements ToolStore {
         const active = this.db.prepare(
           `SELECT active_started_at FROM runs WHERE run_id = ?`,
         ).get(input.runId) as { active_started_at: string | null } | undefined;
-        const activeSeconds = active?.active_started_at === null || active === undefined
-          ? 0
-          : Math.ceil(Math.max(0, input.occurredAt.getTime() - new Date(active.active_started_at).getTime()) / 1_000);
+        const activeSeconds = elapsedActiveSeconds(
+          active?.active_started_at,
+          input.occurredAt,
+        );
         const waiting = this.db.prepare(
           `UPDATE runs SET state = 'waiting_approval', lease_owner = NULL, lease_expires_at = NULL,
              active_started_at = NULL, active_elapsed_seconds = active_elapsed_seconds + ?, updated_at = ?
@@ -193,8 +194,60 @@ export class SqliteToolRepository implements ToolStore {
     const occurredAt = input.occurredAt.toISOString();
     this.inImmediateTransaction(() => {
       this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
-      if (input.result.capturedBytes > input.maxToolOutputBytes) {
-        throw new DomainError("run_budget_exceeded");
+      const budget = this.db.prepare(
+        `SELECT tool_output_bytes, active_started_at FROM runs WHERE run_id = ?`,
+      ).get(input.runId) as {
+        tool_output_bytes: number;
+        active_started_at: string | null;
+      };
+      if (
+        input.result.capturedBytes > input.maxToolOutputBytes ||
+        budget.tool_output_bytes + input.result.capturedBytes > input.maxRunToolOutputBytes
+      ) {
+        const failureResult = {
+          ok: false,
+          summary: "run_budget_exceeded",
+          content: { code: "run_budget_exceeded" },
+          capturedBytes: 0,
+          truncated: true,
+        } as const;
+        const tool = this.db.prepare(
+          `UPDATE tool_calls SET state = 'failed', result_json = ?, updated_at = ?
+           WHERE tool_call_id = ? AND run_id = ? AND state = 'executing'`,
+        ).run(
+          canonicalize(failureResult),
+          occurredAt,
+          input.toolCallId,
+          input.runId,
+        );
+        if (tool.changes !== 1) throw new DomainError("tool_not_executing");
+        const activeSeconds = elapsedActiveSeconds(
+          budget.active_started_at,
+          input.occurredAt,
+        );
+        const run = this.db.prepare(
+          `UPDATE runs SET state = 'failed', failure_code = 'run_budget_exceeded',
+             active_elapsed_seconds = active_elapsed_seconds + ?, active_started_at = NULL,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+           WHERE run_id = ? AND state = 'running' AND lease_owner = ?`,
+        ).run(activeSeconds, occurredAt, input.runId, input.leaseOwner);
+        if (run.changes !== 1) throw new DomainError("run_lease_lost");
+        this.appendEvent(
+          input.runId,
+          "tool.failed",
+          canonicalize({
+            toolCallId: input.toolCallId,
+            capturedBytes: input.result.capturedBytes,
+          }),
+          occurredAt,
+        );
+        this.appendEvent(
+          input.runId,
+          "run.failed",
+          canonicalize({ code: "run_budget_exceeded" }),
+          occurredAt,
+        );
+        return;
       }
       const run = this.db.prepare(
         `UPDATE runs SET tool_output_bytes = tool_output_bytes + ?, updated_at = ?
@@ -264,15 +317,10 @@ export class SqliteToolRepository implements ToolStore {
       const active = this.db.prepare(
         `SELECT active_started_at FROM runs WHERE run_id = ?`,
       ).get(input.runId) as { active_started_at: string | null } | undefined;
-      const activeSeconds = active?.active_started_at === null || active === undefined
-        ? 0
-        : Math.ceil(
-            Math.max(
-              0,
-              input.occurredAt.getTime() -
-                new Date(active.active_started_at).getTime(),
-            ) / 1_000,
-          );
+      const activeSeconds = elapsedActiveSeconds(
+        active?.active_started_at,
+        input.occurredAt,
+      );
       this.db.prepare(
         `UPDATE runs SET state = 'waiting_reconciliation', lease_owner = NULL,
            lease_expires_at = NULL, active_started_at = NULL,
@@ -353,6 +401,16 @@ function canonicalize(value: unknown): string {
     throw new DomainError("value_not_canonicalizable");
   }
   return canonical;
+}
+
+function elapsedActiveSeconds(
+  activeStartedAt: string | null | undefined,
+  endedAt: Date,
+): number {
+  if (activeStartedAt === null || activeStartedAt === undefined) return 0;
+  return Math.ceil(
+    Math.max(0, endedAt.getTime() - new Date(activeStartedAt).getTime()) / 1_000,
+  );
 }
 
 function mapToolCall(row: ToolCallRow): ToolCall {

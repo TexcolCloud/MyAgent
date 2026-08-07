@@ -684,6 +684,218 @@ describe("AdvanceRunService", () => {
     }
   });
 
+  it("persists post-execution Tool output overflow as a failed Run", async () => {
+    const connection = openDatabase({
+      path: tempPath("advance-tool-output-overflow.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const snapshot = withLimits(catalogSnapshot, "tool-output-overflow", {
+        maxToolOutputBytes: 4,
+      });
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const tools = new SqliteToolRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000092")],
+        runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000092")],
+        toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000092")],
+        attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000092")],
+      });
+      const created = new CreateRunService(
+        new CatalogService(snapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:tool-output-overflow",
+        input: { type: "text", text: "read an oversized result" },
+        idempotencyKey: "advance-budget-0004",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const registry = new ToolRegistry();
+      registry.register(new FakeTool({
+        name: "read_file",
+        effect: "read_only",
+        normalizedArguments: { path: "report.md" },
+        policyFacts: { pathWithinWorkspace: true },
+        result: {
+          ok: true,
+          summary: "oversized",
+          content: { contents: "12345" },
+          capturedBytes: 5,
+          truncated: false,
+        },
+      }));
+      const model = new ScriptedModel();
+      model.script({
+        chunks: [
+          {
+            type: "tool_call",
+            call: { name: "read_file", arguments: { path: "report.md" } },
+          },
+          {
+            type: "completed",
+            finishReason: "tool_calls",
+            usage: { inputTokens: 10, outputTokens: 2 },
+          },
+        ],
+      });
+      const service = new AdvanceRunService({
+        runs,
+        tools,
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+      });
+
+      await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      );
+      expect(await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).toEqual({ type: "terminal", runId: created.runId, state: "failed" });
+      expect(runs.getRun(created.runId).state).toBe("failed");
+      expect(tools.getLatestForRun(created.runId)).toMatchObject({
+        state: "failed",
+        result: expect.objectContaining({
+          ok: false,
+          summary: "run_budget_exceeded",
+        }),
+      });
+      expect(runs.listEventsAfter(created.runId, 0)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "tool.failed" }),
+        expect.objectContaining({
+          type: "run.failed",
+          payload: { code: "run_budget_exceeded" },
+        }),
+      ]));
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("does not persist Tool exception details", async () => {
+    const connection = openDatabase({
+      path: tempPath("advance-tool-error-redaction.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const tools = new SqliteToolRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000093")],
+        runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000093")],
+        toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000093")],
+        attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000093")],
+      });
+      const created = new CreateRunService(
+        new CatalogService(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:tool-error-redaction",
+        input: { type: "text", text: "run a failing Tool" },
+        idempotencyKey: "advance-tool-error-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const secret = "resolved-secret-value";
+      const registry = new ToolRegistry();
+      registry.register(new FakeTool({
+        name: "read_file",
+        effect: "read_only",
+        normalizedArguments: { path: "report.md" },
+        policyFacts: { pathWithinWorkspace: true },
+        error: new Error(`adapter failed with ${secret}`),
+      }));
+      const model = new ScriptedModel();
+      model.script({
+        chunks: [
+          {
+            type: "tool_call",
+            call: { name: "read_file", arguments: { path: "report.md" } },
+          },
+          {
+            type: "completed",
+            finishReason: "tool_calls",
+            usage: { inputTokens: 10, outputTokens: 2 },
+          },
+        ],
+      });
+      const service = new AdvanceRunService({
+        runs,
+        tools,
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+      });
+
+      await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      );
+      await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      );
+
+      expect(tools.getLatestForRun(created.runId)).toMatchObject({
+        state: "failed",
+        result: {
+          ok: false,
+          summary: "tool_execution_failed",
+          content: { code: "tool_execution_failed" },
+          capturedBytes: 0,
+          truncated: false,
+        },
+      });
+      expect(JSON.stringify({
+        tool: tools.getLatestForRun(created.runId),
+        events: runs.listEventsAfter(created.runId, 0),
+      })).not.toContain(secret);
+    } finally {
+      connection.close();
+    }
+  });
+
   it("commits Skill activation with the Tool completion checkpoint", async () => {
     const connection = openDatabase({
       path: tempPath("advance-skill-activation.db"),
@@ -1059,6 +1271,101 @@ describe("AdvanceRunService", () => {
         .toHaveLength(3);
       expect(eventTypes.filter((type) => type === "model.attempt.failed"))
         .toHaveLength(1);
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("does not reclassify a proposal checkpoint failure as a provider failure", async () => {
+    const connection = openDatabase({
+      path: tempPath("advance-proposal-checkpoint-busy.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const durableTools = new SqliteToolRepository(connection.db);
+      const busyError = Object.assign(new Error("database is locked"), {
+        errcode: 5,
+      });
+      const tools: ToolStore = {
+        getLatestForRun: (runId) => durableTools.getLatestForRun(runId),
+        recordProposal: () => {
+          throw busyError;
+        },
+        beginExecution: (input) => durableTools.beginExecution(input),
+        completeExecution: (input) => durableTools.completeExecution(input),
+        recoverExecuting: (input) => durableTools.recoverExecuting(input),
+      };
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000151")],
+        runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000151")],
+        toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000151")],
+        attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000151")],
+      });
+      const created = new CreateRunService(
+        new CatalogService(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:proposal-checkpoint-busy",
+        input: { type: "text", text: "propose a Tool" },
+        idempotencyKey: "advance-proposal-busy-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const registry = new ToolRegistry();
+      registry.register(new FakeTool({
+        name: "read_file",
+        effect: "read_only",
+        normalizedArguments: { path: "report.md" },
+        policyFacts: { pathWithinWorkspace: true },
+      }));
+      const model = new ScriptedModel();
+      model.script({
+        chunks: [
+          {
+            type: "tool_call",
+            call: { name: "read_file", arguments: { path: "report.md" } },
+          },
+          {
+            type: "completed",
+            finishReason: "tool_calls",
+            usage: { inputTokens: 10, outputTokens: 2 },
+          },
+        ],
+      });
+      const service = new AdvanceRunService({
+        runs,
+        tools,
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+      });
+
+      await expect(service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).rejects.toBe(busyError);
+      expect(runs.getRun(created.runId).state).toBe("running");
+      expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
+        .not.toContain("run.failed");
     } finally {
       connection.close();
     }
