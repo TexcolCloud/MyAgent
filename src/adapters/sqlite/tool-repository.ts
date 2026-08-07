@@ -314,6 +314,12 @@ export class SqliteToolRepository implements ToolStore {
       this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
       const call = this.requireToolCall(input.toolCallId);
       if (call.state !== "executing") throw new DomainError("tool_not_executing");
+      if (call.toolName === "delegate_agent") {
+        this.db.prepare(
+          `UPDATE tool_calls SET state = 'allowed', updated_at = ? WHERE tool_call_id = ?`,
+        ).run(occurredAt, input.toolCallId);
+        return "retry";
+      }
       if (call.effect === "read_only" || call.effect === "internal") {
         this.db.prepare(
           `UPDATE tool_calls SET state = 'allowed', updated_at = ? WHERE tool_call_id = ?`,

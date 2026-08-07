@@ -17,6 +17,7 @@ import type {
   FailModelAttemptInput,
   RunExecutionContext,
   RunStore,
+  StartDelegationInput,
 } from "../../ports/run-store.js";
 import type { SqliteCatalogRepository } from "./catalog-repository.js";
 
@@ -148,6 +149,97 @@ export class SqliteRunRepository implements RunStore {
     });
   }
 
+  startDelegation(input: StartDelegationInput): {
+    childRunId: RunId;
+    childSessionId: SessionId;
+  } {
+    const occurredAt = input.occurredAt.toISOString();
+    return this.inImmediateTransaction(() => {
+      const existing = this.db.prepare(
+        `SELECT runs.run_id, runs.session_id
+         FROM runs JOIN sessions ON sessions.session_id = runs.session_id
+         WHERE runs.parent_run_id = ? AND sessions.session_key = ?`,
+      ).get(input.parentRunId, input.childSessionKey) as
+        | { run_id: string; session_id: string }
+        | undefined;
+      if (existing !== undefined) {
+        return {
+          childRunId: existing.run_id as RunId,
+          childSessionId: existing.session_id as SessionId,
+        };
+      }
+      this.assertCurrentLease(input.parentRunId, input.leaseOwner, occurredAt);
+      const parent = this.getExecutionContext(input.parentRunId);
+      if (parent.run.delegationDepth >= input.parentDelegationDepthLimit) {
+        throw new DomainError("delegation_depth_exceeded");
+      }
+      const executing = this.db.prepare(
+        `SELECT 1 FROM tool_calls
+         WHERE tool_call_id = ? AND run_id = ? AND tool_name = 'delegate_agent'
+           AND state = 'executing'`,
+      ).get(input.parentToolCallId, input.parentRunId);
+      if (executing === undefined) throw new DomainError("delegate_tool_not_executing");
+      const childCapacity = this.db.prepare(
+        `UPDATE runs SET child_run_count = child_run_count + 1, updated_at = ?
+         WHERE run_id = ? AND child_run_count < ?`,
+      ).run(occurredAt, input.rootRunId, input.parentChildRunLimit);
+      if (childCapacity.changes !== 1) {
+        throw new DomainError("delegation_count_exceeded");
+      }
+      this.catalog.save(input.targetRevision);
+      this.db.prepare(
+        `INSERT INTO sessions (
+          session_id, agent_id, session_key, agent_revision_id, owner_session_id,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        input.childSessionId, input.targetAgentId, input.childSessionKey,
+        input.targetRevision.revisionId, parent.run.sessionId, occurredAt, occurredAt,
+      );
+      const inputJson = canonicalize(input.input);
+      const requestDigest = createHash("sha256").update(canonicalize({
+        parentRunId: input.parentRunId,
+        parentToolCallId: input.parentToolCallId,
+        targetAgentId: input.targetAgentId,
+        input: input.input,
+      })).digest("hex");
+      this.db.prepare(
+        `INSERT INTO runs (
+          run_id, session_id, agent_revision_id, state, fifo_sequence,
+          parent_run_id, root_run_id, delegation_depth, request_digest,
+          input_json, created_at, updated_at
+        ) VALUES (?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        input.childRunId, input.childSessionId, input.targetRevision.revisionId,
+        input.parentRunId, input.rootRunId, input.parentDelegationDepth + 1,
+        requestDigest, inputJson, occurredAt, occurredAt,
+      );
+      this.db.prepare(
+        `INSERT INTO messages (
+          message_id, session_id, run_id, sequence, run_fifo_sequence,
+          role, content_json, created_at
+        ) VALUES (?, ?, ?, 0, 0, 'user', ?, ?)`,
+      ).run(`message:${input.childRunId}`, input.childSessionId, input.childRunId, inputJson, occurredAt);
+      this.insertQueuedEvent(input.childRunId, occurredAt);
+      const parentBlocked = this.db.prepare(
+        `UPDATE runs
+         SET blocked_by_child_run_id = ?, lease_owner = NULL, lease_expires_at = NULL,
+             active_elapsed_seconds = active_elapsed_seconds + ?, active_started_at = NULL,
+             updated_at = ?
+         WHERE run_id = ? AND state = 'running' AND lease_owner = ?`,
+      ).run(
+        input.childRunId, elapsedActiveSeconds(parent, input.occurredAt), occurredAt,
+        input.parentRunId, input.leaseOwner,
+      );
+      if (parentBlocked.changes !== 1) throw new DomainError("run_lease_lost");
+      this.appendEventInTransaction(input.parentRunId, "delegation.started", canonicalize({
+        toolCallId: input.parentToolCallId, childRunId: input.childRunId,
+        targetAgentId: input.targetAgentId,
+      }), occurredAt);
+      return { childRunId: input.childRunId, childSessionId: input.childSessionId };
+    });
+  }
+
   getRun(runId: RunId): Run {
     const row = this.db
       .prepare(
@@ -223,7 +315,8 @@ export class SqliteRunRepository implements RunStore {
                  )
              )
            ) OR (
-             candidate.state = 'running'
+           candidate.state = 'running'
+             AND candidate.blocked_by_child_run_id IS NULL
              AND (
                candidate.lease_expires_at IS NULL
                OR candidate.lease_expires_at <= ?
@@ -486,6 +579,7 @@ export class SqliteRunRepository implements RunStore {
          WHERE run_id = ? AND lease_owner = ?`,
       ).run(input.code, elapsedActiveSeconds(context, input.occurredAt), occurredAt, input.runId, input.leaseOwner);
       this.appendEventInTransaction(input.runId, "run.failed", canonicalize({ code: input.code }), occurredAt);
+      this.resumeParentFromChildInTransaction(input.runId, occurredAt);
       return this.getRun(input.runId);
     });
   }
@@ -546,6 +640,7 @@ export class SqliteRunRepository implements RunStore {
         canonicalize({ result: input.text }),
         occurredAt,
       );
+      this.resumeParentFromChildInTransaction(input.runId, occurredAt);
       return this.getRun(input.runId);
     });
   }
@@ -555,6 +650,38 @@ export class SqliteRunRepository implements RunStore {
     return this.inImmediateTransaction(() => {
       const run = this.getRun(input.runId);
       if (["completed", "failed", "cancelled"].includes(run.state)) return run;
+      const blocked = this.db.prepare(
+        `SELECT blocked_by_child_run_id FROM runs WHERE run_id = ?`,
+      ).get(input.runId) as { blocked_by_child_run_id: string | null } | undefined;
+      if (blocked?.blocked_by_child_run_id !== null && blocked !== undefined) {
+        const childId = blocked.blocked_by_child_run_id as RunId;
+        const child = this.getRun(childId);
+        if (!['completed', 'failed', 'cancelled'].includes(child.state)) {
+          if (child.state === 'running') {
+            this.db.prepare(
+              `UPDATE runs SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?),
+               updated_at = ? WHERE run_id = ? AND state = 'running'`,
+            ).run(occurredAt, occurredAt, childId);
+          } else {
+            this.db.prepare(
+              `UPDATE runs SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+               active_started_at = NULL, updated_at = ? WHERE run_id = ?`,
+            ).run(occurredAt, childId);
+            this.appendEventInTransaction(childId, 'run.cancelled', canonicalize({ requested: false }), occurredAt);
+          }
+        }
+        this.db.prepare(
+          `UPDATE tool_calls SET state = 'failed', result_json = ?, updated_at = ?
+           WHERE run_id = ? AND tool_name = 'delegate_agent' AND state = 'executing'`,
+        ).run(canonicalize({ ok: false, summary: 'run_cancelled', content: { code: 'run_cancelled' }, capturedBytes: 0, truncated: false }), occurredAt, input.runId);
+        this.db.prepare(
+          `UPDATE runs SET state = 'cancelled', blocked_by_child_run_id = NULL,
+           lease_owner = NULL, lease_expires_at = NULL, active_started_at = NULL,
+           updated_at = ? WHERE run_id = ?`,
+        ).run(occurredAt, input.runId);
+        this.appendEventInTransaction(input.runId, 'run.cancelled', canonicalize({ requested: true }), occurredAt);
+        return this.getRun(input.runId);
+      }
       if (run.state === "running") {
         this.db.prepare(
           `UPDATE runs SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), updated_at = ?
@@ -701,6 +828,48 @@ export class SqliteRunRepository implements RunStore {
       );
       return this.getRun(input.runId);
     });
+  }
+
+  private resumeParentFromChildInTransaction(childRunId: RunId, occurredAt: string): void {
+    const child = this.db.prepare(
+      `SELECT parent_run_id, state, output_json, failure_code FROM runs WHERE run_id = ?`,
+    ).get(childRunId) as {
+      parent_run_id: string | null; state: RunState; output_json: string | null; failure_code: string | null;
+    } | undefined;
+    if (child?.parent_run_id === null || child === undefined) return;
+    if (!["completed", "failed", "cancelled"].includes(child.state)) return;
+    const parent = this.db.prepare(
+      `SELECT cancellation_requested_at FROM runs
+       WHERE run_id = ? AND state = 'running' AND blocked_by_child_run_id = ?`,
+    ).get(child.parent_run_id, childRunId) as { cancellation_requested_at: string | null } | undefined;
+    if (parent === undefined) return;
+    const output = child.output_json === null
+      ? { code: child.failure_code ?? `child_${child.state}` }
+      : JSON.parse(child.output_json) as JsonValue;
+    const result = boundedDelegationResult(output);
+    const toolState = child.state === "completed" ? "succeeded" : "failed";
+    this.db.prepare(
+      `UPDATE tool_calls SET state = ?, result_json = ?, updated_at = ?
+       WHERE run_id = ? AND tool_name = 'delegate_agent' AND state = 'executing'`,
+    ).run(toolState, canonicalize({
+      ok: child.state === "completed", summary: "delegation_completed", content: {
+        childRunId, state: child.state, result,
+      }, capturedBytes: Buffer.byteLength(JSON.stringify(result), "utf8"), truncated: result.truncated,
+    }), occurredAt, child.parent_run_id);
+    const nextState = parent.cancellation_requested_at === null ? "queued" : "cancelled";
+    this.db.prepare(
+      `UPDATE runs SET state = ?, blocked_by_child_run_id = NULL,
+       lease_owner = NULL, lease_expires_at = NULL, active_started_at = NULL,
+       updated_at = ? WHERE run_id = ?`,
+    ).run(nextState, occurredAt, child.parent_run_id);
+    this.appendEventInTransaction(child.parent_run_id as RunId, "delegation.completed", canonicalize({
+      childRunId, state: child.state,
+    }), occurredAt);
+    if (nextState === "cancelled") {
+      this.appendEventInTransaction(child.parent_run_id as RunId, "run.cancelled", canonicalize({
+        requestedAt: parent.cancellation_requested_at,
+      }), occurredAt);
+    }
   }
 
   private findUnmatchedModelAttempt(runId: RunId): AttemptId | null {
@@ -961,6 +1130,20 @@ function canonicalize(value: unknown): string {
     throw new Error("value_not_canonicalizable");
   }
   return canonical;
+}
+
+function boundedDelegationResult(value: JsonValue): {
+  result: JsonValue;
+  truncated: boolean;
+} {
+  const serialized = JSON.stringify(value);
+  if (Buffer.byteLength(serialized, "utf8") <= 32_768) {
+    return { result: value, truncated: false };
+  }
+  return {
+    result: { truncated: true, preview: serialized.slice(0, 32_768) },
+    truncated: true,
+  };
 }
 
 function mapRun(row: RunRow): Run {

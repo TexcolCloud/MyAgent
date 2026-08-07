@@ -12,6 +12,7 @@ export interface ToolExecutionContext extends ToolNormalizeContext {
   runId: RunId;
   toolCallId: ToolCallId;
   signal: AbortSignal;
+  leaseOwner?: string;
   remainingRunOutputBytes: number;
   activateSkill(skillName: string): void;
 }
@@ -24,6 +25,7 @@ export interface ToolResult {
   content: JsonValue;
   capturedBytes: number;
   truncated: boolean;
+  deferred?: boolean;
 }
 
 export interface ToolDefinition<TArgs extends JsonValue = JsonValue> {

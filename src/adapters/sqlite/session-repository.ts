@@ -35,6 +35,22 @@ interface SummaryRow {
 export class SqliteSessionRepository implements SessionStore {
   constructor(private readonly db: DatabaseSync) {}
 
+  delete(sessionId: SessionId): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const session = this.db.prepare(
+        `SELECT owner_session_id FROM sessions WHERE session_id = ?`,
+      ).get(sessionId) as { owner_session_id: string | null } | undefined;
+      if (session === undefined) throw new DomainError("session_not_found");
+      if (session.owner_session_id !== null) throw new DomainError("synthetic_session_owned");
+      this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getCurrentSummary(sessionId: SessionId): SessionSummary | null {
     const row = this.db
       .prepare(

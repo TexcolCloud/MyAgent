@@ -32,7 +32,7 @@ export type AdvanceOutcome =
   | {
       type: "waiting";
       runId: RunId;
-      state: "waiting_approval" | "waiting_reconciliation";
+      state: "waiting_approval" | "waiting_reconciliation" | "waiting_child";
     }
   | {
       type: "terminal";
@@ -146,6 +146,7 @@ export class AdvanceRunService {
           runId,
           toolCallId: latestTool.toolCallId,
           signal,
+          leaseOwner,
           remainingRunOutputBytes: context.revision.limits.maxRunToolOutputBytes - context.run.budget.toolOutputBytes,
           activateSkill: (skillName) => {
             const skill = context.revision.skills.find((candidate) => candidate.name === skillName);
@@ -168,6 +169,9 @@ export class AdvanceRunService {
         };
       } finally {
         this.activeAbortSafety.delete(runId);
+      }
+      if (result.deferred === true) {
+        return { type: "waiting", runId, state: "waiting_child" };
       }
       this.options.tools.completeExecution({
         runId, toolCallId: latestTool.toolCallId, leaseOwner, result,

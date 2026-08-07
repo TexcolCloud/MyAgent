@@ -33,6 +33,7 @@ export interface SaveLeasedSessionSummaryInput {
 }
 
 export interface SessionStore {
+  delete?(sessionId: SessionId): void;
   getCurrentSummary(sessionId: SessionId): SessionSummary | null;
   listMessagesThroughRun(
     sessionId: SessionId,

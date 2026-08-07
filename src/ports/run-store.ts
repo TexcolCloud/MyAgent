@@ -7,6 +7,7 @@ import type {
   RunId,
   SessionId,
   SessionKey,
+  ToolCallId,
 } from "../domain/ids.js";
 import type { Run } from "../domain/run.js";
 import type { JsonValue } from "../domain/json.js";
@@ -67,6 +68,23 @@ export interface CompleteRunInput {
   occurredAt: Date;
 }
 
+export interface StartDelegationInput {
+  parentRunId: RunId;
+  parentToolCallId: ToolCallId;
+  leaseOwner: string;
+  rootRunId: RunId;
+  parentDelegationDepth: number;
+  parentChildRunLimit: number;
+  parentDelegationDepthLimit: number;
+  targetAgentId: AgentId;
+  targetRevision: AgentRevisionSnapshot;
+  childSessionKey: SessionKey;
+  childSessionId: SessionId;
+  childRunId: RunId;
+  input: { type: "text"; text: string };
+  occurredAt: Date;
+}
+
 export interface RunStore {
   create(input: CreateStoredRunInput): CreateStoredRunResult;
   getRun(runId: RunId): Run;
@@ -98,6 +116,10 @@ export interface RunStore {
   }): AttemptId | null;
   failRun(input: { runId: RunId; leaseOwner: string; code: string; occurredAt: Date }): Run;
   completeRun(input: CompleteRunInput): Run;
+  startDelegation(input: StartDelegationInput): {
+    childRunId: RunId;
+    childSessionId: SessionId;
+  };
   cancel(input: { runId: RunId; occurredAt: Date }): Run;
   finalizeCancellation(input: {
     runId: RunId;
