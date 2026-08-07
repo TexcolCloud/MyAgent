@@ -1,8 +1,7 @@
 import type { SecretRef } from "../config/secret-ref.js";
 import type { AgentId } from "./ids.js";
 import type { RunLimits } from "./limits.js";
-
-export type PolicyEffect = "allow" | "ask" | "deny";
+import type { PolicyRule } from "./policy.js";
 
 export interface SkillSnapshot {
   name: string;
@@ -13,16 +12,7 @@ export interface SkillSnapshot {
   contentSha256: string;
 }
 
-export type PolicyWhen =
-  | { pathWithinWorkspace: true }
-  | { targetAgentInDelegates: true };
-
-export interface PolicyRule {
-  agent?: AgentId | "*";
-  tool: string;
-  when?: PolicyWhen;
-  effect: PolicyEffect;
-}
+export type { PolicyEffect, PolicyRule, PolicyWhen } from "./policy.js";
 
 export interface AgentRevisionSnapshot {
   revisionId: string;
