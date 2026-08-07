@@ -1031,20 +1031,27 @@ describe("AdvanceRunService", () => {
         "worker-unit",
         new AbortController().signal,
       )).toEqual({
-        type: "terminal",
+        type: "advanced",
         runId: created.runId,
-        state: "completed",
       });
 
       expect(model.requests.map((request) => request.purpose)).toEqual([
         "session_summary",
         "session_summary",
-        "run",
       ]);
-      expect(runs.getRun(created.runId).budget.modelTurns).toBe(2);
+      expect(runs.getRun(created.runId).budget.modelTurns).toBe(1);
       expect(sessions.getCurrentSummary(created.sessionId)).toMatchObject({
         content: "durable compact summary",
       });
+      expect(await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).toEqual({ type: "terminal", runId: created.runId, state: "completed" });
+      expect(model.requests.map((request) => request.purpose)).toEqual([
+        "session_summary", "session_summary", "run",
+      ]);
+      expect(runs.getRun(created.runId).budget.modelTurns).toBe(2);
       const eventTypes = runs
         .listEventsAfter(created.runId, 0)
         .map((event) => event.type);

@@ -229,6 +229,9 @@ export class AdvanceRunService {
           }),
       });
       request = summary.request;
+      if (summary.summarized) {
+        return { type: "advanced", runId };
+      }
       context = this.options.runs.getExecutionContext(runId);
       assertOwnedLease(context, leaseOwner, this.options.clock.now());
     } catch (error) {
@@ -341,6 +344,9 @@ export class AdvanceRunService {
       } catch (error) {
         if (signal.aborted) {
           throw signal.reason;
+        }
+        if (!(error instanceof ModelProviderError)) {
+          throw error;
         }
         const providerError = asProviderError(error);
         this.options.runs.failModelAttempt({
