@@ -225,7 +225,7 @@ class OutputBudget {
   }
 
   retain(text: string): string {
-    const textBytes = Buffer.byteLength(text);
+    const textBytes = jsonStringPayloadBytes(text);
     if (textBytes <= this.#remainingBytes) {
       this.#remainingBytes -= textBytes;
       this.capturedBytes += textBytes;
@@ -236,7 +236,7 @@ class OutputBudget {
     let retainedBytes = 0;
     let retainedCharacters = 0;
     for (const character of text) {
-      const characterBytes = Buffer.byteLength(character);
+      const characterBytes = jsonStringPayloadBytes(character);
       if (retainedBytes + characterBytes > this.#remainingBytes) {
         break;
       }
@@ -247,6 +247,10 @@ class OutputBudget {
     this.capturedBytes += retainedBytes;
     return text.slice(0, retainedCharacters);
   }
+}
+
+function jsonStringPayloadBytes(value: string): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8") - 2;
 }
 
 interface ResolvedEnvironment {

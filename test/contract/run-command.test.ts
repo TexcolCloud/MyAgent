@@ -279,6 +279,37 @@ describe("run_command Tool", () => {
     expect(result.truncated).toBe(true);
   });
 
+  it("bounds captured output after control bytes are escaped for persistence", async () => {
+    const tool = createRunCommandTool({
+      environmentAllowlist: [],
+      secretResolver: new EnvironmentSecretResolver({}),
+    });
+    const normalized = await tool.parseAndNormalize(
+      {
+        program: process.execPath,
+        args: [
+          "-e",
+          "process.stdout.write(Buffer.alloc(64, 0))",
+        ],
+        timeoutMs: 2_000,
+      },
+      normalizeContext,
+    );
+
+    const result = await tool.execute(normalized.arguments, {
+      ...executionContext,
+      remainingRunOutputBytes: 64,
+    });
+    const content = result.content as { stdout: string; stderr: string };
+    const persistedOutputBytes =
+      jsonStringPayloadBytes(content.stdout) +
+      jsonStringPayloadBytes(content.stderr);
+
+    expect(persistedOutputBytes).toBeLessThanOrEqual(64);
+    expect(result.capturedBytes).toBe(persistedOutputBytes);
+    expect(result.truncated).toBe(true);
+  });
+
   it("terminates a command when its timeout expires", async () => {
     const tool = createRunCommandTool({
       environmentAllowlist: [],
@@ -389,6 +420,10 @@ function revisionFor(workspace: string): AgentRevisionSnapshot {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function jsonStringPayloadBytes(value: string): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8") - 2;
 }
 
 async function waitForFile(filePath: string): Promise<string> {
