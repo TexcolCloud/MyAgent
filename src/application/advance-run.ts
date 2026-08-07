@@ -63,11 +63,6 @@ interface CompletedAttempt {
 export class AdvanceRunService {
   constructor(private readonly options: AdvanceRunServiceOptions) {}
 
-  canAbort(runId: RunId): boolean {
-    const call = this.options.tools.getLatestForRun(runId);
-    return call?.state !== "executing" || call.effect !== "side_effect";
-  }
-
   async advance(
     runId: RunId,
     leaseOwner: string,
@@ -136,17 +131,8 @@ export class AdvanceRunService {
             });
           },
         });
-      } catch {
-        if (signal.aborted && latestTool.effect === "side_effect") {
-          throw signal.reason;
-        }
-        result = {
-          ok: false,
-          summary: "tool_execution_failed",
-          content: { code: "tool_execution_failed" },
-          capturedBytes: 0,
-          truncated: false,
-        };
+      } catch (error) {
+        result = { ok: false, summary: error instanceof Error ? error.message : "tool_execution_failed", content: {}, capturedBytes: 0, truncated: false };
       }
       this.options.tools.completeExecution({
         runId, toolCallId: latestTool.toolCallId, leaseOwner, result,

@@ -194,17 +194,13 @@ export class SqliteToolRepository implements ToolStore {
     this.inImmediateTransaction(() => {
       this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
       if (input.result.capturedBytes > input.maxToolOutputBytes) {
-        this.failRunForBudget(input.runId, input.leaseOwner, occurredAt);
-        return;
+        throw new DomainError("run_budget_exceeded");
       }
       const run = this.db.prepare(
         `UPDATE runs SET tool_output_bytes = tool_output_bytes + ?, updated_at = ?
          WHERE run_id = ? AND tool_output_bytes + ? <= ?`,
       ).run(input.result.capturedBytes, occurredAt, input.runId, input.result.capturedBytes, input.maxRunToolOutputBytes);
-      if (run.changes !== 1) {
-        this.failRunForBudget(input.runId, input.leaseOwner, occurredAt);
-        return;
-      }
+      if (run.changes !== 1) throw new DomainError("run_budget_exceeded");
       const state = input.result.ok ? "succeeded" : "failed";
       const updated = this.db.prepare(
         `UPDATE tool_calls SET state = ?, result_json = ?, updated_at = ?
@@ -341,15 +337,6 @@ export class SqliteToolRepository implements ToolStore {
     this.db.exec("BEGIN IMMEDIATE");
     try { const result = operation(); this.db.exec("COMMIT"); return result; }
     catch (error) { this.db.exec("ROLLBACK"); throw error; }
-  }
-
-  private failRunForBudget(runId: RunId, leaseOwner: string, occurredAt: string): void {
-    this.db.prepare(
-      `UPDATE runs SET state = 'failed', failure_code = 'run_budget_exceeded',
-       active_started_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-       WHERE run_id = ? AND lease_owner = ?`,
-    ).run(occurredAt, runId, leaseOwner);
-    this.appendEvent(runId, "run.failed", canonicalize({ code: "run_budget_exceeded" }), occurredAt);
   }
 }
 

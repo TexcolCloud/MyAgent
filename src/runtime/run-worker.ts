@@ -17,7 +17,7 @@ export class RunWorker {
   private readonly concurrency: number;
   private readonly leaseDurationMs: number;
   private readonly idleDelayMs: number;
-  private readonly active = new Map<AbortController, string>();
+  private readonly active = new Set<AbortController>();
   private loops: Promise<void>[] = [];
   private running = false;
 
@@ -35,11 +35,7 @@ export class RunWorker {
 
   async stop(): Promise<void> {
     this.running = false;
-    for (const [controller, runId] of this.active) {
-      if (this.options.advance.canAbort(runId as Parameters<AdvanceRunService["advance"]>[0])) {
-        controller.abort(new Error("worker_stopped"));
-      }
-    }
+    for (const controller of this.active) controller.abort(new Error("worker_stopped"));
     await Promise.all(this.loops);
     this.loops = [];
   }
@@ -68,15 +64,10 @@ export class RunWorker {
         continue;
       }
       const controller = new AbortController();
-      let heartbeatFailure: unknown;
       const heartbeat = new LeaseHeartbeat(
         this.options.runs, this.options.clock, run.runId, leaseOwner, this.leaseDurationMs,
-        (error) => {
-          heartbeatFailure = error;
-          if (this.options.advance.canAbort(run.runId)) controller.abort(error);
-        },
       );
-      this.active.set(controller, run.runId);
+      this.active.add(controller);
       heartbeat.start();
       try {
         while (this.running && !controller.signal.aborted) {
@@ -84,13 +75,7 @@ export class RunWorker {
           if (outcome.type !== "advanced") break;
         }
       } catch (error) {
-        const failure = heartbeatFailure ?? error;
-        if (isSqliteBusy(failure)) {
-          await this.options.clock.sleep(busyDelayMs);
-          busyDelayMs = Math.min(1_000, busyDelayMs * 2);
-        } else if (!controller.signal.aborted) {
-          throw failure;
-        }
+        if (!controller.signal.aborted && !isSqliteBusy(error)) throw error;
       } finally {
         heartbeat.stop();
         this.active.delete(controller);

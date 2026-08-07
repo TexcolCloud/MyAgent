@@ -11,23 +11,16 @@ export class LeaseHeartbeat {
     private readonly runId: RunId,
     private readonly leaseOwner: string,
     private readonly leaseDurationMs: number,
-    private readonly onFailure: (error: unknown) => void,
   ) {}
 
   start(): void {
     this.timer = setInterval(() => {
-      try {
-        const now = this.clock.now();
-        if (!this.runs.renewLease(
-          this.runId,
-          this.leaseOwner,
-          new Date(now.getTime() + this.leaseDurationMs),
-        )) {
-          this.onFailure(new Error("run_lease_lost"));
-        }
-      } catch (error) {
-        this.onFailure(error);
-      }
+      const now = this.clock.now();
+      this.runs.renewLease(
+        this.runId,
+        this.leaseOwner,
+        new Date(now.getTime() + this.leaseDurationMs),
+      );
     }, Math.max(1, Math.floor(this.leaseDurationMs / 3)));
   }
 
