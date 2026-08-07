@@ -403,6 +403,73 @@ export class SqliteRunRepository implements RunStore {
     });
   }
 
+  recoverUnmatchedModelAttempt(input: {
+    runId: RunId;
+    leaseOwner: string;
+    occurredAt: Date;
+  }): AttemptId | null {
+    const occurredAt = input.occurredAt.toISOString();
+    return this.inImmediateTransaction(() => {
+      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
+      const attempt = this.db.prepare(
+        `SELECT started.sequence,
+                json_extract(started.payload_json, '$.attemptId') AS attempt_id
+         FROM run_events AS started
+         WHERE started.run_id = ?
+           AND started.event_type = 'model.attempt.started'
+           AND NOT EXISTS (
+             SELECT 1 FROM run_events AS failed
+             WHERE failed.run_id = started.run_id
+               AND failed.event_type = 'model.attempt.failed'
+               AND json_extract(failed.payload_json, '$.attemptId') =
+                   json_extract(started.payload_json, '$.attemptId')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM run_events AS completed
+             WHERE completed.run_id = started.run_id
+               AND completed.event_type = 'message.completed'
+               AND json_extract(completed.payload_json, '$.attemptId') =
+                   json_extract(started.payload_json, '$.attemptId')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM run_events AS proposed
+             WHERE proposed.run_id = started.run_id
+               AND proposed.event_type = 'tool.proposed'
+               AND proposed.sequence > started.sequence
+           )
+           AND (
+             json_extract(started.payload_json, '$.purpose') <> 'session_summary'
+             OR NOT EXISTS (
+               SELECT 1
+               FROM runs AS summary_run
+               JOIN session_summaries AS summary
+                 ON summary.session_id = summary_run.session_id
+               WHERE summary_run.run_id = started.run_id
+                 AND summary.created_at >= started.created_at
+             )
+           )
+         ORDER BY started.sequence DESC
+         LIMIT 1`,
+      ).get(input.runId) as
+        | { sequence: number; attempt_id: string }
+        | undefined;
+      if (attempt === undefined) {
+        return null;
+      }
+      this.appendEventInTransaction(
+        input.runId,
+        "model.attempt.failed",
+        canonicalize({
+          attemptId: attempt.attempt_id,
+          code: "model_attempt_abandoned",
+          transient: true,
+        }),
+        occurredAt,
+      );
+      return attempt.attempt_id as AttemptId;
+    });
+  }
+
   failRun(input: { runId: RunId; leaseOwner: string; code: string; occurredAt: Date }): Run {
     const occurredAt = input.occurredAt.toISOString();
     return this.inImmediateTransaction(() => {
@@ -415,18 +482,6 @@ export class SqliteRunRepository implements RunStore {
       ).run(input.code, elapsedActiveSeconds(context, input.occurredAt), occurredAt, input.runId, input.leaseOwner);
       this.appendEventInTransaction(input.runId, "run.failed", canonicalize({ code: input.code }), occurredAt);
       return this.getRun(input.runId);
-    });
-  }
-
-  activateSkill(input: { runId: RunId; leaseOwner: string; skillName: string; skillVersion: number; contentSha256: string; occurredAt: Date }): void {
-    const occurredAt = input.occurredAt.toISOString();
-    this.inImmediateTransaction(() => {
-      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
-      this.db.prepare(
-        `INSERT OR IGNORE INTO run_activated_skills (run_id, skill_name, skill_version, content_sha256, activated_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      ).run(input.runId, input.skillName, input.skillVersion, input.contentSha256, occurredAt);
-      this.appendEventInTransaction(input.runId, "skill.activated", canonicalize({ skillName: input.skillName, skillVersion: input.skillVersion }), occurredAt);
     });
   }
 

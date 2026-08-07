@@ -14,11 +14,15 @@ import { PolicyEngine } from "../../src/application/policy-engine.js";
 import { PromptAssembler } from "../../src/application/prompt-assembler.js";
 import { CatalogService } from "../../src/config/catalog-service.js";
 import { loadCatalog, type CatalogSnapshot } from "../../src/config/catalog-loader.js";
-import { runIdFromUuid, sessionIdFromUuid } from "../../src/domain/ids.js";
+import {
+  attemptIdFromUuid,
+  runIdFromUuid,
+  sessionIdFromUuid,
+} from "../../src/domain/ids.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
-import { ScriptedModel } from "../helpers/scripted-model.js";
+import { completedText, ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
 describe("lease recovery", () => {
@@ -52,9 +56,173 @@ describe("lease recovery", () => {
 
       expect(await service.advance(side.runId, "recovery", new AbortController().signal)).toMatchObject({ type: "waiting", state: "waiting_reconciliation" });
       expect(tools.getLatestForRun(side.runId)?.state).toBe("unknown");
+      expect(runs.getRun(side.runId).budget.activeExecutionSeconds).toBe(2);
       await service.advance(read.runId, "recovery", new AbortController().signal);
       await service.advance(read.runId, "recovery", new AbortController().signal);
       expect(fake.executions).toBe(1);
     } finally { connection.close(); }
+  });
+
+  it("fails an unmatched model attempt before starting a new one", async () => {
+    const connection = openDatabase({
+      path: tempPath("model-attempt-recovery.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const recoveredAttemptId = attemptIdFromUuid(
+        "00000000-0000-7000-8000-000000000061",
+      );
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000061")],
+        runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000061")],
+        attemptIds: [
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000062"),
+        ],
+      });
+      const created = new CreateRunService(
+        new CatalogService(snapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "recover:model-attempt",
+        input: { type: "text", text: "resume safely" },
+        idempotencyKey: "recover-model-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "old-worker",
+        clock.now(),
+        new Date(clock.now().getTime() + 1),
+      );
+      runs.beginModelAttempt({
+        runId: created.runId,
+        leaseOwner: "old-worker",
+        attemptId: recoveredAttemptId,
+        purpose: "run",
+        consumeModelTurn: true,
+        modelTurnLimit: 20,
+        occurredAt: clock.now(),
+      });
+      clock.advanceBy(2_000);
+      runs.claimNextEligible(
+        "recovery-worker",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const model = new ScriptedModel();
+      model.script(completedText("recovered answer"));
+      const service = new AdvanceRunService({
+        runs,
+        tools: new SqliteToolRepository(connection.db),
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry: new ToolRegistry(),
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+      });
+
+      expect(await service.advance(
+        created.runId,
+        "recovery-worker",
+        new AbortController().signal,
+      )).toEqual({ type: "advanced", runId: created.runId });
+      expect(model.requests).toHaveLength(0);
+      expect(
+        runs.listEventsAfter(created.runId, 0).filter(
+          (event) => event.type === "model.attempt.failed",
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            attemptId: recoveredAttemptId,
+            code: "model_attempt_abandoned",
+          }),
+        }),
+      ]);
+
+      expect(await service.advance(
+        created.runId,
+        "recovery-worker",
+        new AbortController().signal,
+      )).toEqual({
+        type: "terminal",
+        runId: created.runId,
+        state: "completed",
+      });
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("rejects a Summary commit after the provider lease is lost", () => {
+    const connection = openDatabase({
+      path: tempPath("summary-lease-recovery.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000071")],
+        runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000071")],
+      });
+      const created = new CreateRunService(
+        new CatalogService(snapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "recover:summary-lease",
+        input: { type: "text", text: "summarize safely" },
+        idempotencyKey: "recover-summary-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "provider-worker",
+        clock.now(),
+        new Date(clock.now().getTime() + 1),
+      );
+      clock.advanceBy(2_000);
+      runs.claimNextEligible(
+        "replacement-worker",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+
+      expect(() => sessions.saveSummaryWithLease({
+        runId: created.runId,
+        leaseOwner: "provider-worker",
+        occurredAt: clock.now(),
+        summary: {
+          summaryId: "summary:lost-lease",
+          sessionId: created.sessionId,
+          sourceMessageFrom: 0,
+          sourceMessageTo: 0,
+          content: "must not commit",
+          modelProvider: "openai-compatible",
+          modelName: "test-model",
+          createdAt: clock.now(),
+        },
+      })).toThrowError(expect.objectContaining({ code: "run_lease_lost" }));
+      expect(sessions.getCurrentSummary(created.sessionId)).toBeNull();
+    } finally {
+      connection.close();
+    }
   });
 });

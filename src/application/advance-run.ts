@@ -20,10 +20,12 @@ import type { ToolRegistry } from "../adapters/tools/registry.js";
 import { DeltaBuffer } from "./delta-buffer.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import type { PromptAssembler } from "./prompt-assembler.js";
+import { SessionSummarizer } from "./session-summarizer.js";
 import { normalizeToolProposal } from "./tool-proposal.js";
 
 const MAX_MODEL_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [250, 1_000] as const;
+const DELTA_MAX_DELAY_MS = 100;
 
 export type AdvanceOutcome =
   | { type: "advanced"; runId: RunId }
@@ -67,13 +69,20 @@ export class AdvanceRunService {
     signal: AbortSignal,
   ): Promise<AdvanceOutcome> {
     signal.throwIfAborted();
-    const context = this.options.runs.getExecutionContext(runId);
+    let context = this.options.runs.getExecutionContext(runId);
     assertOwnedLease(context, leaseOwner, this.options.clock.now());
     if (context.run.state !== "running") {
       return outcomeForState(context.run.runId, context.run.state);
     }
     if (this.options.approvals.getPendingForRun(runId) !== null) {
       return { type: "waiting", runId, state: "waiting_approval" };
+    }
+    if (this.options.runs.recoverUnmatchedModelAttempt({
+      runId,
+      leaseOwner,
+      occurredAt: this.options.clock.now(),
+    }) !== null) {
+      return { type: "advanced", runId };
     }
     const latestTool = this.options.tools.getLatestForRun(runId);
     if (latestTool?.state === "executing") {
@@ -85,15 +94,24 @@ export class AdvanceRunService {
         : { type: "advanced", runId };
     }
     if (latestTool?.state === "allowed") {
-      if (context.run.budget.activeExecutionSeconds >= context.revision.limits.activeExecutionSeconds) {
-        this.options.runs.failRun({ runId, leaseOwner, code: "run_budget_exceeded", occurredAt: this.options.clock.now() });
-        return { type: "terminal", runId, state: "failed" };
+      const now = this.options.clock.now();
+      if (
+        activeExecutionSeconds(context, now) >=
+          context.revision.limits.activeExecutionSeconds ||
+        context.run.budget.toolOutputBytes >=
+          context.revision.limits.maxRunToolOutputBytes
+      ) {
+        return this.failForBudget(runId, leaseOwner, now);
       }
       const definition = this.options.registry.get(latestTool.toolName);
       if (definition === undefined) throw new DomainError("tool_not_registered");
       this.options.tools.beginExecution({
         runId, toolCallId: latestTool.toolCallId, leaseOwner, occurredAt: this.options.clock.now(),
       });
+      const activatedSkills = new Map<
+        string,
+        { skillName: string; skillVersion: number; contentSha256: string }
+      >();
       let result;
       try {
         result = await definition.execute(latestTool.arguments, {
@@ -106,7 +124,11 @@ export class AdvanceRunService {
           activateSkill: (skillName) => {
             const skill = context.revision.skills.find((candidate) => candidate.name === skillName);
             if (skill === undefined) throw new DomainError("skill_not_available");
-            this.options.runs.activateSkill({ runId, leaseOwner, skillName, skillVersion: skill.version, contentSha256: skill.contentSha256, occurredAt: this.options.clock.now() });
+            activatedSkills.set(skillName, {
+              skillName,
+              skillVersion: skill.version,
+              contentSha256: skill.contentSha256,
+            });
           },
         });
       } catch (error) {
@@ -114,6 +136,7 @@ export class AdvanceRunService {
       }
       this.options.tools.completeExecution({
         runId, toolCallId: latestTool.toolCallId, leaseOwner, result,
+        activatedSkills: result.ok ? [...activatedSkills.values()] : [],
         maxToolOutputBytes: context.revision.limits.maxToolOutputBytes,
         maxRunToolOutputBytes: context.revision.limits.maxRunToolOutputBytes,
         occurredAt: this.options.clock.now(),
@@ -127,7 +150,16 @@ export class AdvanceRunService {
       throw new DomainError("tool_checkpoint_not_implemented");
     }
 
-    const request = await this.options.prompts.build({
+    const beforeModel = this.options.clock.now();
+    if (
+      context.run.budget.modelTurns >= context.revision.limits.modelTurns ||
+      activeExecutionSeconds(context, beforeModel) >=
+        context.revision.limits.activeExecutionSeconds
+    ) {
+      return this.failForBudget(runId, leaseOwner, beforeModel);
+    }
+
+    const promptInput = {
       revision: context.revision,
       sessionId: context.run.sessionId,
       runId,
@@ -139,12 +171,94 @@ export class AdvanceRunService {
         content: latestTool.result ?? { code: "tool_denied", toolName: latestTool.toolName },
       }],
       tools: modelToolDefinitions(this.options.registry),
-    });
+    };
+    const summaryAttemptIds = new Map<number, Parameters<RunStore["appendModelDelta"]>[2]>();
+    let request: ModelRequest;
+    try {
+      const summary = await new SessionSummarizer({
+        assembler: this.options.prompts,
+        sessionStore: this.options.sessions,
+        model: this.options.model,
+        clock: this.options.clock,
+      }).ensureWithinBudget(promptInput, signal, {
+        onAttemptStarted: (attemptNumber) => {
+          const now = this.options.clock.now();
+          const current = this.options.runs.getExecutionContext(runId);
+          assertOwnedLease(current, leaseOwner, now);
+          if (
+            current.run.budget.modelTurns >= current.revision.limits.modelTurns ||
+            activeExecutionSeconds(current, now) >=
+              current.revision.limits.activeExecutionSeconds
+          ) {
+            this.failForBudget(runId, leaseOwner, now);
+            throw new RunBudgetTerminated();
+          }
+          const attemptId = this.options.ids.attemptId();
+          summaryAttemptIds.set(attemptNumber, attemptId);
+          this.options.runs.beginModelAttempt({
+            runId,
+            leaseOwner,
+            attemptId,
+            purpose: "session_summary",
+            consumeModelTurn: attemptNumber === 1,
+            modelTurnLimit: current.revision.limits.modelTurns,
+            occurredAt: now,
+          });
+        },
+        onAttemptFailed: (attemptNumber, error) => {
+          const attemptId = summaryAttemptIds.get(attemptNumber);
+          if (attemptId === undefined) {
+            throw new Error("summary_attempt_checkpoint_missing");
+          }
+          const providerError = asProviderError(error);
+          this.options.runs.failModelAttempt({
+            runId,
+            leaseOwner,
+            attemptId,
+            code: providerError.code,
+            transient: providerError.transient,
+            occurredAt: this.options.clock.now(),
+          });
+        },
+        saveSummary: (summaryInput) =>
+          this.options.sessions.saveSummaryWithLease({
+            runId,
+            leaseOwner,
+            occurredAt: this.options.clock.now(),
+            summary: summaryInput,
+          }),
+      });
+      request = summary.request;
+      context = this.options.runs.getExecutionContext(runId);
+      assertOwnedLease(context, leaseOwner, this.options.clock.now());
+    } catch (error) {
+      if (error instanceof RunBudgetTerminated) {
+        return { type: "terminal", runId, state: "failed" };
+      }
+      if (error instanceof ModelProviderError) {
+        this.options.runs.failRun({
+          runId,
+          leaseOwner,
+          code: error.code,
+          occurredAt: this.options.clock.now(),
+        });
+        return { type: "terminal", runId, state: "failed" };
+      }
+      throw error;
+    }
 
     for (let attemptNumber = 1; attemptNumber <= MAX_MODEL_ATTEMPTS; attemptNumber += 1) {
-      if (context.run.budget.modelTurns >= context.revision.limits.modelTurns || context.run.budget.activeExecutionSeconds >= context.revision.limits.activeExecutionSeconds) {
-        this.options.runs.failRun({ runId, leaseOwner, code: "run_budget_exceeded", occurredAt: this.options.clock.now() });
-        return { type: "terminal", runId, state: "failed" };
+      const attemptContext = this.options.runs.getExecutionContext(runId);
+      const attemptStartedAt = this.options.clock.now();
+      assertOwnedLease(attemptContext, leaseOwner, attemptStartedAt);
+      if (
+        activeExecutionSeconds(attemptContext, attemptStartedAt) >=
+          attemptContext.revision.limits.activeExecutionSeconds ||
+        (attemptNumber === 1 &&
+          attemptContext.run.budget.modelTurns >=
+            attemptContext.revision.limits.modelTurns)
+      ) {
+        return this.failForBudget(runId, leaseOwner, attemptStartedAt);
       }
       const attemptId = this.options.ids.attemptId();
       this.options.runs.beginModelAttempt({
@@ -165,6 +279,18 @@ export class AdvanceRunService {
           signal,
         );
         if (completed.toolCall !== undefined) {
+          if (context.run.budget.toolCalls >= context.revision.limits.toolCalls) {
+            const occurredAt = this.options.clock.now();
+            this.options.runs.failModelAttempt({
+              runId,
+              leaseOwner,
+              attemptId,
+              code: "run_budget_exceeded",
+              transient: false,
+              occurredAt,
+            });
+            return this.failForBudget(runId, leaseOwner, occurredAt);
+          }
           const proposal = await normalizeToolProposal({
             registry: this.options.registry,
             toolName: completed.toolCall.name,
@@ -226,7 +352,13 @@ export class AdvanceRunService {
           occurredAt: this.options.clock.now(),
         });
         if (!providerError.transient || attemptNumber === MAX_MODEL_ATTEMPTS) {
-          throw providerError;
+          this.options.runs.failRun({
+            runId,
+            leaseOwner,
+            code: providerError.code,
+            occurredAt: this.options.clock.now(),
+          });
+          return { type: "terminal", runId, state: "failed" };
         }
         await this.options.clock.sleep(
           retryDelay(attemptNumber, providerError.retryAfterMs),
@@ -235,6 +367,20 @@ export class AdvanceRunService {
       }
     }
     throw new Error("unreachable_model_attempt_loop");
+  }
+
+  private failForBudget(
+    runId: RunId,
+    leaseOwner: string,
+    occurredAt: Date,
+  ): AdvanceOutcome {
+    this.options.runs.failRun({
+      runId,
+      leaseOwner,
+      code: "run_budget_exceeded",
+      occurredAt,
+    });
+    return { type: "terminal", runId, state: "failed" };
   }
 
   private async collectAttempt(
@@ -246,25 +392,78 @@ export class AdvanceRunService {
   ): Promise<CompletedAttempt> {
     const buffer = new DeltaBuffer({
       maxBytes: 1_024,
-      maxDelayMs: 100,
+      maxDelayMs: DELTA_MAX_DELAY_MS,
       clock: this.options.clock,
     });
     let text = "";
     let completed: Extract<ModelChunk, { type: "completed" }> | undefined;
     let toolCall: Extract<ModelChunk, { type: "tool_call" }>["call"] | undefined;
+    const stream = this.options.model.streamAttempt(request, signal);
+    const iterator = stream[Symbol.asyncIterator]();
+    let pendingNext: Promise<IteratorResult<ModelChunk>> | undefined;
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    let flushDue: Promise<"flush"> | undefined;
+    const cancelFlush = (): void => {
+      if (flushTimer !== undefined) {
+        clearTimeout(flushTimer);
+      }
+      flushTimer = undefined;
+      flushDue = undefined;
+    };
+    const scheduleFlush = (): void => {
+      if (flushDue !== undefined) {
+        return;
+      }
+      flushDue = new Promise((resolve) => {
+        flushTimer = setTimeout(() => {
+          flushTimer = undefined;
+          resolve("flush");
+        }, DELTA_MAX_DELAY_MS);
+      });
+    };
+    const persistDelta = (delta: string | null): void => {
+      if (delta === null) {
+        return;
+      }
+      this.options.runs.appendModelDelta(
+        runId,
+        leaseOwner,
+        attemptId,
+        delta,
+        this.options.clock.now(),
+      );
+    };
     try {
-      for await (const chunk of this.options.model.streamAttempt(request, signal)) {
+      while (true) {
+        pendingNext ??= iterator.next();
+        const nextResult = pendingNext.then((result) => ({
+          type: "next" as const,
+          result,
+        }));
+        const winner = flushDue === undefined
+          ? await nextResult
+          : await Promise.race([
+              nextResult,
+              flushDue.then(() => ({ type: "flush" as const })),
+            ]);
+        if (winner.type === "flush") {
+          flushDue = undefined;
+          persistDelta(buffer.flush());
+          continue;
+        }
+        pendingNext = undefined;
+        if (winner.result.done) {
+          break;
+        }
+        const chunk = winner.result.value;
         if (chunk.type === "text_delta") {
           text += chunk.text;
           const delta = buffer.push(chunk.text);
           if (delta !== null) {
-            this.options.runs.appendModelDelta(
-              runId,
-              leaseOwner,
-              attemptId,
-              delta,
-              this.options.clock.now(),
-            );
+            cancelFlush();
+            persistDelta(delta);
+          } else if (chunk.text.length > 0) {
+            scheduleFlush();
           }
         } else if (chunk.type === "tool_call") {
           if (toolCall !== undefined) {
@@ -278,16 +477,8 @@ export class AdvanceRunService {
         }
       }
     } finally {
-      const remaining = buffer.flush();
-      if (remaining !== null) {
-        this.options.runs.appendModelDelta(
-          runId,
-          leaseOwner,
-          attemptId,
-          remaining,
-          this.options.clock.now(),
-        );
-      }
+      cancelFlush();
+      persistDelta(buffer.flush());
     }
     if (completed === undefined || (text.length === 0 && toolCall === undefined)) {
       throw protocolError();
@@ -323,6 +514,19 @@ function outcomeForState(runId: RunId, state: RunState): AdvanceOutcome {
     return { type: "terminal", runId, state };
   }
   throw new DomainError("run_not_advanceable");
+}
+
+function activeExecutionSeconds(
+  context: ReturnType<RunStore["getExecutionContext"]>,
+  now: Date,
+): number {
+  if (context.activeStartedAt === null) {
+    return context.run.budget.activeExecutionSeconds;
+  }
+  const current = Math.ceil(
+    Math.max(0, now.getTime() - context.activeStartedAt.getTime()) / 1_000,
+  );
+  return context.run.budget.activeExecutionSeconds + current;
 }
 
 function asProviderError(error: unknown): ModelProviderError {
@@ -361,3 +565,5 @@ function modelToolDefinitions(registry: ToolRegistry): ModelRequest["tools"] {
     };
   });
 }
+
+class RunBudgetTerminated extends Error {}

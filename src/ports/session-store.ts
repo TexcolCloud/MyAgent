@@ -25,6 +25,13 @@ export interface SessionSummary {
 
 export type SaveSessionSummaryInput = SessionSummary;
 
+export interface SaveLeasedSessionSummaryInput {
+  runId: RunId;
+  leaseOwner: string;
+  occurredAt: Date;
+  summary: SaveSessionSummaryInput;
+}
+
 export interface SessionStore {
   getCurrentSummary(sessionId: SessionId): SessionSummary | null;
   listMessagesThroughRun(
@@ -32,4 +39,5 @@ export interface SessionStore {
     runFifoSequence: number,
   ): readonly SessionMessage[];
   saveSummary(input: SaveSessionSummaryInput): SessionSummary;
+  saveSummaryWithLease(input: SaveLeasedSessionSummaryInput): SessionSummary;
 }

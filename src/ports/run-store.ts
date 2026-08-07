@@ -90,7 +90,11 @@ export interface RunStore {
     occurredAt: Date,
   ): void;
   failModelAttempt(input: FailModelAttemptInput): void;
+  recoverUnmatchedModelAttempt(input: {
+    runId: RunId;
+    leaseOwner: string;
+    occurredAt: Date;
+  }): AttemptId | null;
   failRun(input: { runId: RunId; leaseOwner: string; code: string; occurredAt: Date }): Run;
-  activateSkill(input: { runId: RunId; leaseOwner: string; skillName: string; skillVersion: number; contentSha256: string; occurredAt: Date }): void;
   completeRun(input: CompleteRunInput): Run;
 }

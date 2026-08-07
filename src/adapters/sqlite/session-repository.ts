@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { DomainError } from "../../domain/errors.js";
 import type { RunId, SessionId } from "../../domain/ids.js";
 import type {
+  SaveLeasedSessionSummaryInput,
   SaveSessionSummaryInput,
   SessionMessage,
   SessionStore,
@@ -74,49 +75,81 @@ export class SqliteSessionRepository implements SessionStore {
     assertSummary(input);
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const inserted = this.db
-        .prepare(
-          `INSERT INTO session_summaries (
-            summary_id, session_id, from_message_sequence,
-            to_message_sequence, content, model_provider, model_name, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(summary_id) DO UPDATE SET
-            from_message_sequence = excluded.from_message_sequence,
-            to_message_sequence = excluded.to_message_sequence,
-            content = excluded.content,
-            model_provider = excluded.model_provider,
-            model_name = excluded.model_name,
-            created_at = excluded.created_at
-          WHERE session_summaries.session_id = excluded.session_id`,
-        )
-        .run(
-          input.summaryId,
-          input.sessionId,
-          input.sourceMessageFrom,
-          input.sourceMessageTo,
-          input.content,
-          input.modelProvider,
-          input.modelName,
-          input.createdAt.toISOString(),
-        );
-      if (inserted.changes !== 1) {
-        throw new DomainError("summary_id_collision");
-      }
-      const updated = this.db
-        .prepare(
-          `UPDATE sessions
-           SET current_summary_id = ?, updated_at = ?
-           WHERE session_id = ?`,
-        )
-        .run(input.summaryId, input.createdAt.toISOString(), input.sessionId);
-      if (updated.changes !== 1) {
-        throw new DomainError("session_not_found");
-      }
+      this.saveSummaryInTransaction(input);
       this.db.exec("COMMIT");
       return { ...input };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
+    }
+  }
+
+  saveSummaryWithLease(input: SaveLeasedSessionSummaryInput): SessionSummary {
+    assertSummary(input.summary);
+    const occurredAt = input.occurredAt.toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const lease = this.db.prepare(
+        `SELECT 1 AS valid
+         FROM runs
+         WHERE run_id = ? AND session_id = ? AND state = 'running'
+           AND lease_owner = ? AND lease_expires_at > ?`,
+      ).get(
+        input.runId,
+        input.summary.sessionId,
+        input.leaseOwner,
+        occurredAt,
+      ) as { valid: number } | undefined;
+      if (lease === undefined) {
+        throw new DomainError("run_lease_lost");
+      }
+      this.saveSummaryInTransaction(input.summary);
+      this.db.exec("COMMIT");
+      return { ...input.summary };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private saveSummaryInTransaction(input: SaveSessionSummaryInput): void {
+    const inserted = this.db
+      .prepare(
+        `INSERT INTO session_summaries (
+          summary_id, session_id, from_message_sequence,
+          to_message_sequence, content, model_provider, model_name, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(summary_id) DO UPDATE SET
+          from_message_sequence = excluded.from_message_sequence,
+          to_message_sequence = excluded.to_message_sequence,
+          content = excluded.content,
+          model_provider = excluded.model_provider,
+          model_name = excluded.model_name,
+          created_at = excluded.created_at
+        WHERE session_summaries.session_id = excluded.session_id`,
+      )
+      .run(
+        input.summaryId,
+        input.sessionId,
+        input.sourceMessageFrom,
+        input.sourceMessageTo,
+        input.content,
+        input.modelProvider,
+        input.modelName,
+        input.createdAt.toISOString(),
+      );
+    if (inserted.changes !== 1) {
+      throw new DomainError("summary_id_collision");
+    }
+    const updated = this.db
+      .prepare(
+        `UPDATE sessions
+         SET current_summary_id = ?, updated_at = ?
+         WHERE session_id = ?`,
+      )
+      .run(input.summaryId, input.createdAt.toISOString(), input.sessionId);
+    if (updated.changes !== 1) {
+      throw new DomainError("session_not_found");
     }
   }
 }

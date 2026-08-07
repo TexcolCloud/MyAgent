@@ -11,6 +11,7 @@ export interface FakeToolOptions {
   normalizedArguments: JsonValue;
   policyFacts?: ToolPolicyFacts;
   result?: ToolResult;
+  activateSkill?: string;
 }
 
 export class FakeTool implements ToolDefinition {
@@ -36,8 +37,14 @@ export class FakeTool implements ToolDefinition {
     };
   }
 
-  async execute(): Promise<ToolResult> {
+  async execute(
+    _args: JsonValue,
+    context: Parameters<ToolDefinition["execute"]>[1],
+  ): Promise<ToolResult> {
     this.executions += 1;
+    if (this.options.activateSkill !== undefined) {
+      context.activateSkill(this.options.activateSkill);
+    }
     return this.options.result ?? {
       ok: true,
       summary: `${this.name} completed`,

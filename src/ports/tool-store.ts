@@ -4,6 +4,12 @@ import type { PolicyEffect, PolicyFacts } from "../domain/policy.js";
 import type { ToolCall } from "../domain/tool-call.js";
 import type { ToolResult } from "./tool.js";
 
+export interface ToolSkillActivation {
+  skillName: string;
+  skillVersion: number;
+  contentSha256: string;
+}
+
 export interface RecordToolProposalInput {
   runId: RunId;
   leaseOwner: string;
@@ -36,6 +42,7 @@ export interface ToolStore {
     toolCallId: ToolCallId;
     leaseOwner: string;
     result: ToolResult;
+    activatedSkills: readonly ToolSkillActivation[];
     maxToolOutputBytes: number;
     maxRunToolOutputBytes: number;
     occurredAt: Date;

@@ -173,6 +173,12 @@ class MemorySessionStore implements SessionStore {
     this.currentSummary = { ...input };
     return this.currentSummary;
   }
+
+  saveSummaryWithLease(
+    input: Parameters<SessionStore["saveSummaryWithLease"]>[0],
+  ): SessionSummary {
+    return this.saveSummary(input.summary);
+  }
 }
 
 function message(sequence: number, text: string): SessionMessage {

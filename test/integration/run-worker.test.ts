@@ -16,7 +16,14 @@ import { PolicyEngine } from "../../src/application/policy-engine.js";
 import { PromptAssembler } from "../../src/application/prompt-assembler.js";
 import { CatalogService } from "../../src/config/catalog-service.js";
 import { loadCatalog, type CatalogSnapshot } from "../../src/config/catalog-loader.js";
-import { attemptIdFromUuid, runIdFromUuid, sessionIdFromUuid, toolCallIdFromUuid } from "../../src/domain/ids.js";
+import {
+  approvalIdFromUuid,
+  attemptIdFromUuid,
+  runIdFromUuid,
+  sessionIdFromUuid,
+  toolCallIdFromUuid,
+} from "../../src/domain/ids.js";
+import type { ModelChunk, ModelPort, ModelRequest } from "../../src/ports/model.js";
 import { RunWorker } from "../../src/runtime/run-worker.js";
 import { SystemClock } from "../../src/adapters/system-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
@@ -118,6 +125,109 @@ describe("RunWorker", () => {
       connection.close();
     }
   });
+
+  it("keeps one Session blocked on Approval while another Session completes", async () => {
+    const connection = openDatabase({
+      path: tempPath("run-worker-session-concurrency.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const clock = new SystemClock();
+      const ids = new FakeIds({
+        sessionIds: [
+          sessionIdFromUuid("00000000-0000-7000-8000-000000000041"),
+          sessionIdFromUuid("00000000-0000-7000-8000-000000000042"),
+        ],
+        runIds: [
+          runIdFromUuid("00000000-0000-7000-8000-000000000041"),
+          runIdFromUuid("00000000-0000-7000-8000-000000000042"),
+          runIdFromUuid("00000000-0000-7000-8000-000000000043"),
+        ],
+        attemptIds: [
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000041"),
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000042"),
+        ],
+        toolCallIds: [
+          toolCallIdFromUuid("00000000-0000-7000-8000-000000000041"),
+        ],
+        approvalIds: [
+          approvalIdFromUuid("00000000-0000-7000-8000-000000000041"),
+        ],
+      });
+      const create = new CreateRunService(
+        new CatalogService(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      );
+      const waiting = create.execute({
+        agentId: "primary",
+        sessionKey: "integration:blocked",
+        input: { type: "text", text: "approval request" },
+        idempotencyKey: "run-worker-approval-0001",
+        source: { kind: "http" },
+      });
+      const queued = create.execute({
+        agentId: "primary",
+        sessionKey: "integration:blocked",
+        input: { type: "text", text: "must stay queued" },
+        idempotencyKey: "run-worker-approval-0002",
+        source: { kind: "http" },
+      });
+      const independent = create.execute({
+        agentId: "primary",
+        sessionKey: "integration:independent",
+        input: { type: "text", text: "finish independently" },
+        idempotencyKey: "run-worker-approval-0003",
+        source: { kind: "http" },
+      });
+      const registry = new ToolRegistry();
+      registry.register(new FakeTool({
+        name: "run_command",
+        effect: "side_effect",
+        normalizedArguments: { program: "node", args: [] },
+      }));
+      const model = new RoutingModel();
+      const advance = new AdvanceRunService({
+        runs,
+        tools: new SqliteToolRepository(connection.db),
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+      });
+      const worker = new RunWorker({
+        runs,
+        advance,
+        clock,
+        workerId: "worker-concurrency",
+        concurrency: 2,
+        leaseDurationMs: 1_000,
+        idleDelayMs: 5,
+      });
+
+      worker.start();
+      await waitFor(
+        () =>
+          runs.getRun(waiting.runId).state === "waiting_approval" &&
+          runs.getRun(independent.runId).state === "completed",
+      );
+      await worker.stop();
+
+      expect(runs.getRun(queued.runId).state).toBe("queued");
+      expect(model.operatorInputs).not.toContain("must stay queued");
+    } finally {
+      connection.close();
+    }
+  });
 });
 
 async function waitFor(condition: () => boolean): Promise<void> {
@@ -125,5 +235,46 @@ async function waitFor(condition: () => boolean): Promise<void> {
   while (!condition()) {
     if (Date.now() >= deadline) throw new Error("timed_out_waiting_for_worker");
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+class RoutingModel implements ModelPort {
+  readonly operatorInputs: string[] = [];
+
+  async *streamAttempt(
+    request: ModelRequest,
+    signal: AbortSignal,
+  ): AsyncIterable<ModelChunk> {
+    signal.throwIfAborted();
+    const input = request.messages.find(
+      (message) => message.name === "current_operator_input",
+    )?.content ?? "";
+    const text = input.includes("approval request")
+      ? "approval request"
+      : input.includes("must stay queued")
+        ? "must stay queued"
+        : "finish independently";
+    this.operatorInputs.push(text);
+    if (text === "approval request") {
+      yield {
+        type: "tool_call",
+        call: {
+          name: "run_command",
+          arguments: { program: "node", args: [] },
+        },
+      };
+      yield {
+        type: "completed",
+        finishReason: "tool_calls",
+        usage: { inputTokens: 10, outputTokens: 2 },
+      };
+      return;
+    }
+    yield { type: "text_delta", text: "independent answer" };
+    yield {
+      type: "completed",
+      finishReason: "stop",
+      usage: { inputTokens: 10, outputTokens: 2 },
+    };
   }
 }

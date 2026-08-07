@@ -9,6 +9,7 @@ import type { ToolCall } from "../../domain/tool-call.js";
 import type { ToolCallState } from "../../domain/states.js";
 import type {
   RecordToolProposalInput,
+  ToolSkillActivation,
   ToolStore,
 } from "../../ports/tool-store.js";
 import type { ToolResult } from "../../ports/tool.js";
@@ -184,6 +185,7 @@ export class SqliteToolRepository implements ToolStore {
     toolCallId: ToolCallId;
     leaseOwner: string;
     result: ToolResult;
+    activatedSkills: readonly ToolSkillActivation[];
     maxToolOutputBytes: number;
     maxRunToolOutputBytes: number;
     occurredAt: Date;
@@ -205,6 +207,30 @@ export class SqliteToolRepository implements ToolStore {
          WHERE tool_call_id = ? AND run_id = ? AND state = 'executing'`,
       ).run(state, canonicalize(input.result), occurredAt, input.toolCallId, input.runId);
       if (updated.changes !== 1) throw new DomainError("tool_not_executing");
+      for (const skill of input.activatedSkills) {
+        const inserted = this.db.prepare(
+          `INSERT OR IGNORE INTO run_activated_skills (
+             run_id, skill_name, skill_version, content_sha256, activated_at
+           ) VALUES (?, ?, ?, ?, ?)`,
+        ).run(
+          input.runId,
+          skill.skillName,
+          skill.skillVersion,
+          skill.contentSha256,
+          occurredAt,
+        );
+        if (inserted.changes === 1) {
+          this.appendEvent(
+            input.runId,
+            "skill.activated",
+            canonicalize({
+              skillName: skill.skillName,
+              skillVersion: skill.skillVersion,
+            }),
+            occurredAt,
+          );
+        }
+      }
       this.appendEvent(
         input.runId,
         input.result.ok ? "tool.completed" : "tool.failed",
@@ -235,11 +261,24 @@ export class SqliteToolRepository implements ToolStore {
       this.db.prepare(
         `UPDATE tool_calls SET state = 'unknown', updated_at = ? WHERE tool_call_id = ?`,
       ).run(occurredAt, input.toolCallId);
+      const active = this.db.prepare(
+        `SELECT active_started_at FROM runs WHERE run_id = ?`,
+      ).get(input.runId) as { active_started_at: string | null } | undefined;
+      const activeSeconds = active?.active_started_at === null || active === undefined
+        ? 0
+        : Math.ceil(
+            Math.max(
+              0,
+              input.occurredAt.getTime() -
+                new Date(active.active_started_at).getTime(),
+            ) / 1_000,
+          );
       this.db.prepare(
         `UPDATE runs SET state = 'waiting_reconciliation', lease_owner = NULL,
-           lease_expires_at = NULL, active_started_at = NULL, updated_at = ?
+           lease_expires_at = NULL, active_started_at = NULL,
+           active_elapsed_seconds = active_elapsed_seconds + ?, updated_at = ?
          WHERE run_id = ? AND lease_owner = ?`,
-      ).run(occurredAt, input.runId, input.leaseOwner);
+      ).run(activeSeconds, occurredAt, input.runId, input.leaseOwner);
       this.appendEvent(input.runId, "tool.unknown", canonicalize({ toolCallId: input.toolCallId }), occurredAt);
       this.appendEvent(input.runId, "run.waiting", canonicalize({ state: "waiting_reconciliation" }), occurredAt);
       return "reconciliation";

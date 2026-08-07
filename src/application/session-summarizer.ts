@@ -34,12 +34,21 @@ export interface EnsureWithinBudgetResult {
   usage?: ModelUsage;
 }
 
+export interface SummaryAttemptLifecycle {
+  onAttemptStarted(attemptNumber: number): void;
+  onAttemptFailed(attemptNumber: number, error: unknown): void;
+  saveSummary(
+    input: Parameters<SessionStore["saveSummary"]>[0],
+  ): ReturnType<SessionStore["saveSummary"]>;
+}
+
 export class SessionSummarizer {
   constructor(private readonly options: SessionSummarizerOptions) {}
 
   async ensureWithinBudget(
     input: PromptAssemblerInput,
     signal: AbortSignal,
+    lifecycle?: SummaryAttemptLifecycle,
   ): Promise<EnsureWithinBudgetResult> {
     const request = await this.options.assembler.build(input);
     if (withinBudget(request)) {
@@ -69,13 +78,15 @@ export class SessionSummarizer {
 
     const summaryRequest = buildSummaryRequest(input, messages, currentSummary);
     const startedAt = this.options.clock.now().getTime();
-    const attempt = await this.summarize(summaryRequest, signal);
+    const attempt = await this.summarize(summaryRequest, signal, lifecycle);
     const firstMessage = messages[0];
     const lastMessage = messages.at(-1);
     if (firstMessage === undefined || lastMessage === undefined) {
       throw new Error("unreachable_empty_summary_source");
     }
-    this.options.sessionStore.saveSummary({
+    const saveSummary = lifecycle?.saveSummary.bind(lifecycle) ??
+      this.options.sessionStore.saveSummary.bind(this.options.sessionStore);
+    saveSummary({
       summaryId: `summary:${input.sessionId}:${String(lastMessage.sequence)}`,
       sessionId: input.sessionId,
       sourceMessageFrom:
@@ -105,6 +116,7 @@ export class SessionSummarizer {
   private async summarize(
     request: ModelRequest,
     signal: AbortSignal,
+    lifecycle?: SummaryAttemptLifecycle,
   ): Promise<{
     text: string;
     usage: ModelUsage;
@@ -113,6 +125,7 @@ export class SessionSummarizer {
     for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt += 1) {
       let text = "";
       let usage: ModelUsage | undefined;
+      lifecycle?.onAttemptStarted(attempt);
       try {
         for await (const chunk of this.options.model.streamAttempt(request, signal)) {
           if (chunk.type === "text_delta") {
@@ -134,6 +147,7 @@ export class SessionSummarizer {
         }
         return { text, usage, attempts: attempt };
       } catch (error) {
+        lifecycle?.onAttemptFailed(attempt, error);
         if (
           !(error instanceof ModelProviderError) ||
           !error.transient ||
