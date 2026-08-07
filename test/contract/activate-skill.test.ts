@@ -42,6 +42,7 @@ describe("activate_skill Tool", () => {
         "00000000-0000-7000-8000-000000000001",
       ),
       signal: new AbortController().signal,
+      leaseOwner: "test-worker",
       remainingRunOutputBytes: 1_024,
       activateSkill(skillName) {
         if (!activated.has(skillName)) {

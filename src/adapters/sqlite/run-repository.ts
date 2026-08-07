@@ -663,6 +663,9 @@ export class SqliteRunRepository implements RunStore {
                updated_at = ? WHERE run_id = ? AND state = 'running'`,
             ).run(occurredAt, occurredAt, childId);
           } else {
+            if (child.state === "waiting_approval") {
+              this.denyPendingApprovalForCancellationInTransaction(childId, occurredAt);
+            }
             this.db.prepare(
               `UPDATE runs SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
                active_started_at = NULL, updated_at = ? WHERE run_id = ?`,
@@ -690,22 +693,7 @@ export class SqliteRunRepository implements RunStore {
         return this.getRun(input.runId);
       }
       if (run.state === "waiting_approval") {
-        const approval = this.db.prepare(
-          `SELECT approval_id, tool_call_id FROM approvals WHERE run_id = ? AND state = 'pending'`,
-        ).get(input.runId) as { approval_id: string; tool_call_id: string } | undefined;
-        if (approval !== undefined) {
-          this.db.prepare(
-            `UPDATE approvals SET state = 'denied', resolved_at = ?, resolution_reason = 'run_cancelled'
-             WHERE approval_id = ? AND state = 'pending'`,
-          ).run(occurredAt, approval.approval_id);
-          this.db.prepare(
-            `UPDATE tool_calls SET state = 'denied', result_json = ?, updated_at = ?
-             WHERE tool_call_id = ? AND state = 'waiting_approval'`,
-          ).run(canonicalize({ ok: false, code: "tool_denied", reason: "run_cancelled" }), occurredAt, approval.tool_call_id);
-          this.appendEventInTransaction(input.runId, "approval.resolved", canonicalize({
-            approvalId: approval.approval_id, state: "denied", reason: "run_cancelled",
-          }), occurredAt);
-        }
+        this.denyPendingApprovalForCancellationInTransaction(input.runId, occurredAt);
       }
       this.db.prepare(
         `UPDATE runs SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
@@ -713,6 +701,7 @@ export class SqliteRunRepository implements RunStore {
          WHERE run_id = ? AND state IN ('queued', 'waiting_approval', 'waiting_reconciliation')`,
       ).run(occurredAt, input.runId);
       this.appendEventInTransaction(input.runId, "run.cancelled", canonicalize({ requested: false }), occurredAt);
+      this.resumeParentFromChildInTransaction(input.runId, occurredAt);
       return this.getRun(input.runId);
     });
   }
@@ -826,8 +815,36 @@ export class SqliteRunRepository implements RunStore {
         canonicalize({ requestedAt: context.cancellationRequestedAt.toISOString() }),
         occurredAt,
       );
+      this.resumeParentFromChildInTransaction(input.runId, occurredAt);
       return this.getRun(input.runId);
     });
+  }
+
+  private denyPendingApprovalForCancellationInTransaction(
+    runId: RunId,
+    occurredAt: string,
+  ): void {
+    const approval = this.db.prepare(
+      `SELECT approval_id, tool_call_id FROM approvals WHERE run_id = ? AND state = 'pending'`,
+    ).get(runId) as { approval_id: string; tool_call_id: string } | undefined;
+    if (approval === undefined) return;
+    this.db.prepare(
+      `UPDATE approvals SET state = 'denied', resolved_at = ?, resolution_reason = 'run_cancelled'
+       WHERE approval_id = ? AND state = 'pending'`,
+    ).run(occurredAt, approval.approval_id);
+    this.db.prepare(
+      `UPDATE tool_calls SET state = 'denied', result_json = ?, updated_at = ?
+       WHERE tool_call_id = ? AND state = 'waiting_approval'`,
+    ).run(
+      canonicalize({ ok: false, code: "tool_denied", reason: "run_cancelled" }),
+      occurredAt,
+      approval.tool_call_id,
+    );
+    this.appendEventInTransaction(runId, "approval.resolved", canonicalize({
+      approvalId: approval.approval_id,
+      state: "denied",
+      reason: "run_cancelled",
+    }), occurredAt);
   }
 
   private resumeParentFromChildInTransaction(childRunId: RunId, occurredAt: string): void {
@@ -1136,14 +1153,27 @@ function boundedDelegationResult(value: JsonValue): {
   result: JsonValue;
   truncated: boolean;
 } {
+  const maxBytes = 32_768;
   const serialized = JSON.stringify(value);
-  if (Buffer.byteLength(serialized, "utf8") <= 32_768) {
+  if (Buffer.byteLength(serialized, "utf8") <= maxBytes) {
     return { result: value, truncated: false };
   }
-  return {
-    result: { truncated: true, preview: serialized.slice(0, 32_768) },
+  const codePoints = Array.from(serialized.slice(0, maxBytes));
+  const buildResult = (length: number) => ({
+    result: { truncated: true, preview: codePoints.slice(0, length).join("") },
     truncated: true,
-  };
+  });
+  let lower = 0;
+  let upper = codePoints.length;
+  while (lower < upper) {
+    const candidate = Math.ceil((lower + upper) / 2);
+    if (Buffer.byteLength(JSON.stringify(buildResult(candidate)), "utf8") <= maxBytes) {
+      lower = candidate;
+    } else {
+      upper = candidate - 1;
+    }
+  }
+  return buildResult(lower);
 }
 
 function mapRun(row: RunRow): Run {

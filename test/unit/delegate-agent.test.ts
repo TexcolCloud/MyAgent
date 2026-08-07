@@ -7,6 +7,7 @@ import { parseAgentId, runIdFromUuid, sessionIdFromUuid, toolCallIdFromUuid } fr
 
 describe("delegate_agent", () => {
   it("rejects undeclared, recursive, and excessive delegation", async () => {
+    let delegationDepth = 0;
     const delegate = new DelegateAgentService({
       catalog: { resolve: () => ({ id: parseAgentId("researcher"), revision: {} as never }) },
       runs: {
@@ -14,7 +15,7 @@ describe("delegate_agent", () => {
           run: {
             runId: runIdFromUuid("00000000-0000-7000-8000-000000000001"),
             rootRunId: runIdFromUuid("00000000-0000-7000-8000-000000000001"),
-            delegationDepth: 0,
+            delegationDepth,
           },
           revision: {
             delegates: [parseAgentId("researcher")],
@@ -32,6 +33,13 @@ describe("delegate_agent", () => {
       parentToolCallId: toolCallIdFromUuid("00000000-0000-7000-8000-000000000001"),
       targetAgentId: parseAgentId("not-allowed"), task: "research", context: {}, leaseOwner: "worker",
     })).toThrow(expect.objectContaining({ code: "delegate_not_allowed" }));
+
+    delegationDepth = 1;
+    expect(() => delegate.execute({
+      parentRunId: runIdFromUuid("00000000-0000-7000-8000-000000000001"),
+      parentToolCallId: toolCallIdFromUuid("00000000-0000-7000-8000-000000000001"),
+      targetAgentId: parseAgentId("researcher"), task: "research", context: {}, leaseOwner: "worker",
+    })).toThrow(expect.objectContaining({ code: "delegation_depth_exceeded" }));
 
     await expect(delegateAgentTool.parseAndNormalize(
       { targetAgentId: "researcher", task: "research", context: {} },

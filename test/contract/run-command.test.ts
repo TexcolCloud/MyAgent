@@ -36,6 +36,7 @@ describe("run_command Tool", () => {
         "00000000-0000-7000-8000-000000000001",
       ),
       signal: new AbortController().signal,
+      leaseOwner: "test-worker",
       remainingRunOutputBytes: DEFAULT_RUN_LIMITS.maxRunToolOutputBytes,
       activateSkill() {},
     };

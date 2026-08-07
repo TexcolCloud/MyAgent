@@ -146,6 +146,8 @@ class MemorySessionStore implements SessionStore {
     private summary: SessionSummary | null,
   ) {}
 
+  delete(): void {}
+
   getCurrentSummary(): SessionSummary | null {
     return this.summary;
   }

@@ -12,7 +12,7 @@ export interface ToolExecutionContext extends ToolNormalizeContext {
   runId: RunId;
   toolCallId: ToolCallId;
   signal: AbortSignal;
-  leaseOwner?: string;
+  leaseOwner: string;
   remainingRunOutputBytes: number;
   activateSkill(skillName: string): void;
 }

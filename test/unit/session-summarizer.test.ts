@@ -154,6 +154,8 @@ class MemorySessionStore implements SessionStore {
 
   constructor(readonly messages: SessionMessage[]) {}
 
+  delete(): void {}
+
   getCurrentSummary(): SessionSummary | null {
     return this.currentSummary;
   }
