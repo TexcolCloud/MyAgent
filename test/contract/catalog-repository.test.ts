@@ -26,6 +26,45 @@ describe("SqliteCatalogRepository", () => {
       connection.close();
     }
   });
+
+  it("keeps an identical revision save idempotent", () => {
+    const connection = openDatabase({
+      path: tempPath("catalog-idempotency.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const repository = new SqliteCatalogRepository(connection.db);
+      const revision = agentRevisionFixture();
+
+      repository.save(revision);
+      repository.save(revision);
+
+      expect(connection.db.prepare("SELECT COUNT(*) AS count FROM agent_revisions").get())
+        .toEqual({ count: 1 });
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("rejects a revision ID collision without replacing stored content", () => {
+    const connection = openDatabase({
+      path: tempPath("catalog-collision.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const repository = new SqliteCatalogRepository(connection.db);
+      const revision = agentRevisionFixture();
+      repository.save(revision);
+
+      expect(() => repository.save({ ...revision, prompt: "Different prompt." }))
+        .toThrowError(expect.objectContaining({ code: "revision_hash_collision" }));
+      expect(repository.get(revision.revisionId)).toEqual(revision);
+    } finally {
+      connection.close();
+    }
+  });
 });
 
 function agentRevisionFixture(): AgentRevisionSnapshot {

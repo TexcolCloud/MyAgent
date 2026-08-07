@@ -20,19 +20,47 @@ export function migrate(db: DatabaseSync): void {
   `);
 
   const migrations = loadMigrations();
-  const highestKnownVersion = migrations.at(-1)?.version ?? 0;
-  const appliedVersions = db
-    .prepare("SELECT version FROM schema_migrations ORDER BY version")
-    .all() as Array<{ version: number }>;
+  while (applyNextMigration(db, migrations)) {
+    // Reacquire the write lock and revalidate history before every migration.
+  }
+}
 
+function applyNextMigration(db: DatabaseSync, migrations: readonly Migration[]): boolean {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const appliedVersions = db
+      .prepare("SELECT version FROM schema_migrations ORDER BY version")
+      .all() as Array<{ version: number }>;
+    assertForwardOnlyHistory(appliedVersions, migrations);
+    const migration = migrations[appliedVersions.length];
+
+    if (migration !== undefined) {
+      db.exec(migration.sql);
+      db.prepare(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
+      ).run(migration.version);
+    }
+
+    db.exec("COMMIT");
+    return migration !== undefined;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function assertForwardOnlyHistory(
+  appliedVersions: readonly { version: number }[],
+  migrations: readonly Migration[],
+): void {
+  const highestKnownVersion = migrations.at(-1)?.version ?? 0;
   if (appliedVersions.some(({ version }) => version > highestKnownVersion)) {
     throw new Error("database_newer_than_binary");
   }
 
-  const applied = new Set(appliedVersions.map(({ version }) => version));
-  for (const migration of migrations) {
-    if (!applied.has(migration.version)) {
-      applyMigration(db, migration);
+  for (const [index, applied] of appliedVersions.entries()) {
+    if (migrations[index]?.version !== applied.version) {
+      throw new Error("inconsistent_migration_history");
     }
   }
 }
@@ -53,18 +81,4 @@ function loadMigrations(): Migration[] {
     })
     .filter((migration): migration is Migration => migration !== null)
     .sort((left, right) => left.version - right.version);
-}
-
-function applyMigration(db: DatabaseSync, migration: Migration): void {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    db.exec(migration.sql);
-    db.prepare(
-      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
-    ).run(migration.version);
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
 }

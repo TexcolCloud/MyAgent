@@ -27,7 +27,9 @@ CREATE TABLE messages (
   role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
   content_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  UNIQUE (session_id, sequence)
+  UNIQUE (session_id, sequence),
+  FOREIGN KEY (run_id, session_id)
+    REFERENCES runs(run_id, session_id) ON DELETE CASCADE
 );
 
 CREATE TABLE session_summaries (
@@ -40,6 +42,34 @@ CREATE TABLE session_summaries (
   model_name TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE TRIGGER sessions_current_summary_owner_on_insert
+BEFORE INSERT ON sessions
+FOR EACH ROW
+WHEN NEW.current_summary_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM session_summaries
+    WHERE summary_id = NEW.current_summary_id
+      AND session_id = NEW.session_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'current_summary_owner_mismatch');
+END;
+
+CREATE TRIGGER sessions_current_summary_owner_on_update
+BEFORE UPDATE OF current_summary_id, session_id ON sessions
+FOR EACH ROW
+WHEN NEW.current_summary_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM session_summaries
+    WHERE summary_id = NEW.current_summary_id
+      AND session_id = NEW.session_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'current_summary_owner_mismatch');
+END;
 
 CREATE TABLE runs (
   run_id TEXT PRIMARY KEY,
@@ -65,7 +95,8 @@ CREATE TABLE runs (
   failure_code TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE (session_id, fifo_sequence)
+  UNIQUE (session_id, fifo_sequence),
+  UNIQUE (run_id, session_id)
 );
 
 CREATE UNIQUE INDEX runs_one_blocking_per_session
@@ -109,7 +140,8 @@ CREATE TABLE tool_calls (
   result_json TEXT,
   error_json TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  UNIQUE (tool_call_id, run_id)
 );
 
 CREATE TRIGGER tool_calls_arguments_immutable
@@ -124,14 +156,16 @@ END;
 
 CREATE TABLE approvals (
   approval_id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-  tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls(tool_call_id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL,
+  tool_call_id TEXT NOT NULL UNIQUE,
   state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'denied', 'expired')),
   arguments_sha256 TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   resolved_at TEXT,
   resolution_reason TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (tool_call_id, run_id)
+    REFERENCES tool_calls(tool_call_id, run_id) ON DELETE CASCADE
 );
 
 CREATE TABLE reconciliations (
@@ -154,10 +188,40 @@ CREATE TABLE idempotency_keys (
   PRIMARY KEY (agent_id, session_key, key)
 );
 
+CREATE TRIGGER idempotency_keys_owner_on_insert
+BEFORE INSERT ON idempotency_keys
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runs
+  JOIN sessions ON sessions.session_id = runs.session_id
+  WHERE runs.run_id = NEW.run_id
+    AND sessions.agent_id = NEW.agent_id
+    AND sessions.session_key = NEW.session_key
+)
+BEGIN
+  SELECT RAISE(ABORT, 'idempotency_key_owner_mismatch');
+END;
+
+CREATE TRIGGER idempotency_keys_owner_on_update
+BEFORE UPDATE OF agent_id, session_key, run_id ON idempotency_keys
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runs
+  JOIN sessions ON sessions.session_id = runs.session_id
+  WHERE runs.run_id = NEW.run_id
+    AND sessions.agent_id = NEW.agent_id
+    AND sessions.session_key = NEW.session_key
+)
+BEGIN
+  SELECT RAISE(ABORT, 'idempotency_key_owner_mismatch');
+END;
+
 CREATE TABLE outbox_deliveries (
   delivery_id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-  run_id TEXT REFERENCES runs(run_id) ON DELETE CASCADE,
+  run_id TEXT,
   channel TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'delivered', 'failed')),
@@ -166,7 +230,9 @@ CREATE TABLE outbox_deliveries (
   delivered_at TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (run_id, session_id)
+    REFERENCES runs(run_id, session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX outbox_deliveries_pending
