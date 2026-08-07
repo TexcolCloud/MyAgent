@@ -1,3 +1,5 @@
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 
 import { beforeAll, describe, expect, it } from "vitest";
@@ -14,7 +16,18 @@ import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
-describe("SqliteRunRepository queue", () => {
+const claimWorkerOptions = process.env.MYAGENT_CLAIM_WORKER_OPTIONS;
+
+if (claimWorkerOptions !== undefined) {
+  describe("claim contention worker", () => {
+    it("claims once in a child process", () => {
+      runContentionWorker(JSON.parse(claimWorkerOptions) as ClaimWorkerOptions);
+    });
+  });
+}
+
+if (claimWorkerOptions === undefined) {
+  describe("SqliteRunRepository queue", () => {
   let catalogSnapshot: CatalogSnapshot;
 
   beforeAll(async () => {
@@ -53,6 +66,71 @@ describe("SqliteRunRepository queue", () => {
       harness.connection.close();
     }
   });
+
+  it("claims the lowest FIFO sequence when timestamps tie and Run IDs reverse", () => {
+    const harness = createQueueHarness(catalogSnapshot, "fifo-tie-break.db", {
+      sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000001")],
+      runIds: [
+        runIdFromUuid("00000000-0000-7000-8000-000000000002"),
+        runIdFromUuid("00000000-0000-7000-8000-000000000001"),
+      ],
+    });
+    try {
+      const first = create(harness.service, "session:a", "request-a001");
+      create(harness.service, "session:a", "request-a002");
+
+      expect(
+        harness.store.claimNextEligible(
+          "worker-1",
+          new Date("2026-08-07T00:00:01.000Z"),
+          new Date("2026-08-07T00:00:30.000Z"),
+        )?.runId,
+      ).toBe(first.runId);
+    } finally {
+      harness.connection.close();
+    }
+  });
+
+  it("serializes overlapping child-process claims through SQLite's busy timeout", async () => {
+    const harness = createQueueHarness(catalogSnapshot, "claim-contention.db");
+    const startPath = tempPath("claim-contention.start");
+    const now = new Date("2026-08-07T00:00:01.000Z");
+    const leaseUntil = new Date("2026-08-07T00:00:30.000Z");
+    let writerTransactionOpen = false;
+    const workers: ContentionWorker[] = [];
+    try {
+      const created = create(harness.service, "session:a", "request-a001");
+      harness.connection.db.exec("BEGIN IMMEDIATE");
+      writerTransactionOpen = true;
+
+      workers.push(
+        startContentionWorker(harness.databasePath, startPath, "worker-1", now, leaseUntil),
+        startContentionWorker(harness.databasePath, startPath, "worker-2", now, leaseUntil),
+      );
+      await Promise.all(workers.map((worker) => waitForFile(worker.readyPath)));
+      writeFileSync(startPath, "start");
+      await Promise.all(workers.map((worker) => waitForFile(worker.attemptingPath)));
+
+      expect(harness.store.getRun(created.runId).state).toBe("queued");
+      harness.connection.db.exec("COMMIT");
+      writerTransactionOpen = false;
+
+      await Promise.all(workers.map((worker) => worker.completed));
+      const results = workers.map((worker) =>
+        JSON.parse(readFileSync(worker.resultPath, "utf8")) as ClaimWorkerResult,
+      );
+      expect(results.map((result) => result.runId).filter(Boolean)).toEqual([
+        created.runId,
+      ]);
+      expect(harness.store.getRun(created.runId).state).toBe("running");
+    } finally {
+      if (writerTransactionOpen) {
+        harness.connection.db.exec("ROLLBACK");
+      }
+      workers.forEach((worker) => worker.child.kill());
+      harness.connection.close();
+    }
+  }, 10_000);
 
   it("reclaims an expired running Run without a duplicate started event", () => {
     const harness = createQueueHarness(catalogSnapshot, "run-reclaim.db");
@@ -236,7 +314,8 @@ describe("SqliteRunRepository queue", () => {
       harness.connection.close();
     }
   });
-});
+  });
+}
 
 interface QueueHarness {
   connection: SqliteDatabase;
@@ -245,7 +324,23 @@ interface QueueHarness {
   store: SqliteRunRepository;
 }
 
-function createQueueHarness(snapshot: CatalogSnapshot, fileName: string): QueueHarness {
+function createQueueHarness(
+  snapshot: CatalogSnapshot,
+  fileName: string,
+  ids: ConstructorParameters<typeof FakeIds>[0] = {
+    sessionIds: [
+      sessionIdFromUuid("00000000-0000-7000-8000-000000000001"),
+      sessionIdFromUuid("00000000-0000-7000-8000-000000000002"),
+      sessionIdFromUuid("00000000-0000-7000-8000-000000000003"),
+    ],
+    runIds: [
+      runIdFromUuid("00000000-0000-7000-8000-000000000001"),
+      runIdFromUuid("00000000-0000-7000-8000-000000000002"),
+      runIdFromUuid("00000000-0000-7000-8000-000000000003"),
+      runIdFromUuid("00000000-0000-7000-8000-000000000004"),
+    ],
+  },
+): QueueHarness {
   const databasePath = tempPath(fileName);
   const connection = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
   migrate(connection.db);
@@ -257,19 +352,7 @@ function createQueueHarness(snapshot: CatalogSnapshot, fileName: string): QueueH
     new CatalogService(snapshot),
     store,
     new FakeClock(new Date("2026-08-07T00:00:00.000Z")),
-    new FakeIds({
-      sessionIds: [
-        sessionIdFromUuid("00000000-0000-7000-8000-000000000001"),
-        sessionIdFromUuid("00000000-0000-7000-8000-000000000002"),
-        sessionIdFromUuid("00000000-0000-7000-8000-000000000003"),
-      ],
-      runIds: [
-        runIdFromUuid("00000000-0000-7000-8000-000000000001"),
-        runIdFromUuid("00000000-0000-7000-8000-000000000002"),
-        runIdFromUuid("00000000-0000-7000-8000-000000000003"),
-        runIdFromUuid("00000000-0000-7000-8000-000000000004"),
-      ],
-    }),
+    new FakeIds(ids),
   );
   return { connection, databasePath, service, store };
 }
@@ -286,4 +369,126 @@ function create(
     idempotencyKey,
     source: { kind: "http" },
   });
+}
+
+interface ClaimWorkerResult {
+  runId: string | null;
+}
+
+interface ClaimWorkerOptions {
+  databasePath: string;
+  startPath: string;
+  readyPath: string;
+  attemptingPath: string;
+  resultPath: string;
+  leaseOwner: string;
+  now: string;
+  leaseUntil: string;
+}
+
+interface ContentionWorker {
+  child: ChildProcess;
+  readyPath: string;
+  attemptingPath: string;
+  resultPath: string;
+  completed: Promise<void>;
+}
+
+function startContentionWorker(
+  databasePath: string,
+  startPath: string,
+  leaseOwner: string,
+  now: Date,
+  leaseUntil: Date,
+): ContentionWorker {
+  const workerToken = leaseOwner.replaceAll(/[^a-zA-Z0-9]/g, "-");
+  const options: ClaimWorkerOptions = {
+    databasePath,
+    startPath,
+    readyPath: tempPath(`claim-contention-${workerToken}.ready`),
+    attemptingPath: tempPath(`claim-contention-${workerToken}.attempting`),
+    resultPath: tempPath(`claim-contention-${workerToken}.result`),
+    leaseOwner,
+    now: now.toISOString(),
+    leaseUntil: leaseUntil.toISOString(),
+  };
+  const child = spawn(
+    process.execPath,
+    [
+      path.resolve("node_modules/vitest/vitest.mjs"),
+      "run",
+      "test/integration/run-queue.test.ts",
+      "--reporter=dot",
+    ],
+    {
+      env: {
+        ...process.env,
+        MYAGENT_CLAIM_WORKER_OPTIONS: JSON.stringify(options),
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  const stderr: string[] = [];
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => stderr.push(chunk));
+
+  const completed = new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`claim worker exited with ${code}: ${stderr.join("")}`));
+      }
+    });
+  });
+
+  return {
+    child,
+    readyPath: options.readyPath,
+    attemptingPath: options.attemptingPath,
+    resultPath: options.resultPath,
+    completed,
+  };
+}
+
+function runContentionWorker(options: ClaimWorkerOptions): void {
+  const connection = openDatabase({
+    path: options.databasePath,
+    busyTimeoutMs: 2_000,
+  });
+  try {
+    const store = new SqliteRunRepository(
+      connection.db,
+      new SqliteCatalogRepository(connection.db),
+    );
+    writeFileSync(options.readyPath, "ready");
+    waitForFileSync(options.startPath);
+    writeFileSync(options.attemptingPath, "attempting");
+    const run = store.claimNextEligible(
+      options.leaseOwner,
+      new Date(options.now),
+      new Date(options.leaseUntil),
+    );
+    writeFileSync(options.resultPath, JSON.stringify({ runId: run?.runId ?? null }));
+  } finally {
+    connection.close();
+  }
+}
+
+async function waitForFile(filePath: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(filePath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${filePath}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function waitForFileSync(filePath: string): void {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(filePath)) {
+    Atomics.wait(signal, 0, 0, 10);
+  }
 }

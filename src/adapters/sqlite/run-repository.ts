@@ -194,6 +194,12 @@ export class SqliteRunRepository implements RunStore {
            FROM runs AS candidate
            WHERE (
              candidate.state = 'queued'
+             AND candidate.fifo_sequence = (
+               SELECT MIN(queued.fifo_sequence)
+               FROM runs AS queued
+               WHERE queued.session_id = candidate.session_id
+                 AND queued.state = 'queued'
+             )
              AND NOT EXISTS (
                SELECT 1
                FROM runs AS blocking
