@@ -220,6 +220,21 @@ describe("delegation", () => {
     } finally { connection.close(); }
   });
 
+  it("includes the result envelope in the child result byte bound", () => {
+    const connection = openDatabase({ path: tempPath("delegation-result-envelope.db"), busyTimeoutMs: 5_000 });
+    try {
+      const setup = createBlockedDelegation(connection, snapshot, 301, "delegation:result-envelope");
+      setup.runs.claimNextEligible("child-worker", setup.clock.now(), new Date(setup.clock.now().getTime() + 30_000));
+      const attemptId = attemptIdFromUuid("00000000-0000-7000-8000-000000000309");
+      setup.runs.beginModelAttempt({ runId: setup.child.childRunId, leaseOwner: "child-worker", attemptId, purpose: "run", consumeModelTurn: true, modelTurnLimit: 20, occurredAt: setup.clock.now() });
+      setup.runs.completeRun({ runId: setup.child.childRunId, leaseOwner: "child-worker", attemptId, text: "x".repeat(32_720), finishReason: "stop", usage: { inputTokens: 1, outputTokens: 1 }, occurredAt: setup.clock.now() });
+
+      const row = connection.db.prepare("SELECT result_json FROM tool_calls WHERE run_id = ? AND tool_name = 'delegate_agent'").get(setup.parent.runId) as { result_json: string };
+      const result = JSON.parse(row.result_json) as { content: { result: unknown } };
+      expect(Buffer.byteLength(JSON.stringify(result.content.result), "utf8")).toBeLessThanOrEqual(32_768);
+    } finally { connection.close(); }
+  });
+
   it("retries an unlinked delegation checkpoint without marking it unknown", () => {
     const connection = openDatabase({ path: tempPath("delegation-recovery.db"), busyTimeoutMs: 5_000 });
     try {

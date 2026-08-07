@@ -1155,8 +1155,9 @@ function boundedDelegationResult(value: JsonValue): {
 } {
   const maxBytes = 32_768;
   const serialized = JSON.stringify(value);
-  if (Buffer.byteLength(serialized, "utf8") <= maxBytes) {
-    return { result: value, truncated: false };
+  const completeResult = { result: value, truncated: false };
+  if (Buffer.byteLength(JSON.stringify(completeResult), "utf8") <= maxBytes) {
+    return completeResult;
   }
   const codePoints = Array.from(serialized.slice(0, maxBytes));
   const buildResult = (length: number) => ({
