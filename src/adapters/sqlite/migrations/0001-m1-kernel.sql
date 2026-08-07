@@ -83,6 +83,7 @@ CREATE TABLE runs (
   blocked_by_child_run_id TEXT REFERENCES runs(run_id) ON DELETE SET NULL,
   lease_owner TEXT,
   lease_expires_at TEXT,
+  cancellation_requested_at TEXT,
   active_started_at TEXT,
   model_turn_count INTEGER NOT NULL DEFAULT 0 CHECK (model_turn_count >= 0),
   tool_call_count INTEGER NOT NULL DEFAULT 0 CHECK (tool_call_count >= 0),

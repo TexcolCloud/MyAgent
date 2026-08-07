@@ -545,6 +545,47 @@ export class SqliteRunRepository implements RunStore {
     });
   }
 
+  cancel(input: { runId: RunId; occurredAt: Date }): Run {
+    const occurredAt = input.occurredAt.toISOString();
+    return this.inImmediateTransaction(() => {
+      const run = this.getRun(input.runId);
+      if (["completed", "failed", "cancelled"].includes(run.state)) return run;
+      if (run.state === "running") {
+        this.db.prepare(
+          `UPDATE runs SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), updated_at = ?
+           WHERE run_id = ? AND state = 'running'`,
+        ).run(occurredAt, occurredAt, input.runId);
+        this.appendEventInTransaction(input.runId, "run.cancelled", canonicalize({ requested: true }), occurredAt);
+        return this.getRun(input.runId);
+      }
+      if (run.state === "waiting_approval") {
+        const approval = this.db.prepare(
+          `SELECT approval_id, tool_call_id FROM approvals WHERE run_id = ? AND state = 'pending'`,
+        ).get(input.runId) as { approval_id: string; tool_call_id: string } | undefined;
+        if (approval !== undefined) {
+          this.db.prepare(
+            `UPDATE approvals SET state = 'denied', resolved_at = ?, resolution_reason = 'run_cancelled'
+             WHERE approval_id = ? AND state = 'pending'`,
+          ).run(occurredAt, approval.approval_id);
+          this.db.prepare(
+            `UPDATE tool_calls SET state = 'denied', result_json = ?, updated_at = ?
+             WHERE tool_call_id = ? AND state = 'waiting_approval'`,
+          ).run(canonicalize({ ok: false, code: "tool_denied", reason: "run_cancelled" }), occurredAt, approval.tool_call_id);
+          this.appendEventInTransaction(input.runId, "approval.resolved", canonicalize({
+            approvalId: approval.approval_id, state: "denied", reason: "run_cancelled",
+          }), occurredAt);
+        }
+      }
+      this.db.prepare(
+        `UPDATE runs SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+         active_started_at = NULL, updated_at = ?
+         WHERE run_id = ? AND state IN ('queued', 'waiting_approval', 'waiting_reconciliation')`,
+      ).run(occurredAt, input.runId);
+      this.appendEventInTransaction(input.runId, "run.cancelled", canonicalize({ requested: false }), occurredAt);
+      return this.getRun(input.runId);
+    });
+  }
+
   private assertCurrentLease(
     runId: RunId,
     leaseOwner: string,

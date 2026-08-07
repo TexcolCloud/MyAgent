@@ -97,4 +97,5 @@ export interface RunStore {
   }): AttemptId | null;
   failRun(input: { runId: RunId; leaseOwner: string; code: string; occurredAt: Date }): Run;
   completeRun(input: CompleteRunInput): Run;
+  cancel(input: { runId: RunId; occurredAt: Date }): Run;
 }
