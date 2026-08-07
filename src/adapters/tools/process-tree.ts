@@ -91,7 +91,12 @@ async function terminateWindowsTree(pid: number): Promise<number | null> {
   const taskkill = spawn(
     path.join(systemRoot, "System32", "taskkill.exe"),
     ["/PID", String(pid), "/T", "/F"],
-    { shell: false, windowsHide: true, stdio: "ignore" },
+    {
+      env: isolatedEnvironment({}),
+      shell: false,
+      windowsHide: true,
+      stdio: "ignore",
+    },
   );
   return new Promise<number | null>((resolve, reject) => {
     taskkill.once("error", reject);
