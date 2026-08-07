@@ -277,6 +277,31 @@ describe("run_command Tool", () => {
     await expect(execution).rejects.toMatchObject({ name: "AbortError" });
     await expectProcessToExit(descendantPid);
   }, 10_000);
+
+  it("does not resolve Secrets or spawn after cancellation during cwd resolution", async () => {
+    const tool = createRunCommandTool({
+      environmentAllowlist: ["SECRET"],
+      secretResolver: new EnvironmentSecretResolver({}),
+    });
+    const normalized = await tool.parseAndNormalize(
+      {
+        program: process.execPath,
+        args: ["-e", "process.exit(99)"],
+        env: { SECRET: { fromEnvironment: "MISSING_SECRET" } },
+        timeoutMs: 2_000,
+      },
+      normalizeContext,
+    );
+    const controller = new AbortController();
+
+    const execution = tool.execute(normalized.arguments, {
+      ...executionContext,
+      signal: controller.signal,
+    });
+    controller.abort(new DOMException("run cancelled", "AbortError"));
+
+    await expect(execution).rejects.toMatchObject({ name: "AbortError" });
+  });
 });
 
 function revisionFor(workspace: string): AgentRevisionSnapshot {

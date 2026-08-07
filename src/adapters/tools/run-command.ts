@@ -77,6 +77,7 @@ export function createRunCommandTool(
       const cwd = await new PathGuard(
         context.revision.workspace,
       ).resolveExisting(args.cwd);
+      context.signal.throwIfAborted();
       const environment = resolveEnvironment(args.env, options.secretResolver);
       const tree = ProcessTree.start(args.program, args.args, {
         cwd,
