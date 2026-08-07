@@ -1,0 +1,3 @@
+# Use deterministic ingress routing and explicit Agent delegation
+
+Ingress selects one primary Personal Agent through an explicit Agent identity or deterministic adapter rule; Agent-to-Agent collaboration occurs through an explicit delegation capability. Each Delegation creates a persistent child Run in a new, non-reusable synthetic Session, receives only explicitly selected context, and returns a result without sharing the parent's Session. The first release permits one delegation layer and at most four child Runs per root Run. This keeps ownership testable and auditable while avoiding an opaque global LLM router, cross-Agent history leakage, and recursive fan-out.
