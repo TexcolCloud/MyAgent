@@ -1,6 +1,6 @@
 # Personal Agent Kernel Design
 
-**Status:** Approved design
+**Status:** Approved written specification
 **Date:** 2026-08-07
 **Reference baseline:** OpenClaw `2026.7.2`, commit [`aa21c001`](https://github.com/openclaw/openclaw/commit/aa21c001f1311b1712da92637adca306f4964aca)
 
@@ -484,6 +484,7 @@ The model cannot change Policy, resolve Secrets, approve calls, or edit pending 
 | `POST` | `/v1/tool-calls/:toolCallId/reconciliation` | Resolve an `unknown` Tool Call |
 | `GET` | `/v1/sessions` | Query Sessions by Agent and Session Key |
 | `DELETE` | `/v1/sessions/:sessionId` | Cascade-delete core Session data |
+| `POST` | `/v1/backups` | Create a consistent SQLite and Agent-file backup |
 
 `POST /v1/runs` requires `Idempotency-Key`:
 
@@ -550,6 +551,8 @@ Reconciliation request:
 ```
 
 `result` is treated as Operator-supplied Tool data, is size-limited and redacted, and is returned to the model on resume. It is forbidden for `retry`; retry creates a new linked Tool Call from the original immutable arguments.
+
+`POST /v1/backups` accepts a server-local destination path and returns HTTP 201 only after SQLite's online backup and the versioned Agent-file copy both complete. This endpoint keeps `myagent backup` within the rule that the CLI uses HTTP and never opens SQLite directly.
 
 ## 11. CLI
 
