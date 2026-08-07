@@ -7,3 +7,10 @@ export const secretRefSchema = z.strictObject({
 });
 
 export type SecretRef = z.infer<typeof secretRefSchema>;
+
+export const toolEnvironmentValueSchema = z.union([
+  z.strictObject({ value: z.string() }),
+  secretRefSchema,
+]);
+
+export type ToolEnvironmentValue = z.infer<typeof toolEnvironmentValueSchema>;
