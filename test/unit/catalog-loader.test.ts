@@ -27,6 +27,33 @@ describe("loadCatalog", () => {
     ]);
   });
 
+  it("maps missing configured roots to a stable global error", async () => {
+    const temporary = await mkdtemp(path.join(os.tmpdir(), "myagent-missing-root-"));
+    const configPath = path.join(temporary, "myagent.yaml");
+    await writeFile(
+      configPath,
+      [
+        "server:",
+        "  bearerToken:",
+        "    fromEnvironment: MYAGENT_BEARER_TOKEN",
+        "database:",
+        "  path: ./kernel.db",
+        "agentRoots:",
+        "  - ./missing-agents",
+        "models: {}",
+        "",
+      ].join("\n"),
+    );
+
+    try {
+      await expect(loadCatalog(configPath)).rejects.toMatchObject({
+        code: "invalid_global_config",
+      });
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  });
+
   it("builds deterministic revisions with full Skill bodies and unresolved secrets", async () => {
     const first = await loadCatalog(fixture("valid", "myagent.yaml"));
     const second = await loadCatalog(fixture("valid", "myagent.yaml"));

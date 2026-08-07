@@ -63,12 +63,11 @@ export async function loadCatalog(configPath: string): Promise<CatalogSnapshot> 
   const absoluteConfigPath = path.resolve(configPath);
   const configDirectory = path.dirname(absoluteConfigPath);
   const global = await loadGlobalConfig(absoluteConfigPath, configDirectory);
-  const skills = await loadSkillCatalog(global.skillRoots);
-  const discovered = await discoverAgentDirectories(global.agentRoots);
+  const { skills, agentDirectories } = await loadGlobalResources(global);
   const available: AvailableAgent[] = [];
   const unavailable: UnavailableAgent[] = [];
 
-  for (const directory of discovered) {
+  for (const directory of agentDirectories) {
     const result = await loadAgent(directory, global, skills);
     if ("revision" in result) {
       available.push(result);
@@ -88,6 +87,29 @@ export async function loadCatalog(configPath: string): Promise<CatalogSnapshot> 
     unavailable: Object.freeze(isolated.unavailable),
     byId: new Map(isolated.available.map((agent) => [agent.id, agent])),
   });
+}
+
+interface GlobalResources {
+  skills: SkillCatalog;
+  agentDirectories: string[];
+}
+
+async function loadGlobalResources(
+  global: ResolvedGlobalConfig,
+): Promise<GlobalResources> {
+  try {
+    const [skills, agentDirectories] = await Promise.all([
+      loadSkillCatalog(global.skillRoots),
+      discoverAgentDirectories(global.agentRoots),
+    ]);
+    return { skills, agentDirectories };
+  } catch (error) {
+    throw new DomainError(
+      "invalid_global_config",
+      "invalid_global_config: configured root is unavailable",
+      { cause: error instanceof Error ? error.message : "unknown" },
+    );
+  }
 }
 
 interface IsolatedAgents {
