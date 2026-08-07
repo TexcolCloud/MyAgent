@@ -94,6 +94,7 @@ if (claimWorkerOptions === undefined) {
   it("serializes overlapping child-process claims through SQLite's busy timeout", async () => {
     const harness = createQueueHarness(catalogSnapshot, "claim-contention.db");
     const startPath = tempPath("claim-contention.start");
+    const retryPath = tempPath("claim-contention.retry");
     const now = new Date("2026-08-07T00:00:01.000Z");
     const leaseUntil = new Date("2026-08-07T00:00:30.000Z");
     let writerTransactionOpen = false;
@@ -104,16 +105,31 @@ if (claimWorkerOptions === undefined) {
       writerTransactionOpen = true;
 
       workers.push(
-        startContentionWorker(harness.databasePath, startPath, "worker-1", now, leaseUntil),
-        startContentionWorker(harness.databasePath, startPath, "worker-2", now, leaseUntil),
+        startContentionWorker(
+          harness.databasePath,
+          startPath,
+          retryPath,
+          "worker-1",
+          now,
+          leaseUntil,
+        ),
+        startContentionWorker(
+          harness.databasePath,
+          startPath,
+          retryPath,
+          "worker-2",
+          now,
+          leaseUntil,
+        ),
       );
       await Promise.all(workers.map((worker) => waitForFile(worker.readyPath)));
       writeFileSync(startPath, "start");
-      await Promise.all(workers.map((worker) => waitForFile(worker.attemptingPath)));
+      await Promise.all(workers.map((worker) => waitForFile(worker.blockedPath)));
 
       expect(harness.store.getRun(created.runId).state).toBe("queued");
       harness.connection.db.exec("COMMIT");
       writerTransactionOpen = false;
+      writeFileSync(retryPath, "retry");
 
       await Promise.all(workers.map((worker) => worker.completed));
       const results = workers.map((worker) =>
@@ -378,8 +394,9 @@ interface ClaimWorkerResult {
 interface ClaimWorkerOptions {
   databasePath: string;
   startPath: string;
+  retryPath: string;
   readyPath: string;
-  attemptingPath: string;
+  blockedPath: string;
   resultPath: string;
   leaseOwner: string;
   now: string;
@@ -389,7 +406,7 @@ interface ClaimWorkerOptions {
 interface ContentionWorker {
   child: ChildProcess;
   readyPath: string;
-  attemptingPath: string;
+  blockedPath: string;
   resultPath: string;
   completed: Promise<void>;
 }
@@ -397,6 +414,7 @@ interface ContentionWorker {
 function startContentionWorker(
   databasePath: string,
   startPath: string,
+  retryPath: string,
   leaseOwner: string,
   now: Date,
   leaseUntil: Date,
@@ -405,8 +423,9 @@ function startContentionWorker(
   const options: ClaimWorkerOptions = {
     databasePath,
     startPath,
+    retryPath,
     readyPath: tempPath(`claim-contention-${workerToken}.ready`),
-    attemptingPath: tempPath(`claim-contention-${workerToken}.attempting`),
+    blockedPath: tempPath(`claim-contention-${workerToken}.blocked`),
     resultPath: tempPath(`claim-contention-${workerToken}.result`),
     leaseOwner,
     now: now.toISOString(),
@@ -446,34 +465,69 @@ function startContentionWorker(
   return {
     child,
     readyPath: options.readyPath,
-    attemptingPath: options.attemptingPath,
+    blockedPath: options.blockedPath,
     resultPath: options.resultPath,
     completed,
   };
 }
 
 function runContentionWorker(options: ClaimWorkerOptions): void {
-  const connection = openDatabase({
+  const probeConnection = openDatabase({
+    path: options.databasePath,
+    busyTimeoutMs: 100,
+  });
+  try {
+    const probeStore = new SqliteRunRepository(
+      probeConnection.db,
+      new SqliteCatalogRepository(probeConnection.db),
+    );
+    writeFileSync(options.readyPath, "ready");
+    waitForFileSync(options.startPath);
+    try {
+      probeStore.claimNextEligible(
+        options.leaseOwner,
+        new Date(options.now),
+        new Date(options.leaseUntil),
+      );
+      throw new Error("expected the held writer lock to exhaust busy_timeout");
+    } catch (error) {
+      if (!isSqliteBusy(error)) {
+        throw error;
+      }
+      writeFileSync(options.blockedPath, "blocked");
+    }
+  } finally {
+    probeConnection.close();
+  }
+
+  waitForFileSync(options.retryPath);
+  const retryConnection = openDatabase({
     path: options.databasePath,
     busyTimeoutMs: 2_000,
   });
   try {
-    const store = new SqliteRunRepository(
-      connection.db,
-      new SqliteCatalogRepository(connection.db),
+    const retryStore = new SqliteRunRepository(
+      retryConnection.db,
+      new SqliteCatalogRepository(retryConnection.db),
     );
-    writeFileSync(options.readyPath, "ready");
-    waitForFileSync(options.startPath);
-    writeFileSync(options.attemptingPath, "attempting");
-    const run = store.claimNextEligible(
+    const run = retryStore.claimNextEligible(
       options.leaseOwner,
       new Date(options.now),
       new Date(options.leaseUntil),
     );
     writeFileSync(options.resultPath, JSON.stringify({ runId: run?.runId ?? null }));
   } finally {
-    connection.close();
+    retryConnection.close();
   }
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const sqliteError = error as Error & { errcode?: unknown };
+  return sqliteError.errcode === 5 && sqliteError.message === "database is locked";
 }
 
 async function waitForFile(filePath: string): Promise<void> {
