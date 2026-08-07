@@ -15,9 +15,17 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { listFilesTool } from "../../src/adapters/tools/list-files.js";
+import {
+  BoundedLexicalEntries,
+  listFilesTool,
+} from "../../src/adapters/tools/list-files.js";
 import { readFileTool } from "../../src/adapters/tools/read-file.js";
-import { writeFileTool } from "../../src/adapters/tools/write-file.js";
+import {
+  installCreateOnly,
+  preservedFileMode,
+  TargetWriteCoordinator,
+  writeFileTool,
+} from "../../src/adapters/tools/write-file.js";
 import type { AgentRevisionSnapshot } from "../../src/domain/agent-revision.js";
 import {
   parseAgentId,
@@ -59,6 +67,21 @@ describe("Workspace file Tools", () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  it("retains only a bounded lexical prefix while scanning", () => {
+    const entries = new BoundedLexicalEntries<ListedEntry>(2);
+
+    for (const entryPath of ["z.txt", "b.txt", "a.txt", "c.txt"]) {
+      entries.add({ path: entryPath, type: "file", size: 1 });
+    }
+
+    expect(entries.values().map((entry) => entry.path)).toEqual([
+      "a.txt",
+      "b.txt",
+    ]);
+    expect(entries.values()).toHaveLength(2);
+    expect(entries.truncated).toBe(true);
   });
 
   it("lists relative metadata in lexical order with default and hard caps", async () => {
@@ -110,6 +133,38 @@ describe("Workspace file Tools", () => {
     expect(entriesFrom(cappedResult.content)).toHaveLength(1_000);
     expect(cappedResult.truncated).toBe(true);
   }, 15_000);
+
+  it("rejects glob patterns that can traverse outside the Workspace", async () => {
+    for (const globPattern of [
+      "../outside/*",
+      "..\\outside\\*",
+      "/outside/*",
+      "C:\\outside\\*",
+      "safe\0*",
+    ]) {
+      await expect(
+        listFilesTool.parseAndNormalize(
+          { path: ".", glob: globPattern },
+          normalizeContext,
+        ),
+      ).rejects.toMatchObject({ code: "path_outside_workspace" });
+    }
+
+    const outside = path.join(root, "outside");
+    await mkdir(outside);
+    await writeFile(path.join(outside, "secret.txt"), "secret", "utf8");
+    const encodedParent = await listFilesTool.parseAndNormalize(
+      { path: ".", glob: "[.][.]/outside/*" },
+      normalizeContext,
+    );
+
+    const result = await listFilesTool.execute(
+      encodedParent.arguments,
+      executionContext,
+    );
+
+    expect(entriesFrom(result.content)).toEqual([]);
+  });
 
   it("reads inclusive line ranges", async () => {
     await writeFile(
@@ -195,11 +250,24 @@ describe("Workspace file Tools", () => {
     expect(await temporaryEntries(workspace)).toEqual([]);
   });
 
+  it("never replaces a file during create-only installation", async () => {
+    const temporaryPath = path.join(workspace, ".create-only.tmp");
+    const targetPath = path.join(workspace, "create-only.txt");
+    await writeFile(temporaryPath, "proposed", "utf8");
+    await writeFile(targetPath, "external", "utf8");
+
+    await expect(
+      installCreateOnly(temporaryPath, targetPath),
+    ).rejects.toMatchObject({ code: "file_changed" });
+    expect(await readFile(targetPath, "utf8")).toBe("external");
+    expect(await readFile(temporaryPath, "utf8")).toBe("proposed");
+  });
+
   it("replaces only the expected hash and preserves the target mode", async () => {
     const target = path.join(workspace, "replace.txt");
     await writeFile(target, "old", "utf8");
     if (process.platform !== "win32") {
-      await chmod(target, 0o640);
+      await chmod(target, 0o3640);
     }
     const normalized = await writeFileTool.parseAndNormalize(
       {
@@ -215,12 +283,77 @@ describe("Workspace file Tools", () => {
     expect(await readFile(target, "utf8")).toBe("new content");
     if (process.platform !== "win32") {
       expect((await stat(target)).mode & 0o777).toBe(0o640);
+      expect((await stat(target)).mode & 0o7777).toBe(0o3640);
     }
     expect(await temporaryEntries(workspace)).toEqual([]);
     await expect(
       writeFileTool.execute(normalized.arguments, executionContext),
     ).rejects.toMatchObject({ code: "file_changed" });
     expect(await temporaryEntries(workspace)).toEqual([]);
+  });
+
+  it("retains POSIX special mode bits for replacement", () => {
+    expect(preservedFileMode(0o103640)).toBe(0o3640);
+  });
+
+  it("accepts only one concurrent replacement for the same expected hash", async () => {
+    const target = path.join(workspace, "concurrent.txt");
+    await writeFile(target, "old", "utf8");
+    const expectedSha256 = sha256("old");
+    const first = await writeFileTool.parseAndNormalize(
+      { path: "concurrent.txt", content: "first", expectedSha256 },
+      normalizeContext,
+    );
+    const second = await writeFileTool.parseAndNormalize(
+      { path: "concurrent.txt", content: "second", expectedSha256 },
+      normalizeContext,
+    );
+
+    const outcomes = await Promise.allSettled([
+      writeFileTool.execute(first.arguments, executionContext),
+      writeFileTool.execute(second.arguments, executionContext),
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(
+      1,
+    );
+    const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+    expect(rejected).toMatchObject({
+      status: "rejected",
+      reason: { code: "file_changed" },
+    });
+    expect(["first", "second"]).toContain(
+      await readFile(target, "utf8"),
+    );
+    expect(await temporaryEntries(workspace)).toEqual([]);
+  });
+
+  it("serializes same-target write critical sections", async () => {
+    const coordinator = new TargetWriteCoordinator();
+    const firstEntered = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const events: string[] = [];
+    const first = coordinator.run("same-target", async () => {
+      events.push("first entered");
+      firstEntered.resolve();
+      await releaseFirst.promise;
+      events.push("first exited");
+    });
+    await firstEntered.promise;
+
+    const second = coordinator.run("same-target", async () => {
+      events.push("second entered");
+    });
+    await Promise.resolve();
+
+    expect(events).toEqual(["first entered"]);
+    releaseFirst.resolve();
+    await Promise.all([first, second]);
+    expect(events).toEqual([
+      "first entered",
+      "first exited",
+      "second entered",
+    ]);
   });
 
   it("uses strict write arguments and enforces the UTF-8 content cap", async () => {
@@ -264,6 +397,17 @@ async function temporaryEntries(directory: string): Promise<string[]> {
 
 function sha256(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function revisionFor(workspace: string): AgentRevisionSnapshot {

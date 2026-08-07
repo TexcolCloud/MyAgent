@@ -28,6 +28,46 @@ type ListedEntry = {
   size: number;
 };
 
+export class BoundedLexicalEntries<T extends { path: string }> {
+  readonly #entries: T[] = [];
+  #seen = 0;
+
+  constructor(readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 1) {
+      throw new RangeError("capacity must be a positive integer");
+    }
+  }
+
+  add(entry: T): void {
+    this.#seen += 1;
+    let lower = 0;
+    let upper = this.#entries.length;
+    while (lower < upper) {
+      const middle = Math.floor((lower + upper) / 2);
+      if (this.#entries[middle]!.path < entry.path) {
+        lower = middle + 1;
+      } else {
+        upper = middle;
+      }
+    }
+    if (lower >= this.capacity) {
+      return;
+    }
+    this.#entries.splice(lower, 0, entry);
+    if (this.#entries.length > this.capacity) {
+      this.#entries.pop();
+    }
+  }
+
+  get truncated(): boolean {
+    return this.#seen > this.capacity;
+  }
+
+  values(): T[] {
+    return [...this.#entries];
+  }
+}
+
 export const listFilesTool: ToolDefinition<ListFilesArguments> = {
   name: "list_files",
   effect: "read_only",
@@ -35,10 +75,12 @@ export const listFilesTool: ToolDefinition<ListFilesArguments> = {
   async parseAndNormalize(raw, context) {
     const parsed = listFilesSchema.parse(raw);
     await new PathGuard(context.revision.workspace).resolveExisting(parsed.path);
+    const globPattern = parsed.glob ?? "**/*";
+    assertGlobPatternWithinWorkspace(globPattern);
     return {
       arguments: {
         path: portablePath(path.normalize(parsed.path)),
-        glob: parsed.glob ?? "**/*",
+        glob: globPattern,
         maxEntries: Math.min(parsed.maxEntries ?? DEFAULT_MAX_ENTRIES, MAX_ENTRIES),
       },
       policyFacts: { pathWithinWorkspace: true },
@@ -49,14 +91,24 @@ export const listFilesTool: ToolDefinition<ListFilesArguments> = {
     context.signal.throwIfAborted();
     const guard = new PathGuard(context.revision.workspace);
     const basePath = await guard.resolveExisting(args.path);
-    const entries: ListedEntry[] = [];
+    const entries = new BoundedLexicalEntries<ListedEntry>(args.maxEntries);
 
     for await (const entry of glob(args.glob, {
       cwd: basePath,
       withFileTypes: true,
       // Node follows Windows junctions during glob traversal unless they are
       // excluded while walking, not merely filtered after a match is emitted.
-      exclude: (candidate) => candidate.isSymbolicLink(),
+      exclude: (candidate) => {
+        const candidatePath = path.resolve(
+          basePath,
+          candidate.parentPath,
+          candidate.name,
+        );
+        return (
+          candidate.isSymbolicLink() ||
+          !isLexicallyWithin(basePath, candidatePath)
+        );
+      },
     })) {
       context.signal.throwIfAborted();
       const lexicalPath = path.join(entry.parentPath, entry.name);
@@ -66,7 +118,7 @@ export const listFilesTool: ToolDefinition<ListFilesArguments> = {
 
       const canonicalPath = await guard.resolveExisting(workspacePath);
       const metadata = await lstat(canonicalPath);
-      entries.push({
+      entries.add({
         path: portablePath(path.normalize(workspacePath)),
         type: metadata.isDirectory()
           ? "directory"
@@ -77,17 +129,13 @@ export const listFilesTool: ToolDefinition<ListFilesArguments> = {
       });
     }
 
-    entries.sort((left, right) =>
-      left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
-    );
-    const truncated = entries.length > args.maxEntries;
-    const content = { entries: entries.slice(0, args.maxEntries) };
+    const content = { entries: entries.values() };
     return {
       ok: true,
       summary: `Listed ${content.entries.length} Workspace entries.`,
       content,
       capturedBytes: Buffer.byteLength(JSON.stringify(content), "utf8"),
-      truncated,
+      truncated: entries.truncated,
     };
   },
 };
@@ -97,11 +145,29 @@ function portablePath(candidate: string): string {
 }
 
 function assertLexicallyWithin(root: string, candidate: string): void {
+  if (!isLexicallyWithin(root, candidate)) {
+    throw new DomainError("path_outside_workspace");
+  }
+}
+
+function isLexicallyWithin(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
-  if (
+  return !(
     path.isAbsolute(relative) ||
     relative === ".." ||
     relative.startsWith(`..${path.sep}`)
+  );
+}
+
+function assertGlobPatternWithinWorkspace(pattern: string): void {
+  const hasParentSegment = pattern
+    .split(/[\\/]+/u)
+    .some((segment) => segment === "..");
+  if (
+    pattern.includes("\0") ||
+    path.posix.isAbsolute(pattern) ||
+    path.win32.parse(pattern).root !== "" ||
+    hasParentSegment
   ) {
     throw new DomainError("path_outside_workspace");
   }

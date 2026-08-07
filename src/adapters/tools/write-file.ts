@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  link,
   open,
   readFile,
   rename,
@@ -35,6 +36,33 @@ type WriteFileArguments = {
   expectedSha256: string | null;
 };
 
+export class TargetWriteCoordinator {
+  readonly #tails = new Map<string, Promise<void>>();
+
+  async run<T>(targetPath: string, operation: () => Promise<T>): Promise<T> {
+    const key = normalizedLockKey(targetPath);
+    const predecessor = this.#tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = predecessor.then(() => current);
+    this.#tails.set(key, tail);
+
+    await predecessor;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.#tails.get(key) === tail) {
+        this.#tails.delete(key);
+      }
+    }
+  }
+}
+
+const targetWriteCoordinator = new TargetWriteCoordinator();
+
 export const writeFileTool: ToolDefinition<WriteFileArguments> = {
   name: "write_file",
   effect: "side_effect",
@@ -57,47 +85,54 @@ export const writeFileTool: ToolDefinition<WriteFileArguments> = {
     const targetPath = await new PathGuard(
       context.revision.workspace,
     ).resolveForCreate(args.path);
-    const initialState = await inspectTarget(targetPath);
-    assertExpected(initialState, args.expectedSha256);
-    const mode = args.expectedSha256 === null ? 0o600 : initialState.mode;
-    const temporaryPath = path.join(
-      path.dirname(targetPath),
-      `.${path.basename(targetPath)}.tmp-${randomUUID()}`,
-    );
-    let temporaryHandle: FileHandle | undefined;
-
-    try {
-      temporaryHandle = await open(temporaryPath, "wx", mode);
-      assertExpected(await inspectTarget(targetPath), args.expectedSha256);
-      await temporaryHandle.writeFile(args.content, "utf8");
-      await temporaryHandle.chmod(mode);
-      await temporaryHandle.sync();
-      await temporaryHandle.close();
-      temporaryHandle = undefined;
-
+    return targetWriteCoordinator.run(targetPath, async () => {
       context.signal.throwIfAborted();
-      assertExpected(await inspectTarget(targetPath), args.expectedSha256);
-      await rename(temporaryPath, targetPath);
-    } finally {
-      try {
-        await temporaryHandle?.close();
-      } finally {
-        await rm(temporaryPath, { force: true });
-      }
-    }
+      const initialState = await inspectTarget(targetPath);
+      assertExpected(initialState, args.expectedSha256);
+      const mode = args.expectedSha256 === null ? 0o600 : initialState.mode;
+      const temporaryPath = path.join(
+        path.dirname(targetPath),
+        `.${path.basename(targetPath)}.tmp-${randomUUID()}`,
+      );
+      let temporaryHandle: FileHandle | undefined;
 
-    const content = {
-      path: args.path,
-      bytes: Buffer.byteLength(args.content, "utf8"),
-      sha256: sha256Buffer(Buffer.from(args.content, "utf8")),
-    };
-    return {
-      ok: true,
-      summary: `Wrote ${content.bytes} bytes to a Workspace file.`,
-      content,
-      capturedBytes: Buffer.byteLength(JSON.stringify(content), "utf8"),
-      truncated: false,
-    };
+      try {
+        temporaryHandle = await open(temporaryPath, "wx", mode);
+        assertExpected(await inspectTarget(targetPath), args.expectedSha256);
+        await temporaryHandle.writeFile(args.content, "utf8");
+        await temporaryHandle.chmod(mode);
+        await temporaryHandle.sync();
+        await temporaryHandle.close();
+        temporaryHandle = undefined;
+
+        context.signal.throwIfAborted();
+        assertExpected(await inspectTarget(targetPath), args.expectedSha256);
+        if (args.expectedSha256 === null) {
+          await installCreateOnly(temporaryPath, targetPath);
+        } else {
+          await rename(temporaryPath, targetPath);
+        }
+      } finally {
+        try {
+          await temporaryHandle?.close();
+        } finally {
+          await rm(temporaryPath, { force: true });
+        }
+      }
+
+      const content = {
+        path: args.path,
+        bytes: Buffer.byteLength(args.content, "utf8"),
+        sha256: sha256Buffer(Buffer.from(args.content, "utf8")),
+      };
+      return {
+        ok: true,
+        summary: `Wrote ${content.bytes} bytes to a Workspace file.`,
+        content,
+        capturedBytes: Buffer.byteLength(JSON.stringify(content), "utf8"),
+        truncated: false,
+      };
+    });
   },
 };
 
@@ -105,6 +140,20 @@ interface TargetState {
   exists: boolean;
   sha256: string | null;
   mode: number;
+}
+
+export async function installCreateOnly(
+  temporaryPath: string,
+  targetPath: string,
+): Promise<void> {
+  try {
+    await link(temporaryPath, targetPath);
+  } catch (error) {
+    if (hasErrorCode(error, "EEXIST")) {
+      throw changedFile();
+    }
+    throw error;
+  }
 }
 
 async function inspectTarget(targetPath: string): Promise<TargetState> {
@@ -116,7 +165,7 @@ async function inspectTarget(targetPath: string): Promise<TargetState> {
     return {
       exists: true,
       sha256: sha256Buffer(await readFile(targetPath)),
-      mode: metadata.mode & 0o777,
+      mode: preservedFileMode(metadata.mode),
     };
   } catch (error) {
     if (isMissing(error)) {
@@ -124,6 +173,10 @@ async function inspectTarget(targetPath: string): Promise<TargetState> {
     }
     throw error;
   }
+}
+
+export function preservedFileMode(mode: number): number {
+  return mode & 0o7777;
 }
 
 function assertExpected(state: TargetState, expectedSha256: string | null): void {
@@ -143,11 +196,15 @@ function sha256Buffer(content: Buffer): string {
 }
 
 function isMissing(error: unknown): boolean {
+  return hasErrorCode(error, "ENOENT");
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
   return (
     typeof error === "object" &&
     error !== null &&
     "code" in error &&
-    error.code === "ENOENT"
+    error.code === code
   );
 }
 
@@ -157,4 +214,9 @@ function changedFile(): DomainError {
 
 function portablePath(candidate: string): string {
   return candidate.split(path.sep).join("/");
+}
+
+function normalizedLockKey(targetPath: string): string {
+  const absolutePath = path.resolve(targetPath);
+  return process.platform === "win32" ? absolutePath.toLowerCase() : absolutePath;
 }
