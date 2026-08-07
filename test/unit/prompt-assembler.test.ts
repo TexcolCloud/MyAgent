@@ -1,5 +1,10 @@
+import type { DatabaseSync } from "node:sqlite";
+
 import { describe, expect, it } from "vitest";
 
+import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { migrate } from "../../src/adapters/sqlite/migrator.js";
+import { SqliteSessionRepository } from "../../src/adapters/sqlite/session-repository.js";
 import { PromptAssembler } from "../../src/application/prompt-assembler.js";
 import type { AgentRevisionSnapshot } from "../../src/domain/agent-revision.js";
 import {
@@ -14,6 +19,7 @@ import type {
   SessionStore,
   SessionSummary,
 } from "../../src/ports/session-store.js";
+import { tempPath } from "../helpers/temp-dir.js";
 
 describe("PromptAssembler", () => {
   it("orders trusted instructions before delimited untrusted data", async () => {
@@ -85,6 +91,52 @@ describe("PromptAssembler", () => {
     expect(serialized).not.toContain("future queued input");
     expect(serialized).not.toContain("stored current input must not be duplicated");
     expect(request.purpose).toBe("run");
+  });
+});
+
+describe("SqliteSessionRepository", () => {
+  it("queries only messages through the current FIFO position and owns summaries by Session", () => {
+    const connection = openDatabase({
+      path: tempPath("session-repository.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      seedSession(connection.db, "session-one", "key-one");
+      seedSession(connection.db, "session-two", "key-two");
+      seedMessage(connection.db, "session-one", 0, 0, "prior");
+      seedMessage(connection.db, "session-one", 1, 1, "current");
+      seedMessage(connection.db, "session-one", 2, 2, "future");
+      const repository = new SqliteSessionRepository(connection.db);
+      const firstSessionId = "session-one" as SessionMessage["sessionId"];
+      const secondSessionId = "session-two" as SessionMessage["sessionId"];
+
+      expect(repository.listMessagesThroughRun(firstSessionId, 1).map((entry) => entry.content))
+        .toEqual([
+          { type: "text", text: "prior" },
+          { type: "text", text: "current" },
+        ]);
+
+      const summary = repository.saveSummary({
+        summaryId: "shared-summary-id",
+        sessionId: firstSessionId,
+        sourceMessageFrom: 0,
+        sourceMessageTo: 0,
+        content: "summary one",
+        modelProvider: "openai-compatible",
+        modelName: "test-model",
+        createdAt: new Date("2026-08-07T00:00:00.000Z"),
+      });
+      expect(repository.getCurrentSummary(firstSessionId)).toEqual(summary);
+      expect(() => repository.saveSummary({
+        ...summary,
+        sessionId: secondSessionId,
+        content: "summary two",
+      })).toThrowError(expect.objectContaining({ code: "summary_id_collision" }));
+      expect(repository.getCurrentSummary(secondSessionId)).toBeNull();
+    } finally {
+      connection.close();
+    }
   });
 });
 
@@ -174,4 +226,49 @@ function revision(): AgentRevisionSnapshot {
     limits: DEFAULT_RUN_LIMITS,
     contentSha256: "0".repeat(64),
   };
+}
+
+function seedSession(
+  db: DatabaseSync,
+  sessionId: string,
+  sessionKey: string,
+): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO agent_revisions (
+       revision_id, agent_id, content_json, content_sha256, created_at
+     ) VALUES ('revision-one', 'primary', '{}', ?, ?)`,
+  ).run("a".repeat(64), "2026-08-07T00:00:00.000Z");
+  db.prepare(
+    `INSERT INTO sessions (
+       session_id, agent_id, session_key, agent_revision_id,
+       owner_session_id, current_summary_id, created_at, updated_at
+     ) VALUES (?, 'primary', ?, 'revision-one', NULL, NULL, ?, ?)`,
+  ).run(
+    sessionId,
+    sessionKey,
+    "2026-08-07T00:00:00.000Z",
+    "2026-08-07T00:00:00.000Z",
+  );
+}
+
+function seedMessage(
+  db: DatabaseSync,
+  sessionId: string,
+  sequence: number,
+  fifoSequence: number,
+  text: string,
+): void {
+  db.prepare(
+    `INSERT INTO messages (
+       message_id, session_id, run_id, sequence, run_fifo_sequence,
+       role, content_json, created_at
+     ) VALUES (?, ?, NULL, ?, ?, 'user', ?, ?)`,
+  ).run(
+    `${sessionId}:message:${String(sequence)}`,
+    sessionId,
+    sequence,
+    fifoSequence,
+    JSON.stringify({ type: "text", text }),
+    "2026-08-07T00:00:00.000Z",
+  );
 }

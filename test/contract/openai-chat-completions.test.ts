@@ -52,6 +52,48 @@ describe("OpenAiChatCompletionsModel", () => {
     });
   });
 
+  it.each([
+    {
+      name: "finish reason",
+      events: [frame({ content: "incomplete" }), usageFrame(3, 1)],
+    },
+    {
+      name: "usage",
+      events: [frame({ content: "incomplete" }), frame({}, "stop")],
+    },
+  ])("rejects a stream missing final $name", async ({ events }) => {
+    const fake = await startServer(events);
+    servers.push(fake.server);
+
+    await expect(
+      collect(
+        adapter().streamAttempt(
+          request(fake.baseUrl),
+          new AbortController().signal,
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("omits Tool-only request fields when no Tools are available", async () => {
+    const fake = await startServer([
+      frame({ content: "summary" }),
+      frame({}, "stop"),
+      usageFrame(3, 1),
+    ]);
+    servers.push(fake.server);
+
+    await collect(
+      adapter().streamAttempt(
+        { ...request(fake.baseUrl), purpose: "session_summary", tools: [] },
+        new AbortController().signal,
+      ),
+    );
+
+    expect(fake.requests[0]).not.toHaveProperty("tools");
+    expect(fake.requests[0]).not.toHaveProperty("parallel_tool_calls");
+  });
+
   it("assembles one fragmented Tool Call", async () => {
     const fake = await startServer([
       frame({

@@ -38,9 +38,17 @@ export class OpenAiChatCompletionsModel implements ModelPort {
       baseURL: request.model.baseUrl,
       maxRetries: 0,
     });
+    const tools = request.tools.map((tool) => ({
+      type: "function" as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema,
+      },
+    })) as ChatCompletionTool[];
     let toolCall: ToolCallFragments | undefined;
-    let finishReason = "stop";
-    let usage: ModelUsage = { inputTokens: 0, outputTokens: 0 };
+    let finishReason: string | undefined;
+    let usage: ModelUsage | undefined;
 
     try {
       const stream = await client.chat.completions.create(
@@ -50,17 +58,11 @@ export class OpenAiChatCompletionsModel implements ModelPort {
             role: message.role,
             content: message.content,
           })) as ChatCompletionMessageParam[],
-          tools: request.tools.map((tool) => ({
-            type: "function" as const,
-            function: {
-              name: tool.name,
-              description: tool.description,
-              parameters: tool.inputSchema,
-            },
-          })) as ChatCompletionTool[],
           stream: true,
           stream_options: { include_usage: true },
-          parallel_tool_calls: false,
+          ...(tools.length === 0
+            ? {}
+            : { tools, parallel_tool_calls: false }),
         },
         { signal },
       );
@@ -84,6 +86,9 @@ export class OpenAiChatCompletionsModel implements ModelPort {
       throw toModelProviderError(error, signal);
     }
 
+    if (finishReason === undefined || usage === undefined) {
+      throw protocolError();
+    }
     if (toolCall !== undefined) {
       yield { type: "tool_call", call: parseToolCall(toolCall) };
     }
