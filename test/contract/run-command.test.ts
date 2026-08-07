@@ -176,6 +176,36 @@ describe("run_command Tool", () => {
     });
   });
 
+  it("redacts resolved environment Secrets from captured output", async () => {
+    const secretValue = "provider-secret-value";
+    const tool = createRunCommandTool({
+      environmentAllowlist: ["SECRET"],
+      secretResolver: new EnvironmentSecretResolver({
+        SOURCE_SECRET: secretValue,
+      }),
+    });
+    const normalized = await tool.parseAndNormalize(
+      {
+        program: process.execPath,
+        args: [
+          "-e",
+          "console.log(process.env.SECRET); console.error(process.env.SECRET)",
+        ],
+        env: { SECRET: { fromEnvironment: "SOURCE_SECRET" } },
+        timeoutMs: 2_000,
+      },
+      normalizeContext,
+    );
+
+    const result = await tool.execute(normalized.arguments, executionContext);
+
+    expect(JSON.stringify(result)).not.toContain(secretValue);
+    expect(result.content).toMatchObject({
+      stdout: "[REDACTED]\n",
+      stderr: "[REDACTED]\n",
+    });
+  });
+
   it("caps retained output while continuing to drain both streams", async () => {
     const tool = createRunCommandTool({
       environmentAllowlist: [],
@@ -216,6 +246,36 @@ describe("run_command Tool", () => {
       64,
     );
     expect(result.capturedBytes).toBe(64);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("bounds captured output after invalid bytes are converted to UTF-8", async () => {
+    const tool = createRunCommandTool({
+      environmentAllowlist: [],
+      secretResolver: new EnvironmentSecretResolver({}),
+    });
+    const normalized = await tool.parseAndNormalize(
+      {
+        program: process.execPath,
+        args: [
+          "-e",
+          "process.stdout.write(Buffer.alloc(64, 0x80))",
+        ],
+        timeoutMs: 2_000,
+      },
+      normalizeContext,
+    );
+
+    const result = await tool.execute(normalized.arguments, {
+      ...executionContext,
+      remainingRunOutputBytes: 64,
+    });
+    const content = result.content as { stdout: string; stderr: string };
+    const returnedBytes =
+      Buffer.byteLength(content.stdout) + Buffer.byteLength(content.stderr);
+
+    expect(returnedBytes).toBeLessThanOrEqual(64);
+    expect(result.capturedBytes).toBe(returnedBytes);
     expect(result.truncated).toBe(true);
   });
 

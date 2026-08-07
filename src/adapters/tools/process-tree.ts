@@ -15,17 +15,21 @@ export interface ProcessExit {
 
 export class ProcessTree {
   readonly #exit: Promise<ProcessExit>;
-  #settled = false;
+  #closed = false;
+  #exited = false;
   #termination: Promise<void> | undefined;
 
   private constructor(readonly child: ChildProcessWithoutNullStreams) {
     this.#exit = new Promise((resolve, reject) => {
       child.once("error", (error) => {
-        this.#settled = true;
+        this.#exited = true;
         reject(error);
       });
+      child.once("exit", () => {
+        this.#exited = true;
+      });
       child.once("close", (exitCode, signal) => {
-        this.#settled = true;
+        this.#closed = true;
         resolve({ exitCode, signal });
       });
     });
@@ -57,7 +61,7 @@ export class ProcessTree {
   }
 
   async #terminate(graceMs: number): Promise<void> {
-    if (this.#settled) {
+    if (this.#hasExited()) {
       await this.#exit;
       return;
     }
@@ -69,7 +73,7 @@ export class ProcessTree {
 
     if (process.platform === "win32") {
       const exitCode = await terminateWindowsTree(pid);
-      if (exitCode !== 0 && !this.#settled) {
+      if (exitCode !== 0 && !this.#hasExited()) {
         this.child.kill("SIGKILL");
         throw new DomainError("process_tree_termination_failed");
       }
@@ -80,6 +84,15 @@ export class ProcessTree {
       }
     }
     await this.#exit;
+  }
+
+  #hasExited(): boolean {
+    return (
+      this.#exited ||
+      this.#closed ||
+      this.child.exitCode !== null ||
+      this.child.signalCode !== null
+    );
   }
 }
 

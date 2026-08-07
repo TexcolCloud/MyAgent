@@ -81,17 +81,16 @@ export function createRunCommandTool(
       const environment = resolveEnvironment(args.env, options.secretResolver);
       const tree = ProcessTree.start(args.program, args.args, {
         cwd,
-        env: environment,
+        env: environment.values,
       });
-      const outputBudget = new OutputBudget(
-        Math.min(
-          MAX_TOOL_OUTPUT_BYTES,
-          context.revision.limits.maxToolOutputBytes,
-          Math.max(0, context.remainingRunOutputBytes),
-        ),
+      const outputLimit = Math.min(
+        MAX_TOOL_OUTPUT_BYTES,
+        context.revision.limits.maxToolOutputBytes,
+        Math.max(0, context.remainingRunOutputBytes),
       );
-      const stdout = new StreamCapture(outputBudget);
-      const stderr = new StreamCapture(outputBudget);
+      const captureBudget = new RawCaptureBudget(outputLimit);
+      const stdout = new StreamCapture(captureBudget);
+      const stderr = new StreamCapture(captureBudget);
       tree.child.stdout.on("data", (chunk: Buffer) => stdout.accept(chunk));
       tree.child.stderr.on("data", (chunk: Buffer) => stderr.accept(chunk));
       const completion = await waitForCompletion(
@@ -102,11 +101,16 @@ export function createRunCommandTool(
       if (completion.cancelled) {
         context.signal.throwIfAborted();
       }
+      const outputBudget = new OutputBudget(outputLimit);
       const content = {
         exitCode: completion.exit.exitCode,
         signal: completion.exit.signal,
-        stdout: stdout.text(),
-        stderr: stderr.text(),
+        stdout: outputBudget.retain(
+          redactKnownValues(stdout.text(), environment.sensitiveValues),
+        ),
+        stderr: outputBudget.retain(
+          redactKnownValues(stderr.text(), environment.sensitiveValues),
+        ),
         stdoutBytes: stdout.totalBytes,
         stderrBytes: stderr.totalBytes,
         timedOut: completion.timedOut,
@@ -119,7 +123,7 @@ export function createRunCommandTool(
           : `Command exited with code ${String(completion.exit.exitCode)}.`,
         content,
         capturedBytes: outputBudget.capturedBytes,
-        truncated: outputBudget.truncated,
+        truncated: captureBudget.truncated || outputBudget.truncated,
       };
     },
   };
@@ -171,9 +175,8 @@ async function waitForCompletion(
   };
 }
 
-class OutputBudget {
+class RawCaptureBudget {
   #remainingBytes: number;
-  capturedBytes = 0;
   truncated = false;
 
   constructor(limit: number) {
@@ -189,7 +192,6 @@ class OutputBudget {
       return undefined;
     }
     this.#remainingBytes -= retainedBytes;
-    this.capturedBytes += retainedBytes;
     return Buffer.from(chunk.subarray(0, retainedBytes));
   }
 }
@@ -198,7 +200,7 @@ class StreamCapture {
   readonly #chunks: Buffer[] = [];
   totalBytes = 0;
 
-  constructor(private readonly budget: OutputBudget) {}
+  constructor(private readonly budget: RawCaptureBudget) {}
 
   accept(chunk: Buffer): void {
     this.totalBytes += chunk.length;
@@ -213,16 +215,73 @@ class StreamCapture {
   }
 }
 
+class OutputBudget {
+  #remainingBytes: number;
+  capturedBytes = 0;
+  truncated = false;
+
+  constructor(limit: number) {
+    this.#remainingBytes = limit;
+  }
+
+  retain(text: string): string {
+    const textBytes = Buffer.byteLength(text);
+    if (textBytes <= this.#remainingBytes) {
+      this.#remainingBytes -= textBytes;
+      this.capturedBytes += textBytes;
+      return text;
+    }
+
+    this.truncated = true;
+    let retainedBytes = 0;
+    let retainedCharacters = 0;
+    for (const character of text) {
+      const characterBytes = Buffer.byteLength(character);
+      if (retainedBytes + characterBytes > this.#remainingBytes) {
+        break;
+      }
+      retainedBytes += characterBytes;
+      retainedCharacters += character.length;
+    }
+    this.#remainingBytes -= retainedBytes;
+    this.capturedBytes += retainedBytes;
+    return text.slice(0, retainedCharacters);
+  }
+}
+
+interface ResolvedEnvironment {
+  values: Record<string, string>;
+  sensitiveValues: readonly string[];
+}
+
 function resolveEnvironment(
   environment: Readonly<Record<string, ToolEnvironmentValue>>,
   secretResolver: SecretResolver,
-): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(environment).map(([name, value]) => [
-      name,
-      "value" in value ? value.value : secretResolver.resolve(value),
-    ]),
-  );
+): ResolvedEnvironment {
+  const values: Record<string, string> = {};
+  const sensitiveValues = new Set<string>();
+  for (const [name, value] of Object.entries(environment)) {
+    if ("value" in value) {
+      values[name] = value.value;
+      continue;
+    }
+    const resolved = secretResolver.resolve(value);
+    values[name] = resolved;
+    sensitiveValues.add(resolved);
+  }
+  return { values, sensitiveValues: [...sensitiveValues] };
+}
+
+function redactKnownValues(
+  text: string,
+  sensitiveValues: readonly string[],
+): string {
+  return [...sensitiveValues]
+    .sort((left, right) => right.length - left.length)
+    .reduce(
+      (redacted, value) => redacted.replaceAll(value, "[REDACTED]"),
+      text,
+    );
 }
 
 function portablePath(candidate: string): string {

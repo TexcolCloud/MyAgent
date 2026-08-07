@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { once } from "node:events";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -52,6 +53,36 @@ describe("ProcessTree", () => {
 
     await expect(tree.terminate()).resolves.toBeUndefined();
   });
+
+  it.skipIf(process.platform !== "win32")(
+    "treats process exit before inherited pipes close as already exited",
+    async () => {
+      const tree = ProcessTree.start(
+        process.execPath,
+        [
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            "const descendant = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 750)'], { detached: true, stdio: ['ignore', 1, 2] });",
+            "descendant.unref();",
+            "console.log(descendant.pid);",
+          ].join(" "),
+        ],
+        { cwd: workspace, env: {} },
+      );
+      const parentExit = once(tree.child, "exit");
+      const descendantPid = Number(await firstLine(tree.child.stdout));
+      await parentExit;
+
+      try {
+        await expect(tree.terminate(100)).resolves.toBeUndefined();
+        expect(isProcessRunning(descendantPid)).toBe(false);
+      } finally {
+        await expectProcessToExit(descendantPid);
+      }
+    },
+    10_000,
+  );
 });
 
 async function firstLine(stream: NodeJS.ReadableStream): Promise<string> {
