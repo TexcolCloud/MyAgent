@@ -403,6 +403,33 @@ export class SqliteRunRepository implements RunStore {
     });
   }
 
+  failRun(input: { runId: RunId; leaseOwner: string; code: string; occurredAt: Date }): Run {
+    const occurredAt = input.occurredAt.toISOString();
+    return this.inImmediateTransaction(() => {
+      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
+      const context = this.getExecutionContext(input.runId);
+      this.db.prepare(
+        `UPDATE runs SET state = 'failed', failure_code = ?, active_elapsed_seconds = active_elapsed_seconds + ?,
+         active_started_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE run_id = ? AND lease_owner = ?`,
+      ).run(input.code, elapsedActiveSeconds(context, input.occurredAt), occurredAt, input.runId, input.leaseOwner);
+      this.appendEventInTransaction(input.runId, "run.failed", canonicalize({ code: input.code }), occurredAt);
+      return this.getRun(input.runId);
+    });
+  }
+
+  activateSkill(input: { runId: RunId; leaseOwner: string; skillName: string; skillVersion: number; contentSha256: string; occurredAt: Date }): void {
+    const occurredAt = input.occurredAt.toISOString();
+    this.inImmediateTransaction(() => {
+      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
+      this.db.prepare(
+        `INSERT OR IGNORE INTO run_activated_skills (run_id, skill_name, skill_version, content_sha256, activated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(input.runId, input.skillName, input.skillVersion, input.contentSha256, occurredAt);
+      this.appendEventInTransaction(input.runId, "skill.activated", canonicalize({ skillName: input.skillName, skillVersion: input.skillVersion }), occurredAt);
+    });
+  }
+
   completeRun(input: CompleteRunInput): Run {
     const occurredAt = input.occurredAt.toISOString();
     return this.inImmediateTransaction(() => {

@@ -85,6 +85,10 @@ export class AdvanceRunService {
         : { type: "advanced", runId };
     }
     if (latestTool?.state === "allowed") {
+      if (context.run.budget.activeExecutionSeconds >= context.revision.limits.activeExecutionSeconds) {
+        this.options.runs.failRun({ runId, leaseOwner, code: "run_budget_exceeded", occurredAt: this.options.clock.now() });
+        return { type: "terminal", runId, state: "failed" };
+      }
       const definition = this.options.registry.get(latestTool.toolName);
       if (definition === undefined) throw new DomainError("tool_not_registered");
       this.options.tools.beginExecution({
@@ -99,7 +103,11 @@ export class AdvanceRunService {
           toolCallId: latestTool.toolCallId,
           signal,
           remainingRunOutputBytes: context.revision.limits.maxRunToolOutputBytes - context.run.budget.toolOutputBytes,
-          activateSkill: () => {},
+          activateSkill: (skillName) => {
+            const skill = context.revision.skills.find((candidate) => candidate.name === skillName);
+            if (skill === undefined) throw new DomainError("skill_not_available");
+            this.options.runs.activateSkill({ runId, leaseOwner, skillName, skillVersion: skill.version, contentSha256: skill.contentSha256, occurredAt: this.options.clock.now() });
+          },
         });
       } catch (error) {
         result = { ok: false, summary: error instanceof Error ? error.message : "tool_execution_failed", content: {}, capturedBytes: 0, truncated: false };
@@ -134,6 +142,10 @@ export class AdvanceRunService {
     });
 
     for (let attemptNumber = 1; attemptNumber <= MAX_MODEL_ATTEMPTS; attemptNumber += 1) {
+      if (context.run.budget.modelTurns >= context.revision.limits.modelTurns || context.run.budget.activeExecutionSeconds >= context.revision.limits.activeExecutionSeconds) {
+        this.options.runs.failRun({ runId, leaseOwner, code: "run_budget_exceeded", occurredAt: this.options.clock.now() });
+        return { type: "terminal", runId, state: "failed" };
+      }
       const attemptId = this.options.ids.attemptId();
       this.options.runs.beginModelAttempt({
         runId,
