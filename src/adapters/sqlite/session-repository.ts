@@ -6,6 +6,8 @@ import type {
   SaveLeasedSessionSummaryInput,
   SaveSessionSummaryInput,
   SessionMessage,
+  SessionMetadata,
+  SessionLookupStore,
   SessionStore,
   SessionSummary,
 } from "../../ports/session-store.js";
@@ -32,8 +34,18 @@ interface SummaryRow {
   created_at: string;
 }
 
-export class SqliteSessionRepository implements SessionStore {
+interface SessionRow { session_id: string; agent_id: string; session_key: string; created_at: string; updated_at: string; }
+
+export class SqliteSessionRepository implements SessionStore, SessionLookupStore {
   constructor(private readonly db: DatabaseSync) {}
+
+  findByIdentity(agentId: string, sessionKey: string): SessionMetadata | null {
+    const row = this.db.prepare(
+      `SELECT session_id, agent_id, session_key, created_at, updated_at
+       FROM sessions WHERE agent_id = ? AND session_key = ? AND owner_session_id IS NULL`,
+    ).get(agentId, sessionKey) as SessionRow | undefined;
+    return row === undefined ? null : { sessionId: row.session_id as SessionId, agentId: row.agent_id, sessionKey: row.session_key, createdAt: new Date(row.created_at), updatedAt: new Date(row.updated_at) };
+  }
 
   delete(sessionId: SessionId): void {
     this.db.exec("BEGIN IMMEDIATE");
@@ -49,6 +61,10 @@ export class SqliteSessionRepository implements SessionStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  hasRunningRun(sessionId: SessionId): boolean {
+    return this.db.prepare("SELECT 1 FROM runs WHERE session_id = ? AND state = 'running' LIMIT 1").get(sessionId) !== undefined;
   }
 
   getCurrentSummary(sessionId: SessionId): SessionSummary | null {

@@ -23,6 +23,14 @@ export interface SessionSummary {
   createdAt: Date;
 }
 
+export interface SessionMetadata {
+  sessionId: SessionId;
+  agentId: string;
+  sessionKey: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export type SaveSessionSummaryInput = SessionSummary;
 
 export interface SaveLeasedSessionSummaryInput {
@@ -41,4 +49,8 @@ export interface SessionStore {
   ): readonly SessionMessage[];
   saveSummary(input: SaveSessionSummaryInput): SessionSummary;
   saveSummaryWithLease(input: SaveLeasedSessionSummaryInput): SessionSummary;
+}
+
+export interface SessionLookupStore {
+  findByIdentity(agentId: string, sessionKey: string): SessionMetadata | null;
 }

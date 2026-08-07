@@ -27,6 +27,15 @@ interface ApprovalRow {
 export class SqliteApprovalRepository implements ApprovalStore {
   constructor(private readonly db: DatabaseSync) {}
 
+  listPending(): readonly Approval[] {
+    const rows = this.db.prepare(
+      `SELECT approval_id, run_id, tool_call_id, state, arguments_sha256,
+              expires_at, resolved_at, resolution_reason, created_at
+       FROM approvals WHERE state = 'pending' ORDER BY created_at, approval_id`,
+    ).all() as unknown as ApprovalRow[];
+    return rows.map(mapApproval);
+  }
+
   getPendingForRun(runId: RunId): Approval | null {
     const row = this.db
       .prepare(
