@@ -1,0 +1,9 @@
+server:
+  port: 70000
+  bearerToken:
+    fromEnvironment: MYAGENT_BEARER_TOKEN
+database:
+  path: ./data/kernel.db
+agentRoots:
+  - ./agents
+models: {}

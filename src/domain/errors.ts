@@ -12,3 +12,18 @@ export class DomainError extends Error {
 
   readonly code: string;
 }
+
+export class ApplicationError extends Error {
+  readonly details: JsonValue | undefined;
+
+  constructor(
+    readonly code: string,
+    readonly status: number,
+    message: string = code,
+    details?: JsonValue,
+  ) {
+    super(message);
+    this.name = "ApplicationError";
+    this.details = details;
+  }
+}

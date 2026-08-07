@@ -1,0 +1,19 @@
+server:
+  bearerToken:
+    fromEnvironment: MYAGENT_BEARER_TOKEN
+database:
+  path: ./data/kernel.db
+agentRoots:
+  - ./agents
+skillRoots:
+  - ./skills
+models:
+  default:
+    provider: openai-compatible
+    model: test-model
+    baseUrl: http://127.0.0.1:11434/v1
+    apiKey:
+      fromEnvironment: MODEL_API_KEY
+    maxInputTokens: 32768
+toolEnvironmentAllowlist:
+  - PATH

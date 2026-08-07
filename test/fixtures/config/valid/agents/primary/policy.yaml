@@ -1,0 +1,12 @@
+version: 1
+rules:
+  - tool: activate_skill
+    effect: allow
+  - tool: read_file
+    when:
+      pathWithinWorkspace: true
+    effect: allow
+  - tool: run_command
+    effect: ask
+  - tool: "*"
+    effect: deny

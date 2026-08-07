@@ -1,0 +1,9 @@
+id: broken
+displayName: Broken Agent
+prompt: ./MISSING.md
+model: default
+workspace: ./workspace
+skills: []
+policy: ./policy.yaml
+delegates: []
+limits: {}
