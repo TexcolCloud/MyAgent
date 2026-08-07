@@ -1,0 +1,43 @@
+{
+  "name": "m1-durable-agent-kernel",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:contract": "vitest run test/contract",
+    "test:integration": "vitest run test/integration",
+    "test:e2e": "vitest run test/e2e",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "bin": {
+    "myagent": "./dist/interfaces/cli/main.js"
+  },
+  "dependencies": {
+    "canonicalize": "^2.1.0",
+    "commander": "^14.0.3",
+    "fastify": "^5.11.2",
+    "openai": "^5.23.2",
+    "uuid": "^11.1.1",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^24.13.3",
+    "eslint": "^9.39.5",
+    "fast-check": "^4.9.0",
+    "tsx": "^4.23.10",
+    "typescript": "5.9",
+    "typescript-eslint": "^8.66.0",
+    "vitest": "^3.2.7"
+  }
+}
