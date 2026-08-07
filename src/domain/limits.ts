@@ -1,3 +1,5 @@
+import { DomainError } from "./errors.js";
+
 export interface RunLimits {
   modelTurns: number;
   toolCalls: number;
@@ -38,6 +40,13 @@ export function consumeBudget(
   delta: Readonly<BudgetDelta>,
   limits: Readonly<RunLimits>,
 ): RunBudget {
+  validateBudgetDelta(delta);
+  const next = addBudget(current, delta);
+  assertBudgetWithinLimits(next, delta, limits);
+  return next;
+}
+
+function validateBudgetDelta(delta: Readonly<BudgetDelta>): void {
   for (const [field, value] of Object.entries(delta)) {
     if (value === undefined || !Number.isFinite(value) || value < 0) {
       throw new DomainError(
@@ -47,8 +56,13 @@ export function consumeBudget(
       );
     }
   }
+}
 
-  const next: RunBudget = {
+function addBudget(
+  current: Readonly<RunBudget>,
+  delta: Readonly<BudgetDelta>,
+): RunBudget {
+  return {
     modelTurns: current.modelTurns + (delta.modelTurns ?? 0),
     toolCalls: current.toolCalls + (delta.toolCalls ?? 0),
     childRuns: current.childRuns + (delta.childRuns ?? 0),
@@ -57,7 +71,13 @@ export function consumeBudget(
       current.activeExecutionSeconds + (delta.activeExecutionSeconds ?? 0),
     toolOutputBytes: current.toolOutputBytes + (delta.toolOutputBytes ?? 0),
   };
+}
 
+function assertBudgetWithinLimits(
+  next: Readonly<RunBudget>,
+  delta: Readonly<BudgetDelta>,
+  limits: Readonly<RunLimits>,
+): void {
   const boundedValues = [
     ["modelTurns", next.modelTurns, limits.modelTurns],
     ["toolCalls", next.toolCalls, limits.toolCalls],
@@ -92,8 +112,6 @@ export function consumeBudget(
       limits.maxRunToolOutputBytes,
     );
   }
-
-  return next;
 }
 
 function throwBudgetExceeded(limit: string, value: number, maximum: number): never {
@@ -103,4 +121,3 @@ function throwBudgetExceeded(limit: string, value: number, maximum: number): nev
     { limit, value, maximum },
   );
 }
-import { DomainError } from "./errors.js";
