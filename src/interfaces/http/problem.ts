@@ -49,6 +49,9 @@ export function sendError(
   if (error instanceof Error && (error.message === "invalid_request" || error.message === "invalid_last_event_id")) {
     return sendProblem(reply, request, 400, "invalid_request", "The request is invalid.");
   }
+  if (isMalformedRequest(error)) {
+    return sendProblem(reply, request, 400, "invalid_request", "The request is invalid.");
+  }
   if (isSqliteUnavailable(error)) {
     return sendProblem(reply, request, 503, "database_unavailable", "The database is temporarily unavailable.");
   }
@@ -60,9 +63,15 @@ function isSqliteUnavailable(error: unknown): boolean {
   return typeof error === "object" && error !== null && "errcode" in error && (error as { errcode?: unknown }).errcode === 5;
 }
 
+function isMalformedRequest(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const httpError = error as Error & { statusCode?: unknown; code?: unknown };
+  return httpError.statusCode === 400 || httpError.code === "FST_ERR_CTP_INVALID_JSON_BODY";
+}
+
 function domainStatus(code: string): number {
   if (code.endsWith("_not_found")) return 404;
-  if (code.includes("already_resolved") || code.includes("conflict")) return 409;
+  if (code.includes("already_resolved") || code.includes("conflict") || code === "session_has_running_run") return 409;
   return 422;
 }
 

@@ -1,4 +1,5 @@
 import { createHttpApp } from "../../src/interfaces/http/app.js";
+import type { SseStreamOptions } from "../../src/interfaces/http/sse.js";
 import { SqliteApprovalRepository } from "../../src/adapters/sqlite/approval-repository.js";
 import { SqliteCatalogRepository } from "../../src/adapters/sqlite/catalog-repository.js";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
@@ -18,7 +19,7 @@ import { ExecutionRegistry } from "../../src/runtime/execution-registry.js";
 import { FakeClock } from "./fake-clock.js";
 import { tempPath } from "./temp-dir.js";
 
-export async function startTestApp() {
+export async function startTestApp(options: { sse?: SseStreamOptions } = {}) {
   const connection = openDatabase({ path: tempPath("http-test.db"), busyTimeoutMs: 5_000 });
   migrate(connection.db);
   const catalog = new CatalogService(await loadCatalog("test/fixtures/config/valid/myagent.yaml"));
@@ -26,18 +27,21 @@ export async function startTestApp() {
   const ids = new UuidIdGenerator();
   const runs = new SqliteRunRepository(connection.db, new SqliteCatalogRepository(connection.db));
   const tools = new SqliteToolRepository(connection.db);
+  const approvals = new SqliteApprovalRepository(connection.db);
+  const sessions = new SqliteSessionRepository(connection.db);
   const app = createHttpApp({
     bearerToken: "test-token",
     catalog,
     createRuns: new CreateRunService(catalog, runs, clock, ids),
     runs,
     cancelRuns: new CancelRunService(runs, new ExecutionRegistry(), clock),
-    approvals: new SqliteApprovalRepository(connection.db),
-    decideApprovals: new DecideApprovalService(new SqliteApprovalRepository(connection.db), clock),
+    approvals,
+    decideApprovals: new DecideApprovalService(approvals, clock),
     tools,
     reconcileTools: new ReconcileToolCallService({ tools, runs, policy: { decide: () => ({ effect: "deny", matchedRule: null }) }, clock, ids }),
-    sessions: new SqliteSessionRepository(connection.db),
-    deleteSession: new DeleteSessionService(new SqliteSessionRepository(connection.db)),
+    sessions,
+    deleteSession: new DeleteSessionService(sessions),
+    ...(options.sse === undefined ? {} : { sse: options.sse }),
   });
-  return { app, connection, runs, close: async () => { await app.close(); connection.close(); } };
+  return { app, approvals, catalog, clock, connection, runs, sessions, tools, close: async () => { await app.close(); connection.close(); } };
 }

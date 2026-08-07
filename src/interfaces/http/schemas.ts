@@ -17,8 +17,89 @@ export const reconciliationSchema = z.strictObject({
   result: z.unknown().optional(),
 });
 
+const runStateSchema = z.enum([
+  "queued", "running", "waiting_approval", "waiting_reconciliation",
+  "completed", "failed", "cancelled",
+]);
+const runBudgetSchema = z.strictObject({
+  modelTurns: z.number().int().nonnegative(),
+  toolCalls: z.number().int().nonnegative(),
+  childRuns: z.number().int().nonnegative(),
+  delegationDepth: z.number().int().nonnegative(),
+  activeExecutionSeconds: z.number().nonnegative(),
+  toolOutputBytes: z.number().int().nonnegative(),
+});
+export const healthResponseSchema = z.strictObject({ status: z.literal("ok") });
+export const readinessResponseSchema = z.strictObject({ status: z.literal("ready") });
+export const agentsResponseSchema = z.strictObject({
+  agents: z.array(z.strictObject({ id: agentIdSchema, revisionId: z.string(), displayName: z.string() })),
+  unavailable: z.array(z.strictObject({ id: agentIdSchema, code: z.string() })),
+});
+export const configReloadResponseSchema = z.strictObject({
+  agents: z.array(z.strictObject({ id: agentIdSchema, revisionId: z.string() })),
+  unavailable: z.array(z.strictObject({ id: agentIdSchema, code: z.string() })),
+});
+export const createRunResponseSchema = z.strictObject({
+  runId: z.string(),
+  status: z.literal("queued"),
+  eventsUrl: z.string(),
+});
+export const runResponseSchema = z.strictObject({
+  runId: z.string(),
+  sessionId: z.string(),
+  agentId: agentIdSchema,
+  status: runStateSchema,
+  fifoSequence: z.number().int().nonnegative(),
+  parentRunId: z.string().nullable(),
+  rootRunId: z.string(),
+  delegationDepth: z.number().int().nonnegative(),
+  budget: runBudgetSchema,
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export const approvalsResponseSchema = z.strictObject({
+  approvals: z.array(z.strictObject({
+    approvalId: z.string(),
+    runId: z.string(),
+    toolCallId: z.string(),
+    state: z.literal("pending"),
+    toolName: z.string(),
+    arguments: z.unknown(),
+    expiresAt: z.string(),
+    riskNotice: z.string().optional(),
+  })),
+});
+export const approvalDecisionResponseSchema = z.strictObject({
+  approvalId: z.string(),
+  runId: z.string(),
+  state: z.enum(["approved", "denied"]),
+  resolvedAt: z.string().nullable(),
+});
+export const reconciliationResponseSchema = z.strictObject({
+  toolCallId: z.string(),
+  state: z.enum(["succeeded", "failed", "unknown"]),
+  retryToolCallId: z.string().optional(),
+});
+export const sessionsResponseSchema = z.strictObject({
+  sessions: z.array(z.strictObject({
+    sessionId: z.string(),
+    agentId: agentIdSchema,
+    sessionKey: sessionKeySchema,
+    createdAt: z.string(),
+    updatedAt: z.string(),
+  })),
+});
+
 export function parseSchema<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (!result.success) throw new Error("invalid_request");
   return result.data;
+}
+
+export function serializeWithSchema(schema: unknown): (value: unknown) => string {
+  return (value) => {
+    const result = (schema as z.ZodType<unknown>).safeParse(value);
+    if (!result.success) throw new Error("invalid_response");
+    return JSON.stringify(result.data);
+  };
 }

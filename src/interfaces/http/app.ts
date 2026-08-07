@@ -19,6 +19,8 @@ import { registerConfigRoutes } from "./routes/config.js";
 import { registerRunRoutes } from "./routes/runs.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerToolCallRoutes } from "./routes/tool-calls.js";
+import { serializeWithSchema } from "./schemas.js";
+import type { SseStreamOptions } from "./sse.js";
 
 export interface HttpAppOptions {
   bearerToken: string;
@@ -32,6 +34,7 @@ export interface HttpAppOptions {
   reconcileTools?: ReconcileToolCallService;
   sessions?: SessionLookupStore;
   deleteSession?: DeleteSessionService;
+  sse?: SseStreamOptions;
 }
 
 export function createHttpApp(options: HttpAppOptions): FastifyInstance {
@@ -40,6 +43,7 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
   }
 
   const app = Fastify({ logger: false });
+  app.setSerializerCompiler(({ schema }) => serializeWithSchema(schema));
   registerHealthRoutes(app);
   app.addHook("onRequest", async (request, reply) => {
     if (request.url === "/v1" || request.url.startsWith("/v1/")) {
@@ -54,7 +58,12 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
   });
   if (options.createRuns !== undefined && options.runs !== undefined && options.cancelRuns !== undefined) {
     app.register((api, _routeOptions, done) => {
-      registerRunRoutes(api, { createRuns: options.createRuns!, runs: options.runs!, cancelRuns: options.cancelRuns! });
+      registerRunRoutes(api, {
+        createRuns: options.createRuns!,
+        runs: options.runs!,
+        cancelRuns: options.cancelRuns!,
+        ...(options.sse === undefined ? {} : { sse: options.sse }),
+      });
       done();
     }, { prefix: "/v1" });
   }

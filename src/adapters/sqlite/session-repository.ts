@@ -48,23 +48,40 @@ export class SqliteSessionRepository implements SessionStore, SessionLookupStore
   }
 
   delete(sessionId: SessionId): void {
+    this.inImmediateTransaction(() => this.deleteRootSession(sessionId));
+  }
+
+  deleteIfIdle(sessionId: SessionId): void {
+    this.inImmediateTransaction(() => {
+      if (
+        this.db.prepare(
+          "SELECT 1 FROM runs WHERE session_id = ? AND state = 'running' LIMIT 1",
+        ).get(sessionId) !== undefined
+      ) {
+        throw new DomainError("session_has_running_run");
+      }
+      this.deleteRootSession(sessionId);
+    });
+  }
+
+  private deleteRootSession(sessionId: SessionId): void {
+    const session = this.db.prepare(
+      `SELECT owner_session_id FROM sessions WHERE session_id = ?`,
+    ).get(sessionId) as { owner_session_id: string | null } | undefined;
+    if (session === undefined) throw new DomainError("session_not_found");
+    if (session.owner_session_id !== null) throw new DomainError("synthetic_session_owned");
+    this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+  }
+
+  private inImmediateTransaction(operation: () => void): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const session = this.db.prepare(
-        `SELECT owner_session_id FROM sessions WHERE session_id = ?`,
-      ).get(sessionId) as { owner_session_id: string | null } | undefined;
-      if (session === undefined) throw new DomainError("session_not_found");
-      if (session.owner_session_id !== null) throw new DomainError("synthetic_session_owned");
-      this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+      operation();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
-  }
-
-  hasRunningRun(sessionId: SessionId): boolean {
-    return this.db.prepare("SELECT 1 FROM runs WHERE session_id = ? AND state = 'running' LIMIT 1").get(sessionId) !== undefined;
   }
 
   getCurrentSummary(sessionId: SessionId): SessionSummary | null {
