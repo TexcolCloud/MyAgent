@@ -69,6 +69,20 @@ export class AdvanceRunService {
     return this.activeAbortSafety.get(runId) ?? true;
   }
 
+  finalizeCancellation(
+    runId: RunId,
+    leaseOwner: string,
+  ): AdvanceOutcome | null {
+    const context = this.options.runs.getExecutionContext(runId);
+    if (context.cancellationRequestedAt === null) return null;
+    const run = this.options.runs.finalizeCancellation({
+      runId,
+      leaseOwner,
+      occurredAt: this.options.clock.now(),
+    });
+    return outcomeForState(run.runId, run.state);
+  }
+
   async advance(
     runId: RunId,
     leaseOwner: string,
@@ -79,6 +93,11 @@ export class AdvanceRunService {
     assertOwnedLease(context, leaseOwner, this.options.clock.now());
     if (context.run.state !== "running") {
       return outcomeForState(context.run.runId, context.run.state);
+    }
+    if (context.cancellationRequestedAt !== null) {
+      const cancellation = this.finalizeCancellation(runId, leaseOwner);
+      if (cancellation === null) throw new DomainError("run_cancellation_not_requested");
+      return cancellation;
     }
     if (this.options.approvals.getPendingForRun(runId) !== null) {
       return { type: "waiting", runId, state: "waiting_approval" };
@@ -157,6 +176,8 @@ export class AdvanceRunService {
         maxRunToolOutputBytes: context.revision.limits.maxRunToolOutputBytes,
         occurredAt: this.options.clock.now(),
       });
+      const cancellation = this.finalizeCancellation(runId, leaseOwner);
+      if (cancellation !== null) return cancellation;
       if (this.options.runs.getRun(runId).state === "failed") {
         return { type: "terminal", runId, state: "failed" };
       }
@@ -247,6 +268,8 @@ export class AdvanceRunService {
             summary: summaryInput,
           }),
       });
+      const cancellation = this.finalizeCancellation(runId, leaseOwner);
+      if (cancellation !== null) return cancellation;
       request = summary.request;
       if (summary.summarized) {
         return { type: "advanced", runId };
@@ -303,6 +326,8 @@ export class AdvanceRunService {
         );
       } catch (error) {
         if (signal.aborted) {
+          const cancellation = this.finalizeCancellation(runId, leaseOwner);
+          if (cancellation !== null) return cancellation;
           throw signal.reason;
         }
         if (!(error instanceof ModelProviderError)) {
@@ -332,6 +357,8 @@ export class AdvanceRunService {
         );
         continue;
       }
+      const cancellation = this.finalizeCancellation(runId, leaseOwner);
+      if (cancellation !== null) return cancellation;
       if (completed.toolCall !== undefined) {
         if (context.run.budget.toolCalls >= context.revision.limits.toolCalls) {
           const occurredAt = this.options.clock.now();
@@ -354,6 +381,13 @@ export class AdvanceRunService {
             revision: context.revision,
           },
         });
+        const cancellationAfterNormalization = this.finalizeCancellation(
+          runId,
+          leaseOwner,
+        );
+        if (cancellationAfterNormalization !== null) {
+          return cancellationAfterNormalization;
+        }
         const decision = this.options.policy.decide({
           agentId: context.run.agentId,
           toolName: proposal.toolName,
@@ -482,6 +516,7 @@ export class AdvanceRunService {
         if (winner.result.done) {
           break;
         }
+        signal.throwIfAborted();
         const chunk = winner.result.value;
         if (chunk.type === "text_delta") {
           text += chunk.text;

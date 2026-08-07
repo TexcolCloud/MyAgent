@@ -2,6 +2,7 @@ import type { AdvanceRunService } from "../application/advance-run.js";
 import type { RunId } from "../domain/ids.js";
 import type { Clock } from "../ports/clock.js";
 import type { RunStore } from "../ports/run-store.js";
+import { ExecutionRegistry } from "./execution-registry.js";
 import { LeaseHeartbeat } from "./lease-heartbeat.js";
 
 export interface RunWorkerOptions {
@@ -12,12 +13,14 @@ export interface RunWorkerOptions {
   concurrency?: number;
   leaseDurationMs?: number;
   idleDelayMs?: number;
+  executions?: ExecutionRegistry;
 }
 
 export class RunWorker {
   private readonly concurrency: number;
   private readonly leaseDurationMs: number;
   private readonly idleDelayMs: number;
+  private readonly executions: ExecutionRegistry;
   private readonly active = new Map<RunId, AbortController>();
   private loops: Promise<void>[] = [];
   private running = false;
@@ -26,6 +29,7 @@ export class RunWorker {
     this.concurrency = options.concurrency ?? 4;
     this.leaseDurationMs = options.leaseDurationMs ?? 30_000;
     this.idleDelayMs = options.idleDelayMs ?? 50;
+    this.executions = options.executions ?? new ExecutionRegistry();
   }
 
   start(): void {
@@ -84,6 +88,7 @@ export class RunWorker {
         },
       );
       this.active.set(run.runId, controller);
+      this.executions.register(run.runId, controller);
       heartbeat.start();
       let shouldBackOff = false;
       try {
@@ -95,7 +100,24 @@ export class RunWorker {
         }
       } catch (error) {
         const cause = heartbeatFailure ?? error;
-        if (isSqliteBusy(cause)) {
+        let cancellation = null;
+        let cancellationFailure: unknown;
+        if (controller.signal.aborted) {
+          try {
+            cancellation = this.options.advance.finalizeCancellation(run.runId, leaseOwner);
+          } catch (finalizationError) {
+            cancellationFailure = finalizationError;
+          }
+        }
+        if (cancellation !== null) {
+          busyDelayMs = 50;
+        } else if (cancellationFailure !== undefined && isLeaseLost(cancellationFailure)) {
+          // Another worker owns the Run now; do not retry this cancelled lease.
+        } else if (cancellationFailure !== undefined && isSqliteBusy(cancellationFailure)) {
+          shouldBackOff = true;
+        } else if (cancellationFailure !== undefined && !isLeaseLost(cancellationFailure)) {
+          throw cancellationFailure;
+        } else if (isSqliteBusy(cause)) {
           shouldBackOff = true;
         } else if (heartbeatFailure !== undefined && !isLeaseLost(cause)) {
           throw cause;
@@ -105,6 +127,7 @@ export class RunWorker {
       } finally {
         heartbeat.stop();
         this.active.delete(run.runId);
+        this.executions.unregister(run.runId, controller);
       }
       if (shouldBackOff && this.running) {
         await this.options.clock.sleep(busyDelayMs);

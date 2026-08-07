@@ -52,6 +52,7 @@ interface RunRow {
   lease_owner: string | null;
   lease_expires_at: string | null;
   active_started_at: string | null;
+  cancellation_requested_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -314,6 +315,10 @@ export class SqliteRunRepository implements RunStore {
         row.lease_expires_at === null ? null : new Date(row.lease_expires_at),
       activeStartedAt:
         row.active_started_at === null ? null : new Date(row.active_started_at),
+      cancellationRequestedAt:
+        row.cancellation_requested_at === null
+          ? null
+          : new Date(row.cancellation_requested_at),
     };
   }
 
@@ -555,7 +560,6 @@ export class SqliteRunRepository implements RunStore {
           `UPDATE runs SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), updated_at = ?
            WHERE run_id = ? AND state = 'running'`,
         ).run(occurredAt, occurredAt, input.runId);
-        this.appendEventInTransaction(input.runId, "run.cancelled", canonicalize({ requested: true }), occurredAt);
         return this.getRun(input.runId);
       }
       if (run.state === "waiting_approval") {
@@ -584,6 +588,162 @@ export class SqliteRunRepository implements RunStore {
       this.appendEventInTransaction(input.runId, "run.cancelled", canonicalize({ requested: false }), occurredAt);
       return this.getRun(input.runId);
     });
+  }
+
+  finalizeCancellation(input: {
+    runId: RunId;
+    leaseOwner: string;
+    occurredAt: Date;
+  }): Run {
+    const occurredAt = input.occurredAt.toISOString();
+    return this.inImmediateTransaction(() => {
+      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
+      const context = this.getExecutionContext(input.runId);
+      if (context.cancellationRequestedAt === null) {
+        throw new DomainError("run_cancellation_not_requested");
+      }
+      const executingTool = this.db.prepare(
+        `SELECT tool_call_id, effect FROM tool_calls
+         WHERE run_id = ? AND state = 'executing'
+         ORDER BY created_at DESC, tool_call_id DESC LIMIT 1`,
+      ).get(input.runId) as {
+        tool_call_id: string;
+        effect: "read_only" | "side_effect" | "internal";
+      } | undefined;
+      if (executingTool !== undefined) {
+        if (executingTool.effect === "side_effect") {
+          this.db.prepare(
+            `UPDATE tool_calls SET state = 'unknown', updated_at = ?
+             WHERE tool_call_id = ? AND state = 'executing'`,
+          ).run(occurredAt, executingTool.tool_call_id);
+          const waiting = this.db.prepare(
+            `UPDATE runs SET state = 'waiting_reconciliation',
+               active_elapsed_seconds = active_elapsed_seconds + ?,
+               active_started_at = NULL, lease_owner = NULL,
+               lease_expires_at = NULL, updated_at = ?
+             WHERE run_id = ? AND state = 'running' AND lease_owner = ?
+               AND cancellation_requested_at IS NOT NULL`,
+          ).run(
+            elapsedActiveSeconds(context, input.occurredAt),
+            occurredAt,
+            input.runId,
+            input.leaseOwner,
+          );
+          if (waiting.changes !== 1) throw new DomainError("run_lease_lost");
+          this.appendEventInTransaction(
+            input.runId,
+            "tool.unknown",
+            canonicalize({ toolCallId: executingTool.tool_call_id }),
+            occurredAt,
+          );
+          this.appendEventInTransaction(
+            input.runId,
+            "run.waiting",
+            canonicalize({ state: "waiting_reconciliation" }),
+            occurredAt,
+          );
+          return this.getRun(input.runId);
+        }
+        const cancelledResult = canonicalize({
+          ok: false,
+          summary: "run_cancelled",
+          content: { code: "run_cancelled" },
+          capturedBytes: 0,
+          truncated: false,
+        });
+        const failed = this.db.prepare(
+          `UPDATE tool_calls SET state = 'failed', result_json = ?, updated_at = ?
+           WHERE tool_call_id = ? AND state = 'executing'`,
+        ).run(cancelledResult, occurredAt, executingTool.tool_call_id);
+        if (failed.changes !== 1) throw new DomainError("tool_not_executing");
+        this.appendEventInTransaction(
+          input.runId,
+          "tool.failed",
+          canonicalize({
+            toolCallId: executingTool.tool_call_id,
+            code: "run_cancelled",
+          }),
+          occurredAt,
+        );
+      }
+      const unmatchedAttempt = this.findUnmatchedModelAttempt(input.runId);
+      if (unmatchedAttempt !== null) {
+        this.appendEventInTransaction(
+          input.runId,
+          "model.attempt.failed",
+          canonicalize({
+            attemptId: unmatchedAttempt,
+            code: "run_cancelled",
+            transient: false,
+          }),
+          occurredAt,
+        );
+      }
+      const cancelled = this.db.prepare(
+        `UPDATE runs SET state = 'cancelled',
+           active_elapsed_seconds = active_elapsed_seconds + ?,
+           active_started_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+           updated_at = ?
+         WHERE run_id = ? AND state = 'running' AND lease_owner = ?
+           AND cancellation_requested_at IS NOT NULL`,
+      ).run(
+        elapsedActiveSeconds(context, input.occurredAt),
+        occurredAt,
+        input.runId,
+        input.leaseOwner,
+      );
+      if (cancelled.changes !== 1) throw new DomainError("run_lease_lost");
+      this.appendEventInTransaction(
+        input.runId,
+        "run.cancelled",
+        canonicalize({ requestedAt: context.cancellationRequestedAt.toISOString() }),
+        occurredAt,
+      );
+      return this.getRun(input.runId);
+    });
+  }
+
+  private findUnmatchedModelAttempt(runId: RunId): AttemptId | null {
+    const attempt = this.db.prepare(
+      `SELECT json_extract(started.payload_json, '$.attemptId') AS attempt_id
+       FROM run_events AS started
+       WHERE started.run_id = ?
+         AND started.event_type = 'model.attempt.started'
+         AND NOT EXISTS (
+           SELECT 1 FROM run_events AS failed
+           WHERE failed.run_id = started.run_id
+             AND failed.event_type = 'model.attempt.failed'
+             AND json_extract(failed.payload_json, '$.attemptId') =
+                 json_extract(started.payload_json, '$.attemptId')
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM run_events AS completed
+           WHERE completed.run_id = started.run_id
+             AND completed.event_type = 'message.completed'
+             AND json_extract(completed.payload_json, '$.attemptId') =
+                 json_extract(started.payload_json, '$.attemptId')
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM run_events AS proposed
+           WHERE proposed.run_id = started.run_id
+             AND proposed.event_type = 'tool.proposed'
+             AND proposed.sequence > started.sequence
+         )
+         AND (
+           json_extract(started.payload_json, '$.purpose') <> 'session_summary'
+           OR NOT EXISTS (
+             SELECT 1
+             FROM runs AS summary_run
+             JOIN session_summaries AS summary
+               ON summary.session_id = summary_run.session_id
+             WHERE summary_run.run_id = started.run_id
+               AND summary.created_at >= started.created_at
+           )
+         )
+       ORDER BY started.sequence DESC
+       LIMIT 1`,
+    ).get(runId) as { attempt_id: string } | undefined;
+    return attempt === undefined ? null : attempt.attempt_id as AttemptId;
   }
 
   private assertCurrentLease(

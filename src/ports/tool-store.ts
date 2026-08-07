@@ -54,3 +54,20 @@ export interface ToolStore {
     occurredAt: Date;
   }): "retry" | "reconciliation";
 }
+
+export interface ReconciliationStore {
+  get(toolCallId: ToolCallId): ToolCall;
+  reconcile(input: {
+    toolCallId: ToolCallId;
+    outcome: "succeeded" | "failed" | "retry";
+    note: string;
+    result?: JsonValue;
+    retryToolCallId?: ToolCallId;
+    approvalId?: ApprovalId;
+    approvalExpiresAt?: Date;
+    policyEffect?: PolicyEffect;
+    matchedRule?: number | null;
+    toolCallLimit?: number;
+    occurredAt: Date;
+  }): { toolCall: ToolCall; retryToolCallId?: ToolCallId };
+}

@@ -35,6 +35,7 @@ export interface RunExecutionContext {
   leaseOwner: string | null;
   leaseExpiresAt: Date | null;
   activeStartedAt: Date | null;
+  cancellationRequestedAt: Date | null;
 }
 
 export interface BeginModelAttemptInput {
@@ -98,4 +99,9 @@ export interface RunStore {
   failRun(input: { runId: RunId; leaseOwner: string; code: string; occurredAt: Date }): Run;
   completeRun(input: CompleteRunInput): Run;
   cancel(input: { runId: RunId; occurredAt: Date }): Run;
+  finalizeCancellation(input: {
+    runId: RunId;
+    leaseOwner: string;
+    occurredAt: Date;
+  }): Run;
 }

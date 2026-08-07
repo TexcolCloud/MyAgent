@@ -369,6 +369,7 @@ describe("RunWorker", () => {
         }, { once: true });
       }),
       isAbortSafe: () => true,
+      finalizeCancellation: () => null,
     } as unknown as AdvanceRunService;
     const clock = new ControlledWorkerClock();
     const worker = new RunWorker({
@@ -385,6 +386,50 @@ describe("RunWorker", () => {
     try {
       await withTimeout(clock.firstSleepRequested, 200);
       expect(abortReason).toBe(busyError);
+      expect(clock.delays[0]).toBe(50);
+    } finally {
+      const stopping = worker.stop();
+      clock.releaseSleep();
+      await stopping;
+    }
+  });
+
+  it("backs off when cancellation finalization encounters SQLite busy", async () => {
+    const runId = runIdFromUuid("00000000-0000-7000-8000-000000000038");
+    let claims = 0;
+    const busyError = Object.assign(new Error("database is locked"), { errcode: 5 });
+    const runs = {
+      claimNextEligible: () => {
+        claims += 1;
+        return claims === 1 ? { runId } as Run : null;
+      },
+      renewLease: () => { throw busyError; },
+    } as unknown as RunStore;
+    const advance = {
+      advance: async (
+        _runId: unknown,
+        _leaseOwner: unknown,
+        signal: AbortSignal,
+      ) => new Promise<never>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+      isAbortSafe: () => true,
+      finalizeCancellation: () => { throw busyError; },
+    } as unknown as AdvanceRunService;
+    const clock = new ControlledWorkerClock();
+    const worker = new RunWorker({
+      runs,
+      advance,
+      clock,
+      workerId: "worker-cancel-finalize-busy",
+      concurrency: 1,
+      leaseDurationMs: 3,
+      idleDelayMs: 5,
+    });
+
+    worker.start();
+    try {
+      await withTimeout(clock.firstSleepRequested, 200);
       expect(clock.delays[0]).toBe(50);
     } finally {
       const stopping = worker.stop();

@@ -175,7 +175,7 @@ CREATE TABLE reconciliations (
   reconciliation_id TEXT PRIMARY KEY,
   tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls(tool_call_id) ON DELETE CASCADE,
   retry_tool_call_id TEXT UNIQUE REFERENCES tool_calls(tool_call_id) ON DELETE SET NULL,
-  outcome TEXT NOT NULL CHECK (outcome IN ('not_executed', 'executed', 'retry')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'failed', 'retry')),
   note TEXT NOT NULL,
   result_json TEXT,
   created_at TEXT NOT NULL
