@@ -2,6 +2,7 @@ import type { AgentRevisionSnapshot } from "../domain/agent-revision.js";
 import type { RunEvent, RunEventType } from "../domain/events.js";
 import type {
   AgentId,
+  AttemptId,
   IdempotencyKey,
   RunId,
   SessionId,
@@ -27,6 +28,44 @@ export interface CreateStoredRunResult {
   created: boolean;
 }
 
+export interface RunExecutionContext {
+  run: Run;
+  revision: AgentRevisionSnapshot;
+  input: { type: "text"; text: string };
+  leaseOwner: string | null;
+  leaseExpiresAt: Date | null;
+  activeStartedAt: Date | null;
+}
+
+export interface BeginModelAttemptInput {
+  runId: RunId;
+  leaseOwner: string;
+  attemptId: AttemptId;
+  purpose: "run" | "session_summary";
+  consumeModelTurn: boolean;
+  modelTurnLimit: number;
+  occurredAt: Date;
+}
+
+export interface FailModelAttemptInput {
+  runId: RunId;
+  leaseOwner: string;
+  attemptId: AttemptId;
+  code: string;
+  transient: boolean;
+  occurredAt: Date;
+}
+
+export interface CompleteRunInput {
+  runId: RunId;
+  leaseOwner: string;
+  attemptId: AttemptId;
+  text: string;
+  finishReason: string;
+  usage: { inputTokens: number; outputTokens: number };
+  occurredAt: Date;
+}
+
 export interface RunStore {
   create(input: CreateStoredRunInput): CreateStoredRunResult;
   getRun(runId: RunId): Run;
@@ -40,4 +79,16 @@ export interface RunStore {
   claimNextEligible(leaseOwner: string, now: Date, leaseUntil: Date): Run | null;
   renewLease(runId: RunId, leaseOwner: string, leaseUntil: Date): boolean;
   releaseLease(runId: RunId, leaseOwner: string): boolean;
+  getExecutionContext(runId: RunId): RunExecutionContext;
+  listActivatedSkillNames(runId: RunId): readonly string[];
+  beginModelAttempt(input: BeginModelAttemptInput): void;
+  appendModelDelta(
+    runId: RunId,
+    leaseOwner: string,
+    attemptId: AttemptId,
+    text: string,
+    occurredAt: Date,
+  ): void;
+  failModelAttempt(input: FailModelAttemptInput): void;
+  completeRun(input: CompleteRunInput): Run;
 }

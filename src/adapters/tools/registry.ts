@@ -13,4 +13,8 @@ export class ToolRegistry {
   get(name: string): ToolDefinition | undefined {
     return this.#tools.get(name);
   }
+
+  list(): readonly ToolDefinition[] {
+    return [...this.#tools.values()];
+  }
 }

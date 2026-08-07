@@ -136,6 +136,8 @@ CREATE TABLE tool_calls (
   canonical_arguments TEXT NOT NULL,
   arguments_sha256 TEXT NOT NULL,
   policy_effect TEXT NOT NULL CHECK (policy_effect IN ('allow', 'ask', 'deny')),
+  matched_rule INTEGER,
+  policy_facts_json TEXT NOT NULL DEFAULT '{}',
   retry_of_tool_call_id TEXT REFERENCES tool_calls(tool_call_id) ON DELETE SET NULL,
   result_json TEXT,
   error_json TEXT,

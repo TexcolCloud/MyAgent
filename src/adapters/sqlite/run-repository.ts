@@ -4,14 +4,18 @@ import canonicalizeModule from "canonicalize";
 import type { DatabaseSync } from "node:sqlite";
 
 import type { RunEvent, RunEventType } from "../../domain/events.js";
-import type { RunId, SessionId } from "../../domain/ids.js";
+import type { AttemptId, RunId, SessionId } from "../../domain/ids.js";
 import type { JsonValue } from "../../domain/json.js";
 import type { Run } from "../../domain/run.js";
 import type { RunState } from "../../domain/states.js";
-import { ApplicationError } from "../../domain/errors.js";
+import { ApplicationError, DomainError } from "../../domain/errors.js";
 import type {
+  BeginModelAttemptInput,
+  CompleteRunInput,
   CreateStoredRunInput,
   CreateStoredRunResult,
+  FailModelAttemptInput,
+  RunExecutionContext,
   RunStore,
 } from "../../ports/run-store.js";
 import type { SqliteCatalogRepository } from "./catalog-repository.js";
@@ -33,6 +37,7 @@ interface RunRow {
   run_id: string;
   session_id: string;
   agent_id: string;
+  agent_revision_id: string;
   state: string;
   fifo_sequence: number;
   parent_run_id: string | null;
@@ -43,8 +48,16 @@ interface RunRow {
   child_run_count: number;
   active_elapsed_seconds: number;
   tool_output_bytes: number;
+  input_json: string;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  active_started_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface ExecutionRow extends RunRow {
+  revision_json: string;
 }
 
 interface ClaimRow {
@@ -277,6 +290,198 @@ export class SqliteRunRepository implements RunStore {
     return result.changes === 1;
   }
 
+  getExecutionContext(runId: RunId): RunExecutionContext {
+    const row = this.db
+      .prepare(
+        `SELECT runs.*, sessions.agent_id,
+                agent_revisions.content_json AS revision_json
+         FROM runs
+         JOIN sessions ON sessions.session_id = runs.session_id
+         JOIN agent_revisions
+           ON agent_revisions.revision_id = runs.agent_revision_id
+         WHERE runs.run_id = ?`,
+      )
+      .get(runId) as ExecutionRow | undefined;
+    if (row === undefined) {
+      throw new DomainError("run_not_found");
+    }
+    return {
+      run: mapRun(row),
+      revision: JSON.parse(row.revision_json) as RunExecutionContext["revision"],
+      input: JSON.parse(row.input_json) as RunExecutionContext["input"],
+      leaseOwner: row.lease_owner,
+      leaseExpiresAt:
+        row.lease_expires_at === null ? null : new Date(row.lease_expires_at),
+      activeStartedAt:
+        row.active_started_at === null ? null : new Date(row.active_started_at),
+    };
+  }
+
+  listActivatedSkillNames(runId: RunId): readonly string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT skill_name
+           FROM run_activated_skills
+           WHERE run_id = ?
+           ORDER BY activated_at, skill_name`,
+        )
+        .all(runId) as unknown as Array<{ skill_name: string }>
+    ).map((row) => row.skill_name);
+  }
+
+  beginModelAttempt(input: BeginModelAttemptInput): void {
+    assertLeaseOwner(input.leaseOwner);
+    const occurredAt = input.occurredAt.toISOString();
+    this.inImmediateTransaction(() => {
+      const increment = input.consumeModelTurn ? 1 : 0;
+      const updated = this.db
+        .prepare(
+          `UPDATE runs
+           SET model_turn_count = model_turn_count + ?, updated_at = ?
+           WHERE run_id = ? AND state = 'running' AND lease_owner = ?
+             AND lease_expires_at > ?
+             AND model_turn_count + ? <= ?`,
+        )
+        .run(
+          increment,
+          occurredAt,
+          input.runId,
+          input.leaseOwner,
+          occurredAt,
+          increment,
+          input.modelTurnLimit,
+        );
+      if (updated.changes !== 1) {
+        throw new DomainError("run_lease_or_budget_invalid");
+      }
+      this.appendEventInTransaction(
+        input.runId,
+        "model.attempt.started",
+        canonicalize({ attemptId: input.attemptId, purpose: input.purpose }),
+        occurredAt,
+      );
+    });
+  }
+
+  appendModelDelta(
+    runId: RunId,
+    leaseOwner: string,
+    attemptId: AttemptId,
+    text: string,
+    occurredAt: Date,
+  ): void {
+    if (text.length === 0) {
+      return;
+    }
+    const occurredAtText = occurredAt.toISOString();
+    this.inImmediateTransaction(() => {
+      this.assertCurrentLease(runId, leaseOwner, occurredAtText);
+      this.appendEventInTransaction(
+        runId,
+        "message.delta",
+        canonicalize({ attemptId, text }),
+        occurredAtText,
+      );
+    });
+  }
+
+  failModelAttempt(input: FailModelAttemptInput): void {
+    const occurredAt = input.occurredAt.toISOString();
+    this.inImmediateTransaction(() => {
+      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
+      this.appendEventInTransaction(
+        input.runId,
+        "model.attempt.failed",
+        canonicalize({
+          attemptId: input.attemptId,
+          code: input.code,
+          transient: input.transient,
+        }),
+        occurredAt,
+      );
+    });
+  }
+
+  completeRun(input: CompleteRunInput): Run {
+    const occurredAt = input.occurredAt.toISOString();
+    return this.inImmediateTransaction(() => {
+      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
+      const context = this.getExecutionContext(input.runId);
+      const messageSequence = this.nextMessageSequence(context.run.sessionId);
+      this.db
+        .prepare(
+          `INSERT INTO messages (
+            message_id, session_id, run_id, sequence, run_fifo_sequence,
+            role, content_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, 'assistant', ?, ?)`,
+        )
+        .run(
+          `message:${input.runId}:assistant:${String(messageSequence)}`,
+          context.run.sessionId,
+          input.runId,
+          messageSequence,
+          context.run.fifoSequence,
+          canonicalize(input.text),
+          occurredAt,
+        );
+      const activeSeconds = elapsedActiveSeconds(context, input.occurredAt);
+      this.db
+        .prepare(
+          `UPDATE runs
+           SET state = 'completed', output_json = ?,
+               active_elapsed_seconds = active_elapsed_seconds + ?,
+               active_started_at = NULL, lease_owner = NULL,
+               lease_expires_at = NULL, updated_at = ?
+           WHERE run_id = ? AND state = 'running' AND lease_owner = ?`,
+        )
+        .run(
+          canonicalize({ type: "text", text: input.text }),
+          activeSeconds,
+          occurredAt,
+          input.runId,
+          input.leaseOwner,
+        );
+      this.appendEventInTransaction(
+        input.runId,
+        "message.completed",
+        canonicalize({
+          attemptId: input.attemptId,
+          content: input.text,
+          finishReason: input.finishReason,
+          usage: input.usage,
+        }),
+        occurredAt,
+      );
+      this.appendEventInTransaction(
+        input.runId,
+        "run.completed",
+        canonicalize({ result: input.text }),
+        occurredAt,
+      );
+      return this.getRun(input.runId);
+    });
+  }
+
+  private assertCurrentLease(
+    runId: RunId,
+    leaseOwner: string,
+    occurredAt: string,
+  ): void {
+    assertLeaseOwner(leaseOwner);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS valid
+         FROM runs
+         WHERE run_id = ? AND state = 'running' AND lease_owner = ?
+           AND lease_expires_at > ?`,
+      )
+      .get(runId, leaseOwner, occurredAt) as { valid: number } | undefined;
+    if (row === undefined) {
+      throw new DomainError("run_lease_lost");
+    }
+  }
+
   private findIdempotency(input: CreateStoredRunInput): IdempotencyRow | undefined {
     return this.db
       .prepare(
@@ -506,4 +711,16 @@ function mapEvent(row: EventRow): RunEvent {
     occurredAt: new Date(row.created_at),
     payload: JSON.parse(row.payload_json) as JsonValue,
   };
+}
+
+function elapsedActiveSeconds(
+  context: RunExecutionContext,
+  endedAt: Date,
+): number {
+  if (context.activeStartedAt === null) {
+    return 0;
+  }
+  return Math.ceil(
+    Math.max(0, endedAt.getTime() - context.activeStartedAt.getTime()) / 1_000,
+  );
 }
