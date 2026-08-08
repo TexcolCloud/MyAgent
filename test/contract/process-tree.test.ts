@@ -73,6 +73,7 @@ describe("ProcessTree", () => {
             "const { spawn } = require('node:child_process');",
             "const { existsSync } = require('node:fs');",
             `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: 'ignore' });`,
+            "descendant.unref();",
             `const readyPath = ${JSON.stringify(readyPath)};`,
             "const ready = setInterval(() => {",
             "  if (!existsSync(readyPath)) return;",
