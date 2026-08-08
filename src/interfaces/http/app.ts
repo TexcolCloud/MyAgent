@@ -1,4 +1,6 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import { randomUUID } from "node:crypto";
+
+import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } from "fastify";
 
 import type { CancelRunService } from "../../application/cancel-run.js";
 import type { CreateBackupService } from "../../application/create-backup.js";
@@ -13,7 +15,7 @@ import type { SessionLookupStore } from "../../ports/session-store.js";
 import type { ReconciliationStore } from "../../ports/tool-store.js";
 import { isAuthorized } from "./auth.js";
 import { sendError, sendProblem } from "./problem.js";
-import { registerHealthRoutes } from "./routes/health.js";
+import { registerHealthRoutes, type ReadinessProbe } from "./routes/health.js";
 import { registerAgentRoutes } from "./routes/agents.js";
 import { registerBackupRoutes } from "./routes/backups.js";
 import { registerApprovalRoutes } from "./routes/approvals.js";
@@ -38,6 +40,8 @@ export interface HttpAppOptions {
   deleteSession?: DeleteSessionService;
   sse?: SseStreamOptions;
   createBackups?: CreateBackupService;
+  logger?: FastifyBaseLogger;
+  readiness?: ReadinessProbe;
 }
 
 export function createHttpApp(options: HttpAppOptions): FastifyInstance {
@@ -45,9 +49,20 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
     throw new Error("http_bearer_token_required");
   }
 
-  const app = Fastify({ logger: false });
+  const app = Fastify({
+    genReqId: () => randomUUID(),
+    ...(options.logger === undefined
+      ? { logger: false as const }
+      : {
+          loggerInstance: options.logger,
+          logController: new LogController({
+            disableRequestLogging: true,
+            requestIdLogLabel: "traceId",
+          }),
+        }),
+  });
   app.setSerializerCompiler(({ schema }) => serializeWithSchema(schema));
-  registerHealthRoutes(app);
+  registerHealthRoutes(app, options.readiness ?? (() => true));
   app.addHook("onRequest", async (request, reply) => {
     if (request.url === "/v1" || request.url.startsWith("/v1/")) {
       const authorization = request.headers.authorization;

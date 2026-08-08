@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
+import { isIP } from "node:net";
 import path from "node:path";
+
+import type { DatabaseSync } from "node:sqlite";
 
 import { EnvironmentSecretResolver } from "./adapters/environment-secret-resolver.js";
 import { OpenAiChatCompletionsModel } from "./adapters/model/openai-chat-completions.js";
@@ -34,14 +37,19 @@ import { ReconcileToolCallService } from "./application/reconcile-tool-call.js";
 import { loadCatalog } from "./config/catalog-loader.js";
 import { CatalogService } from "./config/catalog-service.js";
 import { createHttpApp } from "./interfaces/http/app.js";
+import { createStructuredLogger } from "./observability/logger.js";
 import { assertSupportedRuntime } from "./platform.js";
 import { ApprovalExpirer } from "./runtime/approval-expirer.js";
 import { ExecutionRegistry } from "./runtime/execution-registry.js";
 import { RunWorker } from "./runtime/run-worker.js";
 
 export interface BootstrapOptions {
-  listen?: { host: string; port: number };
+  listen?: { host?: string; port?: number };
   signals?: boolean;
+  log?: {
+    write?: (line: string) => void;
+    sensitiveKeys?: readonly string[];
+  };
 }
 
 export interface BootstrappedService {
@@ -57,9 +65,17 @@ export async function bootstrap(
   const catalog = new CatalogService(await loadCatalog(configPath));
   const secrets = new EnvironmentSecretResolver();
   const bearerToken = secrets.resolve(catalog.current().global.server.bearerToken);
+  const resolvedModelSecrets: string[] = [];
   for (const model of Object.values(catalog.current().global.models)) {
-    secrets.resolve(model.apiKey);
+    resolvedModelSecrets.push(secrets.resolve(model.apiKey));
   }
+  const logger = createStructuredLogger({
+    secretValues: [bearerToken, ...resolvedModelSecrets],
+    ...(options.log?.write === undefined ? {} : { write: options.log.write }),
+    ...(options.log?.sensitiveKeys === undefined
+      ? {}
+      : { sensitiveKeys: options.log.sensitiveKeys }),
+  });
   await mkdir(path.dirname(catalog.current().global.database.path), { recursive: true });
   const connection = openDatabase(catalog.current().global.database);
   let app: ReturnType<typeof createHttpApp> | undefined;
@@ -69,6 +85,7 @@ export async function bootstrap(
   let detachSignals = (): void => {};
   try {
     migrate(connection.db);
+    const expectedMigrationVersions = readMigrationVersions(connection.db);
     const clock = new SystemClock();
     const ids = new UuidIdGenerator();
     const catalogStore = new SqliteCatalogRepository(connection.db);
@@ -126,13 +143,22 @@ export async function bootstrap(
         catalog,
         clock,
       ),
+      logger,
+      readiness: createReadinessProbe(catalog, connection.db, expectedMigrationVersions),
     });
     worker.start();
     expirer.start();
-    const address = await app.listen(options.listen ?? {
-      host: catalog.current().global.server.host,
-      port: catalog.current().global.server.port,
-    });
+    const listen = {
+      host: options.listen?.host ?? catalog.current().global.server.host,
+      port: options.listen?.port ?? catalog.current().global.server.port,
+    };
+    const address = await app.listen(listen);
+    if (!isLoopbackHost(listen.host)) {
+      logger.warn(
+        { code: "non_loopback_binding", host: listen.host },
+        "HTTP listener is exposed beyond loopback",
+      );
+    }
     const shutdown = async (): Promise<void> => {
       if (closed) return;
       closed = true;
@@ -146,7 +172,10 @@ export async function bootstrap(
     };
     if (options.signals !== false) {
       const onSignal = (): void => {
-        void shutdown().catch(() => { process.exitCode = 1; });
+        void shutdown().catch((error: unknown) => {
+          logger.error({ code: "shutdown_failed", error }, "service shutdown failed");
+          process.exitCode = 1;
+        });
       };
       process.once("SIGINT", onSignal);
       process.once("SIGTERM", onSignal);
@@ -164,11 +193,69 @@ export async function bootstrap(
         () => expirer?.stop(),
         () => connection.close(),
       ]);
-    } catch {
-      // Preserve the startup failure; observability owns cleanup diagnostics.
+    } catch (cleanupError) {
+      logger.error(
+        { code: "startup_cleanup_failed", error: cleanupError },
+        "startup cleanup failed",
+      );
     }
     throw error;
   }
+}
+
+function createReadinessProbe(
+  catalog: CatalogService,
+  database: DatabaseSync,
+  expectedMigrationVersions: readonly number[],
+): () => boolean {
+  return () => {
+    try {
+      catalog.current();
+    } catch {
+      return false;
+    }
+    let transactionStarted = false;
+    try {
+      database.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      const currentMigrationVersions = readMigrationVersions(database);
+      database.exec("ROLLBACK");
+      transactionStarted = false;
+      return arraysEqual(currentMigrationVersions, expectedMigrationVersions);
+    } catch {
+      if (transactionStarted) {
+        try {
+          database.exec("ROLLBACK");
+        } catch {
+          // A closed or failed connection is already not ready.
+        }
+      }
+      return false;
+    }
+  };
+}
+
+function readMigrationVersions(database: DatabaseSync): number[] {
+  return (database.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>)
+    .map(({ version }) => version);
+}
+
+function arraysEqual(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase();
+  if (
+    normalized === "localhost"
+    || normalized === "::1"
+    || normalized === "[::1]"
+    || normalized === "0:0:0:0:0:0:0:1"
+    || normalized === "[0:0:0:0:0:0:0:1]"
+  ) return true;
+  const ipv4Mapped = normalized.match(/^\[?::ffff:(127(?:\.\d{1,3}){3})\]?$/);
+  if (ipv4Mapped?.[1] !== undefined) return isLoopbackHost(ipv4Mapped[1]);
+  return isIP(normalized) === 4 && normalized.startsWith("127.");
 }
 
 async function cleanupResources(

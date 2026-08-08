@@ -38,7 +38,10 @@ describe("bootstrap", () => {
     const sigtermListeners = process.listenerCount("SIGTERM");
 
     try {
-      service = await bootstrap(path.join(root, "config", "myagent.yaml"), { listen: { host: "127.0.0.1", port: 0 } });
+      service = await bootstrap(path.join(root, "config", "myagent.yaml"), {
+        listen: { host: "127.0.0.1", port: 0 },
+        log: { write: () => {} },
+      });
       expect(process.listenerCount("SIGINT")).toBe(sigintListeners + 1);
       expect(process.listenerCount("SIGTERM")).toBe(sigtermListeners + 1);
       const response = await fetch(`${service.url}/healthz`);

@@ -30,8 +30,8 @@ const runBudgetSchema = z.strictObject({
   activeExecutionSeconds: z.number().nonnegative(),
   toolOutputBytes: z.number().int().nonnegative(),
 });
-export const healthResponseSchema = z.strictObject({ status: z.literal("ok") });
-export const readinessResponseSchema = z.strictObject({ status: z.literal("ready") });
+export const healthResponseSchema = z.strictObject({ ok: z.literal(true) });
+export const readinessResponseSchema = z.strictObject({ ready: z.boolean() });
 export const agentsResponseSchema = z.strictObject({
   agents: z.array(z.strictObject({ id: agentIdSchema, revisionId: z.string(), displayName: z.string() })),
   unavailable: z.array(z.strictObject({ id: agentIdSchema, code: z.string() })),
