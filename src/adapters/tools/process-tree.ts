@@ -87,6 +87,9 @@ export class ProcessTree {
     signalProcessGroup(pid, "SIGTERM");
     if (await processGroupStillRunning(pid, graceMs)) {
       signalProcessGroup(pid, "SIGKILL");
+      if (await processGroupStillRunning(pid, Math.max(100, graceMs))) {
+        throw new DomainError("process_tree_termination_failed");
+      }
     }
     await waitForProcessClose(this.#exit, Math.max(100, graceMs));
   }

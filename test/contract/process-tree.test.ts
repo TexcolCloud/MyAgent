@@ -55,16 +55,30 @@ describe("ProcessTree", () => {
   });
 
   it.skipIf(process.platform === "win32")(
-    "terminates the POSIX group after its leader closes while a descendant remains",
+    "confirms POSIX group disappearance after SIGKILL when the leader closed",
     async () => {
+      const readyPath = path.join(workspace, "sigterm-ignoring-descendant-ready");
+      const sigtermPath = path.join(workspace, "sigterm-observed");
+      const descendantScript = [
+        "const { writeFileSync } = require('node:fs');",
+        `process.on('SIGTERM', () => writeFileSync(${JSON.stringify(sigtermPath)}, 'observed'));`,
+        `writeFileSync(${JSON.stringify(readyPath)}, 'ready');`,
+        "setInterval(() => {}, 1000);",
+      ].join(" ");
       const tree = ProcessTree.start(
         process.execPath,
         [
           "-e",
           [
             "const { spawn } = require('node:child_process');",
-            "const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
-            "console.log(descendant.pid);",
+            "const { existsSync } = require('node:fs');",
+            `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: 'ignore' });`,
+            `const readyPath = ${JSON.stringify(readyPath)};`,
+            "const ready = setInterval(() => {",
+            "  if (!existsSync(readyPath)) return;",
+            "  clearInterval(ready);",
+            "  console.log(descendant.pid);",
+            "}, 10);",
           ].join(" "),
         ],
         { cwd: workspace, env: {} },
@@ -77,6 +91,7 @@ describe("ProcessTree", () => {
         await tree.terminate(100);
 
         expect(Date.now() - startedAt).toBeLessThan(600);
+        expect(await readFile(sigtermPath, "utf8")).toBe("observed");
         expect(isProcessRunning(descendantPid)).toBe(false);
       } finally {
         if (isProcessRunning(descendantPid)) {

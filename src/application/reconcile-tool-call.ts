@@ -48,12 +48,6 @@ export class ReconcileToolCallService {
       }
       const call = this.options.tools.get(input.toolCallId);
       const context = this.options.runs.getExecutionContext(call.runId);
-      if (context.run.state === "cancelled") {
-        throw new ApplicationError(
-          "reconciliation_retry_cancelled_run",
-          409,
-        );
-      }
       const decision = this.options.policy.decide({
         agentId: context.run.agentId,
         toolName: call.toolName,

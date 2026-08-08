@@ -132,7 +132,7 @@ describe("HTTP Runs", () => {
     }
   });
 
-  it("returns only a typed redacted failure for a failed Run", async () => {
+  it("returns only allowlisted typed redacted failures for failed Runs", async () => {
     const harness = await startTestApp({
       databasePath: tempPath("http-failed-result.db"),
     });
@@ -157,36 +157,51 @@ describe("HTTP Runs", () => {
       harness.runs.failRun({
         runId,
         leaseOwner: "http-failed-worker",
-        code: "provider_request_invalid",
+        code: "run_budget_exceeded",
         occurredAt,
       });
 
-      const failed = await harness.app.inject({
-        method: "GET",
-        url: `/v1/runs/${runId}`,
-        headers: auth,
-      });
-      expect(failed.statusCode).toBe(200);
-      expect(failed.json()).toMatchObject({
-        runId,
-        status: "failed",
-        failure: { code: "provider_request_invalid" },
-      });
-      expect(failed.json()).not.toHaveProperty("result");
+      for (const publicCode of [
+        "run_budget_exceeded",
+        "model_protocol_error",
+        "tool_not_found",
+        "provider_unavailable",
+      ]) {
+        harness.connection.db.prepare(
+          "UPDATE runs SET failure_code = ? WHERE run_id = ?",
+        ).run(publicCode, runId);
+        const failed = await harness.app.inject({
+          method: "GET",
+          url: `/v1/runs/${runId}`,
+          headers: auth,
+        });
+        expect(failed.statusCode).toBe(200);
+        expect(failed.json()).toMatchObject({
+          runId,
+          status: "failed",
+          failure: { code: publicCode },
+        });
+        expect(failed.json()).not.toHaveProperty("result");
+      }
 
-      const sensitiveFailure = "provider leaked SECRET_VALUE at C:\\private\\kernel.db";
-      harness.connection.db.prepare(
-        "UPDATE runs SET failure_code = ? WHERE run_id = ?",
-      ).run(sensitiveFailure, runId);
-      const redacted = await harness.app.inject({
-        method: "GET",
-        url: `/v1/runs/${runId}`,
-        headers: auth,
-      });
-      expect(redacted.statusCode).toBe(200);
-      expect(redacted.json().failure).toEqual({ code: "run_failed" });
-      expect(redacted.payload).not.toContain("SECRET_VALUE");
-      expect(redacted.payload).not.toContain("kernel.db");
+      for (const privateCode of [
+        "sk_live_SUPERSECRET",
+        "provider_request_invalid",
+        "custom_terminal_failure",
+        "provider leaked SECRET_VALUE at C:\\private\\kernel.db",
+      ]) {
+        harness.connection.db.prepare(
+          "UPDATE runs SET failure_code = ? WHERE run_id = ?",
+        ).run(privateCode, runId);
+        const redacted = await harness.app.inject({
+          method: "GET",
+          url: `/v1/runs/${runId}`,
+          headers: auth,
+        });
+        expect(redacted.statusCode).toBe(200);
+        expect(redacted.json().failure).toEqual({ code: "run_failed" });
+        expect(redacted.payload).not.toContain(privateCode);
+      }
     } finally {
       await harness.close();
     }

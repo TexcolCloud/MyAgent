@@ -6,7 +6,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { RunEvent, RunEventType } from "../../domain/events.js";
 import type { AttemptId, RunId, SessionId } from "../../domain/ids.js";
 import type { JsonValue } from "../../domain/json.js";
-import type { Run } from "../../domain/run.js";
+import { publicRunFailureCode, type Run } from "../../domain/run.js";
 import type { RunState } from "../../domain/states.js";
 import { ApplicationError, DomainError } from "../../domain/errors.js";
 import type {
@@ -1201,17 +1201,11 @@ function mapRun(row: RunRow): Run {
       ? JSON.parse(row.output_json) as JsonValue
       : null,
     failure: row.state === "failed"
-      ? { code: publicFailureCode(row.failure_code) }
+      ? { code: publicRunFailureCode(row.failure_code) }
       : null,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
   };
-}
-
-function publicFailureCode(code: string | null): string {
-  return code !== null && /^[A-Za-z0-9_]{1,64}$/.test(code)
-    ? code
-    : "run_failed";
 }
 
 function mapEvent(row: EventRow): RunEvent {

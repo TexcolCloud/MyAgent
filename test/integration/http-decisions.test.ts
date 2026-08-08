@@ -326,6 +326,103 @@ describe("HTTP catalog and session routes", () => {
     }
   });
 
+  it("preserves a retry reconciliation across later Run cancellation", async () => {
+    const harness = await startTestApp();
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/runs",
+        headers: {
+          ...headers,
+          "idempotency-key": "request-retry-then-cancel",
+        },
+        payload: {
+          agentId: "primary",
+          sessionKey: "session:retry-then-cancel",
+          input: { type: "text", text: "retry before cancellation" },
+        },
+      });
+      const runId = created.json().runId as string;
+      const toolCallId = "tool-http-retry-then-cancel";
+      const payload = {
+        outcome: "retry",
+        note: "operator requested one retry",
+      } as const;
+      seedUnknownToolCall(harness.connection.db, runId, toolCallId);
+
+      const first = await harness.app.inject({
+        method: "POST",
+        url: `/v1/tool-calls/${toolCallId}/reconciliation`,
+        headers,
+        payload,
+      });
+      expect(first.statusCode).toBe(200);
+      const firstBody = first.json() as {
+        toolCallId: string;
+        state: string;
+        retryToolCallId: string;
+      };
+      expect(firstBody).toMatchObject({
+        toolCallId,
+        state: "unknown",
+        retryToolCallId: expect.stringMatching(/^call_/),
+      });
+
+      const cancelled = await harness.app.inject({
+        method: "POST",
+        url: `/v1/runs/${runId}/cancel`,
+        headers,
+      });
+      expect(cancelled.statusCode).toBe(200);
+      expect(cancelled.json()).toMatchObject({ status: "cancelled" });
+      const footprintAfterCancellation = reconciliationFootprint(
+        harness.connection.db,
+        runId,
+        toolCallId,
+      );
+
+      const replayed = await harness.app.inject({
+        method: "POST",
+        url: `/v1/tool-calls/${toolCallId}/reconciliation`,
+        headers,
+        payload,
+      });
+
+      expect(replayed.statusCode).toBe(200);
+      expect(replayed.json()).toEqual(firstBody);
+      expect(reconciliationFootprint(
+        harness.connection.db,
+        runId,
+        toolCallId,
+      )).toEqual(footprintAfterCancellation);
+      expect(harness.runs.getRun(runId as never).state).toBe("cancelled");
+      expect(harness.tools.get(firstBody.retryToolCallId as never).state)
+        .toBe("denied");
+
+      const opposite = await harness.app.inject({
+        method: "POST",
+        url: `/v1/tool-calls/${toolCallId}/reconciliation`,
+        headers,
+        payload: {
+          outcome: "failed",
+          note: "operator changed the decision",
+        },
+      });
+      expect(opposite.statusCode).toBe(409);
+      expect(opposite.json()).toMatchObject({
+        code: "tool_call_already_reconciled",
+      });
+      expect(reconciliationFootprint(
+        harness.connection.db,
+        runId,
+        toolCallId,
+      )).toEqual(footprintAfterCancellation);
+      expect(harness.runs.getRun(runId as never).state).toBe("cancelled");
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("delegates the deletion decision to one atomic store operation", () => {
     const sessionId = "session-atomic" as SessionId;
     const deleteIfIdle = vi.fn(() => { throw new DomainError("session_has_running_run"); });
@@ -364,4 +461,28 @@ function seedUnknownToolCall(
     policy_facts_json, created_at, updated_at
   ) VALUES (?, ?, 'unknown', 'write_file', 'side_effect', ?, ?, 'hash-http-2', 'allow', 0, '{}', ?, ?)`)
     .run(toolCallId, runId, '{"content":"x","path":"report.txt"}', '{"content":"x","path":"report.txt"}', now, now);
+}
+
+function reconciliationFootprint(
+  db: import("node:sqlite").DatabaseSync,
+  runId: string,
+  toolCallId: string,
+): { toolCalls: number; reconciliations: number; events: number } {
+  const count = (query: string, value: string): number => (
+    db.prepare(query).get(value) as { count: number }
+  ).count;
+  return {
+    toolCalls: count(
+      "SELECT COUNT(*) AS count FROM tool_calls WHERE run_id = ?",
+      runId,
+    ),
+    reconciliations: count(
+      "SELECT COUNT(*) AS count FROM reconciliations WHERE tool_call_id = ?",
+      toolCallId,
+    ),
+    events: count(
+      "SELECT COUNT(*) AS count FROM run_events WHERE run_id = ?",
+      runId,
+    ),
+  };
 }
