@@ -15,14 +15,21 @@ import {
 import type { RunStore } from "../ports/run-store.js";
 import type { SessionStore } from "../ports/session-store.js";
 import type { ToolStore } from "../ports/tool-store.js";
-import type { ToolDefinition } from "../ports/tool.js";
+import {
+  isToolExecutionError,
+  type ToolDefinition,
+  type ToolResult,
+} from "../ports/tool.js";
 import type { ToolRegistry } from "../adapters/tools/registry.js";
 import { noFaults, type FaultInjector } from "../runtime/fault-injector.js";
 import { DeltaBuffer } from "./delta-buffer.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import type { PromptAssembler } from "./prompt-assembler.js";
 import { SessionSummarizer } from "./session-summarizer.js";
-import { normalizeToolProposal } from "./tool-proposal.js";
+import {
+  normalizeToolProposal,
+  preserveRejectedToolProposal,
+} from "./tool-proposal.js";
 
 const MAX_MODEL_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [250, 1_000] as const;
@@ -150,7 +157,8 @@ export class AdvanceRunService {
         string,
         { skillName: string; skillVersion: number; contentSha256: string }
       >();
-      let result;
+      let result: ToolResult | undefined;
+      let executionUncertain = false;
       this.activeAbortSafety.set(runId, latestTool.effect !== "side_effect");
       try {
         result = await definition.execute(latestTool.arguments, {
@@ -171,19 +179,36 @@ export class AdvanceRunService {
             });
           },
         });
-      } catch {
+      } catch (error) {
         if (signal.aborted) throw signal.reason;
-        result = {
-          ok: false,
-          summary: "tool_execution_failed",
-          content: { code: "tool_execution_failed" },
-          capturedBytes: 0,
-          truncated: false,
-        };
+        if (
+          isToolExecutionError(error) &&
+          error.startState === "possibly_started"
+        ) {
+          executionUncertain = true;
+        } else {
+          result = {
+            ok: false,
+            summary: "tool_execution_failed",
+            content: { code: "tool_execution_failed" },
+            capturedBytes: 0,
+            truncated: false,
+          };
+        }
       } finally {
         this.activeAbortSafety.delete(runId);
       }
       await this.faults.hit("after_tool_execution");
+      if (executionUncertain) {
+        this.options.tools.markExecutionUnknown({
+          runId,
+          toolCallId: latestTool.toolCallId,
+          leaseOwner,
+          occurredAt: this.options.clock.now(),
+        });
+        return { type: "waiting", runId, state: "waiting_reconciliation" };
+      }
+      if (result === undefined) throw new Error("tool_execution_result_missing");
       if (result.deferred === true) {
         return { type: "waiting", runId, state: "waiting_child" };
       }
@@ -395,15 +420,65 @@ export class AdvanceRunService {
           });
           return { type: "terminal", runId, state: "failed" };
         }
-        const proposal = await normalizeToolProposal({
-          registry: this.options.registry,
-          toolName: completed.toolCall.name,
-          arguments: completed.toolCall.arguments,
-          context: {
-            agentId: context.run.agentId,
-            revision: context.revision,
-          },
-        });
+        let proposal;
+        try {
+          proposal = await normalizeToolProposal({
+            registry: this.options.registry,
+            toolName: completed.toolCall.name,
+            arguments: completed.toolCall.arguments,
+            context: {
+              agentId: context.run.agentId,
+              revision: context.revision,
+            },
+          });
+        } catch (error) {
+          if (!(error instanceof DomainError)) throw error;
+          const cancellationAfterRejection = await this.finalizeCancellation(
+            runId,
+            leaseOwner,
+          );
+          if (cancellationAfterRejection !== null) {
+            return cancellationAfterRejection;
+          }
+          if (error.code === "tool_not_found") {
+            await this.commitModelAttempt(() => {
+              this.options.runs.failModelAttemptAndRun({
+                runId,
+                leaseOwner,
+                attemptId,
+                code: error.code,
+                transient: false,
+                occurredAt: this.options.clock.now(),
+              });
+            });
+            return { type: "terminal", runId, state: "failed" };
+          }
+          if (error.code !== "invalid_tool_arguments") throw error;
+          const rejected = preserveRejectedToolProposal({
+            registry: this.options.registry,
+            toolName: completed.toolCall.name,
+            arguments: completed.toolCall.arguments,
+          });
+          await this.commitModelAttempt(() => {
+            this.options.tools.recordProposal({
+              runId,
+              leaseOwner,
+              toolCallId: this.options.ids.toolCallId(),
+              toolName: rejected.toolName,
+              effect: rejected.effect,
+              arguments: rejected.arguments,
+              canonicalArguments: rejected.canonicalArguments,
+              argumentsSha256: rejected.argumentsSha256,
+              policyFacts: rejected.policyFacts,
+              policyEffect: "deny",
+              matchedRule: null,
+              denialCode: "invalid_tool_arguments",
+              toolCallLimit: context.revision.limits.toolCalls,
+              occurredAt: this.options.clock.now(),
+            });
+          });
+          return { type: "advanced", runId };
+        }
         const cancellationAfterNormalization = await this.finalizeCancellation(
           runId,
           leaseOwner,

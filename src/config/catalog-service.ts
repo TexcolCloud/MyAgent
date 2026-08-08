@@ -18,11 +18,18 @@ export class CatalogService {
     return loadCatalog(this.#snapshot.configPath);
   }
 
-  async reload(): Promise<CatalogSnapshot> {
+  reload(): Promise<CatalogSnapshot>;
+  reload<Result>(
+    prepare: (candidate: CatalogSnapshot) => Result,
+  ): Promise<Result>;
+  async reload<Result>(
+    prepare?: (candidate: CatalogSnapshot) => Result,
+  ): Promise<CatalogSnapshot | Result> {
     const candidate = await this.validate();
     assertReloadableGlobal(this.#snapshot, candidate);
+    const result = prepare === undefined ? candidate : prepare(candidate);
     this.#snapshot = Object.freeze(candidate);
-    return this.#snapshot;
+    return result;
   }
 
   resolve(agentId: AgentId): AvailableAgent {
@@ -53,5 +60,6 @@ function staticGlobalFields(snapshot: CatalogSnapshot): object {
       bearerToken: snapshot.global.server.bearerToken,
     },
     database: snapshot.global.database,
+    toolEnvironmentAllowlist: snapshot.global.toolEnvironmentAllowlist,
   };
 }

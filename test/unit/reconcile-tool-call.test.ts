@@ -69,6 +69,8 @@ function createService(
             activeExecutionSeconds: 0,
             toolOutputBytes: 0,
           },
+          result: null,
+          failure: null,
           createdAt: new Date(0),
           updatedAt: new Date(0),
         },

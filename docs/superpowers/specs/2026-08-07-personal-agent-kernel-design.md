@@ -240,14 +240,12 @@ SQLite runs with WAL, foreign keys, a non-zero busy timeout, explicit forward mi
 - `approvals`: unique Tool Call decision, expiry, and resolution metadata.
 - `reconciliations`: Operator decisions for `unknown` Tool Calls and links to explicit retry calls.
 - `idempotency_keys`: scoped request key, request digest, and original Run.
-- `outbox_deliveries`: durable outbound Channel messages and retry state.
 
 ### 6.2 Extension tables
 
-- `memories`
-- `kb_collections`, `kb_collection_agents`, `kb_sources`, and `kb_chunks`
-- `channel_events`
-- `schedules` and `schedule_occurrences`
+- M2: `memories`, `kb_collections`, `kb_collection_agents`, `kb_sources`, and `kb_chunks`
+- M3: `channel_events` and `outbox_deliveries`
+- M4: `schedules` and `schedule_occurrences`
 
 ### 6.3 Invariants
 

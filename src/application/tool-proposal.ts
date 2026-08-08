@@ -50,26 +50,48 @@ export async function normalizeToolProposal(
   }
 
   try {
-    const argumentsValue = copyAndFreezeJson(normalized.arguments);
-    const policyFacts = copyPolicyFacts(normalized.policyFacts);
-    const canonicalArguments = canonicalizeJson(argumentsValue);
-    if (canonicalArguments === undefined) {
-      throw new Error("arguments are not canonicalizable");
-    }
-
-    return Object.freeze({
-      toolName: tool.name,
-      arguments: argumentsValue,
-      canonicalArguments,
-      argumentsSha256: createHash("sha256")
-        .update(canonicalArguments, "utf8")
-        .digest("hex"),
-      effect: tool.effect,
-      policyFacts,
-    });
+    return buildProposal(tool, normalized.arguments, normalized.policyFacts);
   } catch {
     throw invalidArguments();
   }
+}
+
+export function preserveRejectedToolProposal(
+  input: Omit<NormalizeToolProposalInput, "context">,
+): NormalizedToolProposal {
+  const tool = input.registry.get(input.toolName);
+  if (tool === undefined) {
+    throw new DomainError("tool_not_found");
+  }
+  try {
+    return buildProposal(tool, input.arguments, {});
+  } catch {
+    throw invalidArguments();
+  }
+}
+
+function buildProposal(
+  tool: ToolDefinition,
+  argumentsValue: unknown,
+  policyFactsValue: ToolPolicyFacts,
+): NormalizedToolProposal {
+  const argumentsCopy = copyAndFreezeJson(argumentsValue);
+  const policyFacts = copyPolicyFacts(policyFactsValue);
+  const canonicalArguments = canonicalizeJson(argumentsCopy);
+  if (canonicalArguments === undefined) {
+    throw new Error("arguments are not canonicalizable");
+  }
+
+  return Object.freeze({
+    toolName: tool.name,
+    arguments: argumentsCopy,
+    canonicalArguments,
+    argumentsSha256: createHash("sha256")
+      .update(canonicalArguments, "utf8")
+      .digest("hex"),
+    effect: tool.effect,
+    policyFacts,
+  });
 }
 
 function copyAndFreezeJson(value: unknown, ancestors = new Set<object>()): JsonValue {

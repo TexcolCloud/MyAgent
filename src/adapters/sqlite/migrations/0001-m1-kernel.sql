@@ -220,24 +220,3 @@ WHEN NOT EXISTS (
 BEGIN
   SELECT RAISE(ABORT, 'idempotency_key_owner_mismatch');
 END;
-
-CREATE TABLE outbox_deliveries (
-  delivery_id TEXT PRIMARY KEY,
-  session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-  run_id TEXT,
-  channel TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'delivered', 'failed')),
-  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-  next_attempt_at TEXT NOT NULL,
-  delivered_at TEXT,
-  last_error TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (run_id, session_id)
-    REFERENCES runs(run_id, session_id) ON DELETE CASCADE
-);
-
-CREATE INDEX outbox_deliveries_pending
-  ON outbox_deliveries(next_attempt_at, delivery_id)
-  WHERE state IN ('pending', 'failed');

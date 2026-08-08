@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { CancelRunService } from "../../src/application/cancel-run.js";
 import type { CreateRunService } from "../../src/application/create-run.js";
+import type { AttemptId, RunId } from "../../src/domain/ids.js";
 import { createHttpApp } from "../../src/interfaces/http/app.js";
 import type { RunStore } from "../../src/ports/run-store.js";
 import { startTestApp } from "../helpers/start-test-app.js";
+import { tempPath } from "../helpers/temp-dir.js";
 
 const auth = { authorization: "Bearer test-token", "idempotency-key": "request-0001" };
 
@@ -75,6 +77,116 @@ describe("HTTP Runs", () => {
       });
       expect(cancelled.statusCode).toBe(200);
       expect(cancelled.json()).toMatchObject({ runId: created.json().runId, status: "cancelled" });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("returns a completed Run's parsed terminal result", async () => {
+    const harness = await startTestApp({
+      databasePath: tempPath("http-completed-result.db"),
+    });
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/runs",
+        headers: { ...auth, "idempotency-key": "request-completed-result" },
+        payload: {
+          agentId: "primary",
+          sessionKey: "session:completed-result",
+          input: { type: "text", text: "complete me" },
+        },
+      });
+      const runId = created.json().runId as RunId;
+      const occurredAt = harness.clock.now();
+      expect(harness.runs.claimNextEligible(
+        "http-completed-worker",
+        occurredAt,
+        new Date(occurredAt.getTime() + 30_000),
+      )?.runId).toBe(runId);
+      harness.runs.completeRun({
+        runId,
+        leaseOwner: "http-completed-worker",
+        attemptId: "attempt-http-completed" as AttemptId,
+        text: "durable terminal output",
+        finishReason: "stop",
+        usage: { inputTokens: 4, outputTokens: 3 },
+        occurredAt,
+      });
+
+      const response = await harness.app.inject({
+        method: "GET",
+        url: `/v1/runs/${runId}`,
+        headers: auth,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        runId,
+        status: "completed",
+        result: { type: "text", text: "durable terminal output" },
+      });
+      expect(response.json()).not.toHaveProperty("failure");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("returns only a typed redacted failure for a failed Run", async () => {
+    const harness = await startTestApp({
+      databasePath: tempPath("http-failed-result.db"),
+    });
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/runs",
+        headers: { ...auth, "idempotency-key": "request-failed-result" },
+        payload: {
+          agentId: "primary",
+          sessionKey: "session:failed-result",
+          input: { type: "text", text: "fail me" },
+        },
+      });
+      const runId = created.json().runId as RunId;
+      const occurredAt = harness.clock.now();
+      expect(harness.runs.claimNextEligible(
+        "http-failed-worker",
+        occurredAt,
+        new Date(occurredAt.getTime() + 30_000),
+      )?.runId).toBe(runId);
+      harness.runs.failRun({
+        runId,
+        leaseOwner: "http-failed-worker",
+        code: "provider_request_invalid",
+        occurredAt,
+      });
+
+      const failed = await harness.app.inject({
+        method: "GET",
+        url: `/v1/runs/${runId}`,
+        headers: auth,
+      });
+      expect(failed.statusCode).toBe(200);
+      expect(failed.json()).toMatchObject({
+        runId,
+        status: "failed",
+        failure: { code: "provider_request_invalid" },
+      });
+      expect(failed.json()).not.toHaveProperty("result");
+
+      const sensitiveFailure = "provider leaked SECRET_VALUE at C:\\private\\kernel.db";
+      harness.connection.db.prepare(
+        "UPDATE runs SET failure_code = ? WHERE run_id = ?",
+      ).run(sensitiveFailure, runId);
+      const redacted = await harness.app.inject({
+        method: "GET",
+        url: `/v1/runs/${runId}`,
+        headers: auth,
+      });
+      expect(redacted.statusCode).toBe(200);
+      expect(redacted.json().failure).toEqual({ code: "run_failed" });
+      expect(redacted.payload).not.toContain("SECRET_VALUE");
+      expect(redacted.payload).not.toContain("kernel.db");
     } finally {
       await harness.close();
     }

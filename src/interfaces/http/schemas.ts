@@ -32,13 +32,17 @@ const runBudgetSchema = z.strictObject({
 });
 export const healthResponseSchema = z.strictObject({ ok: z.literal(true) });
 export const readinessResponseSchema = z.strictObject({ ready: z.boolean() });
+const unavailableAgentResponseSchema = z.strictObject({
+  label: z.string(),
+  code: z.literal("invalid_agent_config"),
+});
 export const agentsResponseSchema = z.strictObject({
   agents: z.array(z.strictObject({ id: agentIdSchema, revisionId: z.string(), displayName: z.string() })),
-  unavailable: z.array(z.strictObject({ id: agentIdSchema, code: z.string() })),
+  unavailable: z.array(unavailableAgentResponseSchema),
 });
 export const configReloadResponseSchema = z.strictObject({
   agents: z.array(z.strictObject({ id: agentIdSchema, revisionId: z.string() })),
-  unavailable: z.array(z.strictObject({ id: agentIdSchema, code: z.string() })),
+  unavailable: z.array(unavailableAgentResponseSchema),
 });
 export const createRunResponseSchema = z.strictObject({
   runId: z.string(),
@@ -55,6 +59,8 @@ export const runResponseSchema = z.strictObject({
   rootRunId: z.string(),
   delegationDepth: z.number().int().nonnegative(),
   budget: runBudgetSchema,
+  result: z.unknown().optional(),
+  failure: z.strictObject({ code: z.string() }).optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });

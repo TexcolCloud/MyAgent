@@ -52,7 +52,7 @@ export interface CatalogSourceFile {
 }
 
 export interface UnavailableAgent {
-  id: string;
+  sourceLabel: string;
   code: "invalid_agent_config";
   detail: string;
 }
@@ -86,7 +86,9 @@ export async function loadCatalog(configPath: string): Promise<CatalogSnapshot> 
 
   const isolated = isolateDuplicateAgents(available, unavailable);
   isolated.available.sort((left, right) => left.id.localeCompare(right.id));
-  isolated.unavailable.sort((left, right) => left.id.localeCompare(right.id));
+  isolated.unavailable.sort((left, right) =>
+    left.sourceLabel.localeCompare(right.sourceLabel)
+  );
 
   const sourceFiles = new Map<string, CatalogSourceFile>();
   sourceFiles.set("myagent.yaml", Object.freeze({ relativePath: "myagent.yaml", content: globalSource }));
@@ -159,7 +161,10 @@ function isolateDuplicateAgents(
     counts.set(agent.id, (counts.get(agent.id) ?? 0) + 1);
   }
   for (const agent of unavailable) {
-    counts.set(agent.id, (counts.get(agent.id) ?? 0) + 1);
+    counts.set(
+      agent.sourceLabel,
+      (counts.get(agent.sourceLabel) ?? 0) + 1,
+    );
   }
 
   const duplicateIds = new Set(
@@ -168,11 +173,11 @@ function isolateDuplicateAgents(
       .map(([agentId]) => agentId),
   );
   const isolatedUnavailable = unavailable.filter(
-    (agent) => !duplicateIds.has(agent.id),
+    (agent) => !duplicateIds.has(agent.sourceLabel),
   );
   for (const id of duplicateIds) {
     isolatedUnavailable.push({
-      id,
+      sourceLabel: id,
       code: "invalid_agent_config",
       detail: `duplicate Agent ID: ${id}`,
     });
@@ -280,7 +285,7 @@ async function loadAgent(
     return Object.freeze({ id, revision, sources: Object.freeze(sources) });
   } catch (error) {
     return Object.freeze({
-      id: fallbackId,
+      sourceLabel: fallbackId,
       code: "invalid_agent_config" as const,
       detail: error instanceof Error ? error.message : "invalid Agent configuration",
     });

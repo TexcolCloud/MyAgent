@@ -1,6 +1,11 @@
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import { DeleteSessionService } from "../../src/application/delete-session.js";
+import type { CatalogSnapshot } from "../../src/config/catalog-loader.js";
 import { DomainError } from "../../src/domain/errors.js";
 import type { SessionId } from "../../src/domain/ids.js";
 import { startTestApp } from "../helpers/start-test-app.js";
@@ -20,6 +25,77 @@ describe("HTTP catalog and session routes", () => {
       expect(reloaded.statusCode).toBe(200);
       expect(reloaded.json().agents).toEqual(expect.arrayContaining([expect.objectContaining({ id: "primary" })]));
     } finally { await harness.close(); }
+  });
+
+  it("serializes malformed unavailable Agent source labels after reload", async () => {
+    const temporary = await mkdtemp(path.join(os.tmpdir(), "myagent-http-label-"));
+    const configRoot = path.join(temporary, "config");
+    await cp("test/fixtures/config/valid", configRoot, { recursive: true });
+    const harness = await startTestApp({
+      configPath: path.join(configRoot, "myagent.yaml"),
+    });
+    const agentPath = path.join(configRoot, "agents", "primary", "agent.yaml");
+    await writeFile(
+      agentPath,
+      (await readFile(agentPath, "utf8")).replace("id: primary", "id: Bad Agent!"),
+    );
+
+    try {
+      const reloaded = await harness.app.inject({
+        method: "POST",
+        url: "/v1/config/reload",
+        headers,
+      });
+      expect(reloaded.statusCode).toBe(200);
+      expect(reloaded.json().unavailable).toContainEqual({
+        label: "Bad Agent!",
+        code: "invalid_agent_config",
+      });
+
+      const listed = await harness.app.inject({
+        method: "GET",
+        url: "/v1/agents",
+        headers,
+      });
+      expect(listed.statusCode).toBe(200);
+      expect(listed.json().unavailable).toContainEqual({
+        label: "Bad Agent!",
+        code: "invalid_agent_config",
+      });
+      expect(harness.catalog.current().unavailable).toHaveLength(1);
+    } finally {
+      await harness.close();
+      await rm(temporary, { recursive: true, force: true });
+    }
+  });
+
+  it("validates the complete reload response before publishing its snapshot", async () => {
+    const harness = await startTestApp();
+    const active = harness.catalog.current();
+    const candidate = {
+      ...active,
+      available: active.available.map((agent, index) => index === 0
+        ? {
+            ...agent,
+            revision: { ...agent.revision, revisionId: 42 },
+          }
+        : agent),
+    } as unknown as CatalogSnapshot;
+    vi.spyOn(harness.catalog, "validate").mockResolvedValue(candidate);
+
+    try {
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/config/reload",
+        headers,
+      });
+
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toMatchObject({ code: "internal_error" });
+      expect(harness.catalog.current()).toBe(active);
+    } finally {
+      await harness.close();
+    }
   });
 
   it("returns only Session lifecycle metadata and deletes an idle Session", async () => {
@@ -129,6 +205,127 @@ describe("HTTP catalog and session routes", () => {
     }
   });
 
+  it.each(["succeeded", "failed"] as const)(
+    "records a %s unknown-Tool outcome after Run cancellation without reopening it",
+    async (outcome) => {
+      const harness = await startTestApp();
+      try {
+        const created = await harness.app.inject({
+          method: "POST",
+          url: "/v1/runs",
+          headers: {
+            ...headers,
+            "idempotency-key": `request-cancelled-${outcome}`,
+          },
+          payload: {
+            agentId: "primary",
+            sessionKey: `session:cancelled-${outcome}`,
+            input: { type: "text", text: "cancel before reconciliation" },
+          },
+        });
+        const runId = created.json().runId as string;
+        const toolCallId = `tool-http-cancelled-${outcome}`;
+        seedUnknownToolCall(harness.connection.db, runId, toolCallId);
+        const cancelled = await harness.app.inject({
+          method: "POST",
+          url: `/v1/runs/${runId}/cancel`,
+          headers,
+        });
+        expect(cancelled.statusCode).toBe(200);
+        expect(cancelled.json()).toMatchObject({ status: "cancelled" });
+        const queuedEventsBeforeReconciliation = harness.runs
+          .listEventsAfter(runId as never, 0)
+          .filter((event) => event.type === "run.queued").length;
+
+        const payload = {
+          outcome,
+          note: `operator observed ${outcome}`,
+          result: { observed: outcome },
+        };
+        const first = await harness.app.inject({
+          method: "POST",
+          url: `/v1/tool-calls/${toolCallId}/reconciliation`,
+          headers,
+          payload,
+        });
+        expect(first.statusCode).toBe(200);
+        expect(first.json()).toEqual({
+          toolCallId,
+          state: outcome,
+        });
+        const eventsAfterFirst = harness.runs.listEventsAfter(runId as never, 0);
+
+        const repeated = await harness.app.inject({
+          method: "POST",
+          url: `/v1/tool-calls/${toolCallId}/reconciliation`,
+          headers,
+          payload,
+        });
+
+        expect(repeated.statusCode).toBe(200);
+        expect(harness.runs.getRun(runId as never).state).toBe("cancelled");
+        expect(harness.tools.get(toolCallId as never).state).toBe(outcome);
+        expect(harness.runs.listEventsAfter(runId as never, 0))
+          .toHaveLength(eventsAfterFirst.length);
+        expect(eventsAfterFirst.map((event) => event.type)).toContain(
+          outcome === "succeeded" ? "tool.completed" : "tool.failed",
+        );
+        expect(
+          eventsAfterFirst.filter((event) => event.type === "run.queued"),
+        ).toHaveLength(queuedEventsBeforeReconciliation);
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it("rejects retry for a cancelled Run without creating unexecutable work", async () => {
+    const harness = await startTestApp();
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/runs",
+        headers: { ...headers, "idempotency-key": "request-cancelled-retry" },
+        payload: {
+          agentId: "primary",
+          sessionKey: "session:cancelled-retry",
+          input: { type: "text", text: "do not retry after cancellation" },
+        },
+      });
+      const runId = created.json().runId as string;
+      const toolCallId = "tool-http-cancelled-retry";
+      seedUnknownToolCall(harness.connection.db, runId, toolCallId);
+      await harness.app.inject({
+        method: "POST",
+        url: `/v1/runs/${runId}/cancel`,
+        headers,
+      });
+
+      const retried = await harness.app.inject({
+        method: "POST",
+        url: `/v1/tool-calls/${toolCallId}/reconciliation`,
+        headers,
+        payload: { outcome: "retry", note: "operator requested retry" },
+      });
+
+      expect(retried.statusCode).toBe(409);
+      expect(retried.json()).toMatchObject({
+        code: "reconciliation_retry_cancelled_run",
+      });
+      expect(harness.runs.getRun(runId as never).state).toBe("cancelled");
+      expect(harness.tools.get(toolCallId as never).state).toBe("unknown");
+      expect(harness.connection.db.prepare(
+        `SELECT COUNT(*) AS count FROM tool_calls
+         WHERE run_id = ? AND retry_of_tool_call_id IS NOT NULL`,
+      ).get(runId)).toEqual({ count: 0 });
+      expect(harness.connection.db.prepare(
+        "SELECT COUNT(*) AS count FROM reconciliations WHERE tool_call_id = ?",
+      ).get(toolCallId)).toEqual({ count: 0 });
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("delegates the deletion decision to one atomic store operation", () => {
     const sessionId = "session-atomic" as SessionId;
     const deleteIfIdle = vi.fn(() => { throw new DomainError("session_has_running_run"); });
@@ -154,13 +351,17 @@ function seedPendingApproval(db: import("node:sqlite").DatabaseSync, runId: stri
     .run(runId, "2026-08-08T00:00:00.000Z", now);
 }
 
-function seedUnknownToolCall(db: import("node:sqlite").DatabaseSync, runId: string): void {
+function seedUnknownToolCall(
+  db: import("node:sqlite").DatabaseSync,
+  runId: string,
+  toolCallId = "tool-http-unknown",
+): void {
   const now = "2026-08-07T00:00:00.000Z";
   db.prepare("UPDATE runs SET state = 'waiting_reconciliation' WHERE run_id = ?").run(runId);
   db.prepare(`INSERT INTO tool_calls (
     tool_call_id, run_id, state, tool_name, effect, arguments_json,
     canonical_arguments, arguments_sha256, policy_effect, matched_rule,
     policy_facts_json, created_at, updated_at
-  ) VALUES ('tool-http-unknown', ?, 'unknown', 'write_file', 'side_effect', ?, ?, 'hash-http-2', 'allow', 0, '{}', ?, ?)`)
-    .run(runId, '{"content":"x","path":"report.txt"}', '{"content":"x","path":"report.txt"}', now, now);
+  ) VALUES (?, ?, 'unknown', 'write_file', 'side_effect', ?, ?, 'hash-http-2', 'allow', 0, '{}', ?, ?)`)
+    .run(toolCallId, runId, '{"content":"x","path":"report.txt"}', '{"content":"x","path":"report.txt"}', now, now);
 }

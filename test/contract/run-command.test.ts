@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createRunCommandTool } from "../../src/adapters/tools/run-command.js";
+import type { ProcessTree } from "../../src/adapters/tools/process-tree.js";
 import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
 import type { AgentRevisionSnapshot } from "../../src/domain/agent-revision.js";
 import {
@@ -70,6 +73,171 @@ describe("run_command Tool", () => {
       exitCode: 0,
       stdout: "a && echo injected\n",
       stderr: "",
+    });
+  });
+
+  it("rejects an embedded NUL in the approved program during normalization", async () => {
+    const tool = createRunCommandTool({
+      environmentAllowlist: [],
+      secretResolver: new EnvironmentSecretResolver({}),
+    });
+
+    await expect(tool.parseAndNormalize(
+      {
+        program: `${process.execPath}\0ignored`,
+        args: [],
+        cwd: ".",
+        env: {},
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
+      },
+      normalizeContext,
+    )).rejects.toMatchObject({ code: "invalid_tool_arguments" });
+  });
+
+  it("rejects an embedded NUL in approved argv during normalization", async () => {
+    const tool = createRunCommandTool({
+      environmentAllowlist: [],
+      secretResolver: new EnvironmentSecretResolver({}),
+    });
+
+    await expect(tool.parseAndNormalize(
+      {
+        program: process.execPath,
+        args: ["-e", "process.exit(0)\0ignored"],
+        cwd: ".",
+        env: {},
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
+      },
+      normalizeContext,
+    )).rejects.toMatchObject({ code: "invalid_tool_arguments" });
+  });
+
+  it.each([
+    {
+      boundary: "environment name",
+      environmentAllowlist: ["SAFE\0INJECTED"],
+      env: { "SAFE\0INJECTED": { value: "owned" } },
+    },
+    {
+      boundary: "literal environment value",
+      environmentAllowlist: ["SAFE"],
+      env: { SAFE: { value: "safe\0INJECTED=owned" } },
+    },
+  ])(
+    "rejects an embedded NUL in an approved $boundary during normalization",
+    async ({ environmentAllowlist, env }) => {
+      const tool = createRunCommandTool({
+        environmentAllowlist,
+        secretResolver: new EnvironmentSecretResolver({}),
+      });
+
+      await expect(tool.parseAndNormalize(
+        {
+          program: process.execPath,
+          args: [],
+          cwd: ".",
+          env,
+          timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
+        },
+        normalizeContext,
+      )).rejects.toMatchObject({
+        code: "invalid_tool_arguments",
+        message: "invalid_tool_arguments",
+      });
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "rejects the reserved Windows bridge environment key case-insensitively",
+    async () => {
+      const tool = createRunCommandTool({
+        environmentAllowlist: ["myagent_windows_job_host"],
+        secretResolver: new EnvironmentSecretResolver({}),
+      });
+
+      await expect(tool.parseAndNormalize(
+        {
+          program: process.execPath,
+          args: [],
+          cwd: ".",
+          env: { myagent_windows_job_host: { value: "requested" } },
+          timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
+        },
+        normalizeContext,
+      )).rejects.toMatchObject({
+        code: "invalid_tool_arguments",
+        message: "invalid_tool_arguments",
+      });
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "allows the Windows bridge environment name on POSIX",
+    async () => {
+      const tool = createRunCommandTool({
+        environmentAllowlist: ["MYAGENT_WINDOWS_JOB_HOST"],
+        secretResolver: new EnvironmentSecretResolver({}),
+      });
+
+      const normalized = await tool.parseAndNormalize(
+        {
+          program: process.execPath,
+          args: [],
+          cwd: ".",
+          env: { MYAGENT_WINDOWS_JOB_HOST: { value: "ordinary-posix-value" } },
+          timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
+        },
+        normalizeContext,
+      );
+
+      expect(normalized.arguments.env).toEqual({
+        MYAGENT_WINDOWS_JOB_HOST: { value: "ordinary-posix-value" },
+      });
+    },
+  );
+
+  it("rejects a Secret-backed environment NUL before the target launches", async () => {
+    const markerPath = path.join(workspace, "secret-nul-launched");
+    const secretValue = "safe\0INJECTED=owned";
+    const tool = createRunCommandTool({
+      environmentAllowlist: ["SAFE"],
+      secretResolver: new EnvironmentSecretResolver({
+        SOURCE_SECRET: secretValue,
+      }),
+      startProcess: () => {
+        writeFileSync(markerPath, "launched", "utf8");
+        throw new Error("launcher_called");
+      },
+    });
+    const normalized = await tool.parseAndNormalize(
+      {
+        program: process.execPath,
+        args: [
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(markerPath)}, 'launched')`,
+        ],
+        env: { SAFE: { fromEnvironment: "SOURCE_SECRET" } },
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
+      },
+      normalizeContext,
+    );
+
+    let failure: unknown;
+    try {
+      await tool.execute(normalized.arguments, executionContext);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "tool_execution_infrastructure_failed",
+      message: "tool_execution_infrastructure_failed",
+      startState: "never_started",
+    });
+    expect(String(failure)).not.toContain(secretValue);
+    expect(JSON.stringify(failure)).not.toContain(secretValue);
+    await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
     });
   });
 
@@ -395,6 +563,57 @@ describe("run_command Tool", () => {
     controller.abort(new DOMException("run cancelled", "AbortError"));
 
     await expect(execution).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("classifies a failure before process start as never started", async () => {
+    const tool = createRunCommandTool({
+      environmentAllowlist: ["SECRET"],
+      secretResolver: new EnvironmentSecretResolver({}),
+    });
+    const normalized = await tool.parseAndNormalize(
+      {
+        program: process.execPath,
+        args: ["-e", "process.exit(99)"],
+        env: { SECRET: { fromEnvironment: "MISSING_SECRET" } },
+        timeoutMs: 2_000,
+      },
+      normalizeContext,
+    );
+
+    await expect(tool.execute(normalized.arguments, executionContext))
+      .rejects.toMatchObject({
+        code: "tool_execution_infrastructure_failed",
+        startState: "never_started",
+      });
+  });
+
+  it("classifies a wait failure after process start as possibly started", async () => {
+    const infrastructureFailure = new Error("simulated_wait_failure");
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const tool = createRunCommandTool({
+      environmentAllowlist: [],
+      secretResolver: new EnvironmentSecretResolver({}),
+      startProcess: () => ({
+        child: { stdout, stderr },
+        wait: () => Promise.reject(infrastructureFailure),
+        terminate: () => Promise.resolve(),
+      }) as unknown as ProcessTree,
+    });
+    const normalized = await tool.parseAndNormalize(
+      {
+        program: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        timeoutMs: 2_000,
+      },
+      normalizeContext,
+    );
+
+    await expect(tool.execute(normalized.arguments, executionContext))
+      .rejects.toMatchObject({
+        code: "tool_execution_infrastructure_failed",
+        startState: "possibly_started",
+      });
   });
 });
 

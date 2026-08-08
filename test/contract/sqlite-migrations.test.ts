@@ -15,6 +15,10 @@ describe("SQLite migrations", () => {
       expect(first.db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
       expect(first.db.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
       expect(first.db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5_000 });
+      expect(first.db.prepare(
+        `SELECT name FROM sqlite_master
+         WHERE name IN ('outbox_deliveries', 'outbox_deliveries_pending')`,
+      ).all()).toEqual([]);
     } finally {
       first.close();
     }
@@ -145,43 +149,6 @@ describe("SQLite migrations", () => {
             "request-0001",
             "request-digest",
             "run-a",
-            "2026-08-07T00:00:00.000Z",
-          ),
-      ).toThrow();
-    } finally {
-      connection.close();
-    }
-  });
-
-  it("rejects an outbox delivery linked to a Run from another Session", () => {
-    const connection = openDatabase({
-      path: tempPath("outbox-ownership.db"),
-      busyTimeoutMs: 5_000,
-    });
-    try {
-      migrate(connection.db);
-      seedRevision(connection.db);
-      seedSession(connection.db, "session-a", "session:a");
-      seedSession(connection.db, "session-b", "session:b");
-      seedRun(connection.db, "run-a", "session-a");
-
-      expect(() =>
-        connection.db
-          .prepare(
-            `INSERT INTO outbox_deliveries (
-              delivery_id, session_id, run_id, channel, payload_json, state,
-              next_attempt_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            "delivery-b",
-            "session-b",
-            "run-a",
-            "http",
-            "{}",
-            "pending",
-            "2026-08-07T00:00:00.000Z",
-            "2026-08-07T00:00:00.000Z",
             "2026-08-07T00:00:00.000Z",
           ),
       ).toThrow();

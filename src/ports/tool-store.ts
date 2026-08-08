@@ -22,6 +22,7 @@ export interface RecordToolProposalInput {
   policyFacts: PolicyFacts;
   policyEffect: PolicyEffect;
   matchedRule: number | null;
+  denialCode?: "invalid_tool_arguments";
   toolCallLimit: number;
   approvalId?: ApprovalId;
   approvalExpiresAt?: Date;
@@ -45,6 +46,12 @@ export interface ToolStore {
     activatedSkills: readonly ToolSkillActivation[];
     maxToolOutputBytes: number;
     maxRunToolOutputBytes: number;
+    occurredAt: Date;
+  }): ToolCall;
+  markExecutionUnknown(input: {
+    runId: RunId;
+    toolCallId: ToolCallId;
+    leaseOwner: string;
     occurredAt: Date;
   }): ToolCall;
   recoverExecuting(input: {

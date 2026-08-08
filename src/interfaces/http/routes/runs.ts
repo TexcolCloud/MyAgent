@@ -33,5 +33,21 @@ export function registerRunRoutes(app: FastifyInstance, services: {
 }
 
 function runView(run: ReturnType<RunStore["getRun"]>) {
-  return { runId: run.runId, sessionId: run.sessionId, agentId: run.agentId, status: run.state, fifoSequence: run.fifoSequence, parentRunId: run.parentRunId, rootRunId: run.rootRunId, delegationDepth: run.delegationDepth, budget: run.budget, createdAt: run.createdAt.toISOString(), updatedAt: run.updatedAt.toISOString() };
+  return {
+    runId: run.runId,
+    sessionId: run.sessionId,
+    agentId: run.agentId,
+    status: run.state,
+    fifoSequence: run.fifoSequence,
+    parentRunId: run.parentRunId,
+    rootRunId: run.rootRunId,
+    delegationDepth: run.delegationDepth,
+    budget: run.budget,
+    ...(run.state === "completed" ? { result: run.result } : {}),
+    ...(run.state === "failed"
+      ? { failure: run.failure ?? { code: "run_failed" } }
+      : {}),
+    createdAt: run.createdAt.toISOString(),
+    updatedAt: run.updatedAt.toISOString(),
+  };
 }

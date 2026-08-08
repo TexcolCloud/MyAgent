@@ -50,6 +50,8 @@ interface RunRow {
   active_elapsed_seconds: number;
   tool_output_bytes: number;
   input_json: string;
+  output_json: string | null;
+  failure_code: string | null;
   lease_owner: string | null;
   lease_expires_at: string | null;
   active_started_at: string | null;
@@ -1195,9 +1197,21 @@ function mapRun(row: RunRow): Run {
       activeExecutionSeconds: row.active_elapsed_seconds,
       toolOutputBytes: row.tool_output_bytes,
     },
+    result: row.state === "completed" && row.output_json !== null
+      ? JSON.parse(row.output_json) as JsonValue
+      : null,
+    failure: row.state === "failed"
+      ? { code: publicFailureCode(row.failure_code) }
+      : null,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
   };
+}
+
+function publicFailureCode(code: string | null): string {
+  return code !== null && /^[A-Za-z0-9_]{1,64}$/.test(code)
+    ? code
+    : "run_failed";
 }
 
 function mapEvent(row: EventRow): RunEvent {

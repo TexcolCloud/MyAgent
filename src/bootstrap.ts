@@ -136,6 +136,18 @@ export async function bootstrap(
       workerId: `worker-${randomUUID()}`,
       executions,
       faults,
+      onUnexpectedRunError(error, runId) {
+        logger.error(
+          { code: "worker_run_failed", error, runId },
+          "worker could not advance a claimed Run",
+        );
+      },
+      onFatalError(error) {
+        logger.error(
+          { code: "worker_lane_failed", error },
+          "worker lane stopped unexpectedly",
+        );
+      },
       ...options.worker,
     });
     expirer = new ApprovalExpirer({ approvals, clock });

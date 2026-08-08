@@ -130,7 +130,11 @@ export class SqliteToolRepository implements ToolStore {
         this.db.prepare(
           `UPDATE tool_calls SET result_json = ?, updated_at = ? WHERE tool_call_id = ?`,
         ).run(
-          canonicalize({ ok: false, code: "tool_denied", matchedRule: input.matchedRule }),
+          canonicalize({
+            ok: false,
+            code: input.denialCode ?? "tool_denied",
+            matchedRule: input.matchedRule,
+          }),
           occurredAt,
           input.toolCallId,
         );
@@ -303,6 +307,56 @@ export class SqliteToolRepository implements ToolStore {
     return this.requireToolCall(input.toolCallId);
   }
 
+  markExecutionUnknown(input: {
+    runId: RunId;
+    toolCallId: ToolCallId;
+    leaseOwner: string;
+    occurredAt: Date;
+  }): ToolCall {
+    const occurredAt = input.occurredAt.toISOString();
+    this.inImmediateTransaction(() => {
+      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
+      const tool = this.db.prepare(
+        `UPDATE tool_calls SET state = 'unknown', updated_at = ?
+         WHERE tool_call_id = ? AND run_id = ? AND state = 'executing'
+           AND effect = 'side_effect'`,
+      ).run(occurredAt, input.toolCallId, input.runId);
+      if (tool.changes !== 1) throw new DomainError("tool_not_executing_side_effect");
+      const active = this.db.prepare(
+        `SELECT active_started_at FROM runs WHERE run_id = ?`,
+      ).get(input.runId) as { active_started_at: string | null } | undefined;
+      const activeSeconds = elapsedActiveSeconds(
+        active?.active_started_at,
+        input.occurredAt,
+      );
+      const run = this.db.prepare(
+        `UPDATE runs SET state = 'waiting_reconciliation', lease_owner = NULL,
+           lease_expires_at = NULL, active_started_at = NULL,
+           active_elapsed_seconds = active_elapsed_seconds + ?, updated_at = ?
+         WHERE run_id = ? AND state = 'running' AND lease_owner = ?`,
+      ).run(
+        activeSeconds,
+        occurredAt,
+        input.runId,
+        input.leaseOwner,
+      );
+      if (run.changes !== 1) throw new DomainError("run_lease_lost");
+      this.appendEvent(
+        input.runId,
+        "tool.unknown",
+        canonicalize({ toolCallId: input.toolCallId }),
+        occurredAt,
+      );
+      this.appendEvent(
+        input.runId,
+        "run.waiting",
+        canonicalize({ state: "waiting_reconciliation" }),
+        occurredAt,
+      );
+    });
+    return this.requireToolCall(input.toolCallId);
+  }
+
   recoverExecuting(input: {
     runId: RunId;
     toolCallId: ToolCallId;
@@ -383,10 +437,21 @@ export class SqliteToolRepository implements ToolStore {
       }
       const call = this.requireToolCall(input.toolCallId);
       if (call.state !== "unknown") throw new DomainError("tool_call_not_unknown");
-      const waiting = this.db.prepare(
-        `SELECT 1 FROM runs WHERE run_id = ? AND state = 'waiting_reconciliation'`,
-      ).get(call.runId) as unknown;
-      if (waiting === undefined) throw new DomainError("run_not_waiting_reconciliation");
+      const run = this.db.prepare(
+        `SELECT state FROM runs WHERE run_id = ?`,
+      ).get(call.runId) as { state: string } | undefined;
+      if (
+        run === undefined ||
+        (run.state !== "waiting_reconciliation" && run.state !== "cancelled")
+      ) {
+        throw new DomainError("run_not_waiting_reconciliation");
+      }
+      if (input.outcome === "retry" && run.state === "cancelled") {
+        throw new ApplicationError(
+          "reconciliation_retry_cancelled_run",
+          409,
+        );
+      }
       if (input.outcome === "retry") {
         if (
           input.retryToolCallId === undefined ||
@@ -437,7 +502,7 @@ export class SqliteToolRepository implements ToolStore {
         const nextRunState = input.policyEffect === "ask"
           ? "waiting_approval"
           : "queued";
-        const run = this.db.prepare(
+        const updatedRun = this.db.prepare(
           `UPDATE runs SET state = ?, tool_call_count = tool_call_count + 1,
              updated_at = ?
            WHERE run_id = ? AND state = 'waiting_reconciliation'
@@ -448,7 +513,7 @@ export class SqliteToolRepository implements ToolStore {
           call.runId,
           input.toolCallLimit,
         );
-        if (run.changes !== 1) {
+        if (updatedRun.changes !== 1) {
           throw new DomainError("run_reconciliation_or_budget_invalid");
         }
         this.db.prepare(
@@ -565,12 +630,14 @@ export class SqliteToolRepository implements ToolStore {
         input.result === undefined ? null : canonicalize(input.result),
         occurredAt,
       );
-      const queued = this.db.prepare(
-        `UPDATE runs SET state = 'queued', updated_at = ?
-         WHERE run_id = ? AND state = 'waiting_reconciliation'`,
-      ).run(occurredAt, call.runId);
-      if (queued.changes !== 1) {
-        throw new DomainError("run_not_waiting_reconciliation");
+      if (run.state === "waiting_reconciliation") {
+        const queued = this.db.prepare(
+          `UPDATE runs SET state = 'queued', updated_at = ?
+           WHERE run_id = ? AND state = 'waiting_reconciliation'`,
+        ).run(occurredAt, call.runId);
+        if (queued.changes !== 1) {
+          throw new DomainError("run_not_waiting_reconciliation");
+        }
       }
       this.appendEvent(
         call.runId,
@@ -578,12 +645,14 @@ export class SqliteToolRepository implements ToolStore {
         canonicalize({ toolCallId: input.toolCallId, source: "operator" }),
         occurredAt,
       );
-      this.appendEvent(
-        call.runId,
-        "run.queued",
-        canonicalize({ state: "queued" }),
-        occurredAt,
-      );
+      if (run.state === "waiting_reconciliation") {
+        this.appendEvent(
+          call.runId,
+          "run.queued",
+          canonicalize({ state: "queued" }),
+          occurredAt,
+        );
+      }
       return { toolCall: this.requireToolCall(input.toolCallId) };
     });
   }

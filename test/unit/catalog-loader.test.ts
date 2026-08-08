@@ -23,7 +23,7 @@ describe("loadCatalog", () => {
     const result = await loadCatalog(fixture("invalid-agent", "myagent.yaml"));
     expect(result.available.map((agent) => agent.id)).toEqual(["primary"]);
     expect(result.unavailable).toEqual([
-      expect.objectContaining({ id: "broken", code: "invalid_agent_config" }),
+      expect.objectContaining({ sourceLabel: "broken", code: "invalid_agent_config" }),
     ]);
   });
 
@@ -145,7 +145,7 @@ describe("loadCatalog", () => {
       expect(result.available.map((agent) => agent.id)).toEqual(["researcher"]);
       expect(result.unavailable).toContainEqual(
         expect.objectContaining({
-          id: "primary",
+          sourceLabel: "primary",
           code: "invalid_agent_config",
           detail: expect.stringContaining("duplicate Agent ID"),
         }),
@@ -168,7 +168,7 @@ describe("loadCatalog", () => {
       const result = await loadCatalog(path.join(configRoot, "myagent.yaml"));
       expect(result.available.map((agent) => agent.id)).toEqual(["researcher"]);
       expect(result.unavailable).toContainEqual(
-        expect.objectContaining({ id: "primary", code: "invalid_agent_config" }),
+        expect.objectContaining({ sourceLabel: "primary", code: "invalid_agent_config" }),
       );
     } finally {
       await rm(temporary, { recursive: true, force: true });
@@ -199,7 +199,7 @@ describe("loadCatalog", () => {
       const result = await loadCatalog(path.join(configRoot, "myagent.yaml"));
       expect(result.available.map((agent) => agent.id)).toEqual(["researcher"]);
       expect(result.unavailable).toContainEqual(
-        expect.objectContaining({ id: "primary", code: "invalid_agent_config" }),
+        expect.objectContaining({ sourceLabel: "primary", code: "invalid_agent_config" }),
       );
     } finally {
       await rm(temporary, { recursive: true, force: true });

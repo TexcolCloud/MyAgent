@@ -16,6 +16,8 @@ export interface RunWorkerOptions {
   idleDelayMs?: number;
   executions?: ExecutionRegistry;
   faults?: FaultInjector;
+  onUnexpectedRunError?(error: unknown, runId: RunId): void;
+  onFatalError?(error: unknown): void;
 }
 
 export class RunWorker {
@@ -26,6 +28,7 @@ export class RunWorker {
   private readonly faults: FaultInjector;
   private readonly active = new Map<RunId, AbortController>();
   private loops: Promise<void>[] = [];
+  private fatalFailures: unknown[] = [];
   private running = false;
 
   constructor(private readonly options: RunWorkerOptions) {
@@ -39,7 +42,19 @@ export class RunWorker {
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.loops = Array.from({ length: this.concurrency }, (_, index) => this.claimLoop(index));
+    this.fatalFailures = [];
+    this.loops = Array.from(
+      { length: this.concurrency },
+      (_, index) => this.claimLoop(index).catch((error: unknown) => {
+        this.fatalFailures.push(error);
+        this.running = false;
+        try {
+          this.options.onFatalError?.(error);
+        } catch (reportingError) {
+          this.fatalFailures.push(reportingError);
+        }
+      }),
+    );
   }
 
   async stop(): Promise<void> {
@@ -51,6 +66,9 @@ export class RunWorker {
     }
     await Promise.all(this.loops);
     this.loops = [];
+    const failure = this.fatalFailures[0];
+    this.fatalFailures = [];
+    if (failure !== undefined) throw failure;
   }
 
   private async claimLoop(index: number): Promise<void> {
@@ -97,6 +115,7 @@ export class RunWorker {
       this.executions.register(run.runId, controller);
       heartbeat.start();
       let shouldBackOff = false;
+      let unexpectedRunError: unknown;
       try {
         while (this.running && !controller.signal.aborted) {
           await this.faults.hit("before_worker_resume");
@@ -127,18 +146,21 @@ export class RunWorker {
         } else if (cancellationFailure !== undefined && isSqliteBusy(cancellationFailure)) {
           shouldBackOff = true;
         } else if (cancellationFailure !== undefined && !isLeaseLost(cancellationFailure)) {
-          throw cancellationFailure;
+          unexpectedRunError = cancellationFailure;
         } else if (isSqliteBusy(cause)) {
           shouldBackOff = true;
         } else if (heartbeatFailure !== undefined && !isLeaseLost(cause)) {
-          throw cause;
+          unexpectedRunError = cause;
         } else if (!controller.signal.aborted && !isLeaseLost(cause)) {
-          throw cause;
+          unexpectedRunError = cause;
         }
       } finally {
         heartbeat.stop();
         this.active.delete(run.runId);
         this.executions.unregister(run.runId, controller);
+      }
+      if (unexpectedRunError !== undefined) {
+        this.options.onUnexpectedRunError?.(unexpectedRunError, run.runId);
       }
       if (shouldBackOff && this.running) {
         await this.options.clock.sleep(busyDelayMs);

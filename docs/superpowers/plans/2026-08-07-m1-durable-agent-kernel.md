@@ -615,7 +615,7 @@ Expected: FAIL because the SQLite adapter and migration are missing.
 
 - [ ] **Step 3: Write the complete M1 relational migration**
 
-Create `schema_migrations`, `agent_revisions`, `sessions`, `messages`, `session_summaries`, `runs`, `run_events`, `run_activated_skills`, `tool_calls`, `approvals`, `reconciliations`, `idempotency_keys`, and `outbox_deliveries`. Include:
+Create `schema_migrations`, `agent_revisions`, `sessions`, `messages`, `session_summaries`, `runs`, `run_events`, `run_activated_skills`, `tool_calls`, `approvals`, `reconciliations`, and `idempotency_keys`. Include:
 
 - unique `sessions(agent_id, session_key)`;
 - unique `runs(session_id, fifo_sequence)`;

@@ -135,6 +135,172 @@ describe("RunWorker", () => {
     }
   });
 
+  it("fails an unknown Tool proposal without removing the lane for a later Run", async () => {
+    const connection = openDatabase({
+      path: tempPath("run-worker-unknown-tool.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const clock = new SystemClock();
+      const ids = new FakeIds({
+        sessionIds: [
+          sessionIdFromUuid("00000000-0000-7000-8000-000000000191"),
+          sessionIdFromUuid("00000000-0000-7000-8000-000000000192"),
+        ],
+        runIds: [
+          runIdFromUuid("00000000-0000-7000-8000-000000000191"),
+          runIdFromUuid("00000000-0000-7000-8000-000000000192"),
+        ],
+        attemptIds: [
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000191"),
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000192"),
+        ],
+      });
+      const create = new CreateRunService(
+        new CatalogService(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      );
+      const malformed = create.execute({
+        agentId: "primary",
+        sessionKey: "integration:unknown-tool",
+        input: { type: "text", text: "propose the unknown Tool" },
+        idempotencyKey: "run-worker-unknown-0001",
+        source: { kind: "http" },
+      });
+      const later = create.execute({
+        agentId: "primary",
+        sessionKey: "integration:after-unknown-tool",
+        input: { type: "text", text: "complete after malformed Run" },
+        idempotencyKey: "run-worker-unknown-0002",
+        source: { kind: "http" },
+      });
+      const model = new UnknownToolRoutingModel();
+      const advance = new AdvanceRunService({
+        runs,
+        tools: new SqliteToolRepository(connection.db),
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry: new ToolRegistry(),
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+      });
+      const worker = new RunWorker({
+        runs,
+        advance,
+        clock,
+        workerId: "worker-unknown-tool",
+        concurrency: 1,
+        leaseDurationMs: 1_000,
+        idleDelayMs: 5,
+      });
+
+      worker.start();
+      try {
+        await waitFor(() =>
+          runs.getRun(malformed.runId).state === "failed" &&
+          runs.getRun(later.runId).state === "completed"
+        );
+      } finally {
+        await worker.stop().catch(() => undefined);
+      }
+
+      expect(runs.getUnmatchedModelAttempt(malformed.runId)).toBeNull();
+      expect(
+        runs.listEventsAfter(malformed.runId, 0).map((event) => [
+          event.type,
+          event.payload,
+        ]),
+      ).toEqual(expect.arrayContaining([
+        ["model.attempt.failed", expect.objectContaining({ code: "tool_not_found" })],
+        ["run.failed", expect.objectContaining({ code: "tool_not_found" })],
+      ]));
+      expect(
+        model.completedInputs.some((input) =>
+          input.includes("complete after malformed Run")
+        ),
+      ).toBe(true);
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("reports an unexpected Run failure and keeps the lane available", async () => {
+    const firstRunId = runIdFromUuid("00000000-0000-7000-8000-000000000193");
+    const laterRunId = runIdFromUuid("00000000-0000-7000-8000-000000000194");
+    const claims = [{ runId: firstRunId }, { runId: laterRunId }];
+    const runs = {
+      claimNextEligible: () => claims.shift() as Run | undefined ?? null,
+      renewLease: () => true,
+    } as unknown as RunStore;
+    const failure = new Error("unexpected_run_failure");
+    let laterAdvanced = false;
+    const advance = {
+      advance: async (runId: typeof firstRunId) => {
+        if (runId === firstRunId) throw failure;
+        laterAdvanced = true;
+        return { type: "terminal", runId, state: "completed" } as const;
+      },
+      isAbortSafe: () => true,
+    } as unknown as AdvanceRunService;
+    const reported: Array<{ error: unknown; runId: typeof firstRunId }> = [];
+    const worker = new RunWorker({
+      runs,
+      advance,
+      clock: new SystemClock(),
+      workerId: "worker-supervised",
+      concurrency: 1,
+      leaseDurationMs: 1_000,
+      idleDelayMs: 5,
+      onUnexpectedRunError(error, runId) {
+        reported.push({ error, runId });
+      },
+    });
+
+    worker.start();
+    try {
+      await waitFor(() => laterAdvanced);
+    } finally {
+      await worker.stop().catch(() => undefined);
+    }
+
+    expect(reported).toEqual([{ error: failure, runId: firstRunId }]);
+  });
+
+  it("reports and surfaces a fatal claim failure", async () => {
+    const failure = new Error("fatal_claim_failure");
+    const runs = {
+      claimNextEligible: () => {
+        throw failure;
+      },
+    } as unknown as RunStore;
+    let reported: unknown;
+    const worker = new RunWorker({
+      runs,
+      advance: {} as AdvanceRunService,
+      clock: new SystemClock(),
+      workerId: "worker-fatal-claim",
+      concurrency: 1,
+      onFatalError(error) {
+        reported = error;
+      },
+    });
+
+    worker.start();
+    await waitFor(() => reported !== undefined).catch(() => undefined);
+
+    expect(reported).toBe(failure);
+    await expect(worker.stop()).rejects.toBe(failure);
+  });
+
   it("does not abort an executing side-effect Tool during worker shutdown", async () => {
     const connection = openDatabase({
       path: tempPath("run-worker-side-effect-stop.db"),
@@ -583,6 +749,39 @@ class RoutingModel implements ModelPort {
       return;
     }
     yield { type: "text_delta", text: "independent answer" };
+    yield {
+      type: "completed",
+      finishReason: "stop",
+      usage: { inputTokens: 10, outputTokens: 2 },
+    };
+  }
+}
+
+class UnknownToolRoutingModel implements ModelPort {
+  readonly completedInputs: string[] = [];
+
+  async *streamAttempt(
+    request: ModelRequest,
+    signal: AbortSignal,
+  ): AsyncIterable<ModelChunk> {
+    signal.throwIfAborted();
+    const input = request.messages.find(
+      (message) => message.name === "current_operator_input",
+    )?.content ?? "";
+    if (input.includes("propose the unknown Tool")) {
+      yield {
+        type: "tool_call",
+        call: { name: "not_registered", arguments: {} },
+      };
+      yield {
+        type: "completed",
+        finishReason: "tool_calls",
+        usage: { inputTokens: 10, outputTokens: 2 },
+      };
+      return;
+    }
+    this.completedInputs.push(input);
+    yield { type: "text_delta", text: "later answer" };
     yield {
       type: "completed",
       finishReason: "stop",

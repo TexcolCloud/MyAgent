@@ -7,7 +7,10 @@ import {
   type ToolEnvironmentValue,
 } from "../../config/secret-ref.js";
 import { DomainError } from "../../domain/errors.js";
-import type { ToolDefinition } from "../../ports/tool.js";
+import {
+  ToolExecutionError,
+  type ToolDefinition,
+} from "../../ports/tool.js";
 import type { SecretResolver } from "../../ports/secret-resolver.js";
 import { PathGuard } from "./path-guard.js";
 import {
@@ -16,6 +19,7 @@ import {
 } from "./process-tree.js";
 
 const MAX_TOOL_OUTPUT_BYTES = 1_024 * 1_024;
+const WINDOWS_JOB_HOST_ENVIRONMENT = "myagent_windows_job_host";
 
 const commandSchema = z.strictObject({
   program: z.string().min(1),
@@ -36,18 +40,26 @@ type RunCommandArguments = {
 export interface RunCommandToolOptions {
   environmentAllowlist: readonly string[];
   secretResolver: SecretResolver;
+  startProcess?: typeof ProcessTree.start;
 }
 
 export function createRunCommandTool(
   options: RunCommandToolOptions,
 ): ToolDefinition<RunCommandArguments> {
   const allowedEnvironment = new Set(options.environmentAllowlist);
+  const startProcess = options.startProcess ?? ProcessTree.start;
   return {
     name: "run_command",
     effect: "side_effect",
 
     async parseAndNormalize(raw, context) {
       const parsed = commandSchema.parse(raw);
+      if (
+        parsed.program.includes("\0") ||
+        parsed.args.some((argument) => argument.includes("\0"))
+      ) {
+        throw new DomainError("invalid_tool_arguments");
+      }
       await new PathGuard(context.revision.workspace).resolveExisting(parsed.cwd);
       const timeoutMs =
         parsed.timeoutMs ?? context.revision.limits.defaultToolTimeoutMs;
@@ -57,7 +69,14 @@ export function createRunCommandTool(
       ) {
         throw new DomainError("tool_timeout_exceeds_limit");
       }
-      for (const name of Object.keys(parsed.env)) {
+      for (const [name, value] of Object.entries(parsed.env)) {
+        if (
+          name.includes("\0") ||
+          ("value" in value && value.value.includes("\0")) ||
+          isReservedWindowsEnvironmentName(name)
+        ) {
+          throw new DomainError("invalid_tool_arguments");
+        }
         if (!allowedEnvironment.has(name)) {
           throw new DomainError("environment_not_allowed");
         }
@@ -73,58 +92,72 @@ export function createRunCommandTool(
     },
 
     async execute(args, context) {
-      context.signal.throwIfAborted();
-      const cwd = await new PathGuard(
-        context.revision.workspace,
-      ).resolveExisting(args.cwd);
-      context.signal.throwIfAborted();
-      const environment = resolveEnvironment(args.env, options.secretResolver);
-      const tree = ProcessTree.start(args.program, args.args, {
-        cwd,
-        env: environment.values,
-      });
-      const outputLimit = Math.min(
-        MAX_TOOL_OUTPUT_BYTES,
-        context.revision.limits.maxToolOutputBytes,
-        Math.max(0, context.remainingRunOutputBytes),
-      );
-      const captureBudget = new RawCaptureBudget(outputLimit);
-      const stdout = new StreamCapture(captureBudget);
-      const stderr = new StreamCapture(captureBudget);
-      tree.child.stdout.on("data", (chunk: Buffer) => stdout.accept(chunk));
-      tree.child.stderr.on("data", (chunk: Buffer) => stderr.accept(chunk));
-      const completion = await waitForCompletion(
-        tree,
-        args.timeoutMs,
-        context.signal,
-      );
-      if (completion.cancelled) {
+      let tree: ProcessTree;
+      let environment: ResolvedEnvironment;
+      try {
         context.signal.throwIfAborted();
+        const cwd = await new PathGuard(
+          context.revision.workspace,
+        ).resolveExisting(args.cwd);
+        context.signal.throwIfAborted();
+        environment = resolveEnvironment(args.env, options.secretResolver);
+        validateResolvedEnvironment(environment.values);
+        tree = startProcess(args.program, args.args, {
+          cwd,
+          env: environment.values,
+        });
+      } catch {
+        if (context.signal.aborted) throw context.signal.reason;
+        throw new ToolExecutionError("never_started");
       }
-      const outputBudget = new OutputBudget(outputLimit);
-      const content = {
-        exitCode: completion.exit.exitCode,
-        signal: completion.exit.signal,
-        stdout: outputBudget.retain(
-          redactKnownValues(stdout.text(), environment.sensitiveValues),
-        ),
-        stderr: outputBudget.retain(
-          redactKnownValues(stderr.text(), environment.sensitiveValues),
-        ),
-        stdoutBytes: stdout.totalBytes,
-        stderrBytes: stderr.totalBytes,
-        timedOut: completion.timedOut,
-        cancelled: completion.cancelled,
-      };
-      return {
-        ok: completion.exit.exitCode === 0 && !completion.timedOut,
-        summary: completion.timedOut
-          ? "Command timed out."
-          : `Command exited with code ${String(completion.exit.exitCode)}.`,
-        content,
-        capturedBytes: outputBudget.capturedBytes,
-        truncated: captureBudget.truncated || outputBudget.truncated,
-      };
+
+      try {
+        const outputLimit = Math.min(
+          MAX_TOOL_OUTPUT_BYTES,
+          context.revision.limits.maxToolOutputBytes,
+          Math.max(0, context.remainingRunOutputBytes),
+        );
+        const captureBudget = new RawCaptureBudget(outputLimit);
+        const stdout = new StreamCapture(captureBudget);
+        const stderr = new StreamCapture(captureBudget);
+        tree.child.stdout.on("data", (chunk: Buffer) => stdout.accept(chunk));
+        tree.child.stderr.on("data", (chunk: Buffer) => stderr.accept(chunk));
+        const completion = await waitForCompletion(
+          tree,
+          args.timeoutMs,
+          context.signal,
+        );
+        if (completion.cancelled) {
+          context.signal.throwIfAborted();
+        }
+        const outputBudget = new OutputBudget(outputLimit);
+        const content = {
+          exitCode: completion.exit.exitCode,
+          signal: completion.exit.signal,
+          stdout: outputBudget.retain(
+            redactKnownValues(stdout.text(), environment.sensitiveValues),
+          ),
+          stderr: outputBudget.retain(
+            redactKnownValues(stderr.text(), environment.sensitiveValues),
+          ),
+          stdoutBytes: stdout.totalBytes,
+          stderrBytes: stderr.totalBytes,
+          timedOut: completion.timedOut,
+          cancelled: completion.cancelled,
+        };
+        return {
+          ok: completion.exit.exitCode === 0 && !completion.timedOut,
+          summary: completion.timedOut
+            ? "Command timed out."
+            : `Command exited with code ${String(completion.exit.exitCode)}.`,
+          content,
+          capturedBytes: outputBudget.capturedBytes,
+          truncated: captureBudget.truncated || outputBudget.truncated,
+        };
+      } catch {
+        if (context.signal.aborted) throw context.signal.reason;
+        throw new ToolExecutionError("possibly_started");
+      }
     },
   };
 }
@@ -274,6 +307,25 @@ function resolveEnvironment(
     sensitiveValues.add(resolved);
   }
   return { values, sensitiveValues: [...sensitiveValues] };
+}
+
+function validateResolvedEnvironment(
+  environment: Readonly<Record<string, string>>,
+): void {
+  for (const [name, value] of Object.entries(environment)) {
+    if (
+      name.includes("\0") ||
+      value.includes("\0") ||
+      isReservedWindowsEnvironmentName(name)
+    ) {
+      throw new DomainError("invalid_process_argument");
+    }
+  }
+}
+
+function isReservedWindowsEnvironmentName(name: string): boolean {
+  return process.platform === "win32" &&
+    name.toLowerCase() === WINDOWS_JOB_HOST_ENVIRONMENT;
 }
 
 function redactKnownValues(

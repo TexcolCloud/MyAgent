@@ -4,6 +4,8 @@ import { gzipSync } from "node:zlib";
 
 import { DomainError } from "../../domain/errors.js";
 
+const WINDOWS_JOB_HOST_ENVIRONMENT = "myagent_windows_job_host";
+
 export interface ProcessStartOptions {
   cwd: string;
   env: Readonly<Record<string, string>>;
@@ -41,6 +43,7 @@ export class ProcessTree {
     args: readonly string[],
     options: ProcessStartOptions,
   ): ProcessTree {
+    validateProcessStartInput(program, args, options);
     const child = process.platform === "win32"
       ? startWindowsJob(program, args, options)
       : spawn(program, args, {
@@ -64,10 +67,6 @@ export class ProcessTree {
   }
 
   async #terminate(graceMs: number): Promise<void> {
-    if (this.#hasExited()) {
-      await this.#exit;
-      return;
-    }
     const pid = this.child.pid;
     if (pid === undefined) {
       await this.#exit;
@@ -75,16 +74,21 @@ export class ProcessTree {
     }
 
     if (process.platform === "win32") {
+      if (this.#hasExited()) {
+        await this.#exit;
+        return;
+      }
       if (!this.child.kill("SIGKILL") && !this.#hasExited()) {
         throw new DomainError("process_tree_termination_failed");
       }
-    } else {
-      signalProcessGroup(pid, "SIGTERM");
-      if (await processGroupStillRunning(pid, graceMs)) {
-        signalProcessGroup(pid, "SIGKILL");
-      }
+      await this.#exit;
+      return;
     }
-    await this.#exit;
+    signalProcessGroup(pid, "SIGTERM");
+    if (await processGroupStillRunning(pid, graceMs)) {
+      signalProcessGroup(pid, "SIGKILL");
+    }
+    await waitForProcessClose(this.#exit, Math.max(100, graceMs));
   }
 
   #hasExited(): boolean {
@@ -94,6 +98,52 @@ export class ProcessTree {
       this.child.exitCode !== null ||
       this.child.signalCode !== null
     );
+  }
+}
+
+function validateProcessStartInput(
+  program: string,
+  args: readonly string[],
+  options: ProcessStartOptions,
+): void {
+  const invalidEnvironment = Object.entries(options.env).some(
+    ([name, value]) =>
+      name.includes("\0") ||
+      value.includes("\0") ||
+      isReservedWindowsEnvironmentName(name),
+  );
+  if (
+    program.includes("\0") ||
+    args.some((argument) => argument.includes("\0")) ||
+    options.cwd.includes("\0") ||
+    invalidEnvironment
+  ) {
+    throw new DomainError("invalid_process_argument");
+  }
+}
+
+function isReservedWindowsEnvironmentName(name: string): boolean {
+  return process.platform === "win32" &&
+    name.toLowerCase() === WINDOWS_JOB_HOST_ENVIRONMENT;
+}
+
+async function waitForProcessClose(
+  exit: Promise<ProcessExit>,
+  timeoutMs: number,
+): Promise<void> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      exit,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new DomainError("process_tree_termination_failed")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
   }
 }
 
@@ -191,22 +241,14 @@ function isolatedEnvironment(
     return { ...allowedValues };
   }
 
-  const environment = Object.fromEntries(
-    Object.keys(process.env).map((name) => [name, ""]),
+  const environment = deduplicateWindowsEnvironment(
+    Object.entries(process.env).map(([name, value]) => [
+      name,
+      name.toLowerCase() === "systemroot" ? value ?? "" : "",
+    ]),
   );
-  const systemRootName = Object.keys(process.env).find(
-    (name) => name.toLowerCase() === "systemroot",
-  );
-  if (systemRootName !== undefined) {
-    environment[systemRootName] = process.env[systemRootName] ?? "";
-  }
   for (const [name, value] of Object.entries(allowedValues)) {
-    for (const existingName of Object.keys(environment)) {
-      if (existingName.toLowerCase() === name.toLowerCase()) {
-        delete environment[existingName];
-      }
-    }
-    environment[name] = value;
+    setWindowsEnvironmentValue(environment, name, value);
   }
   return environment;
 }
@@ -228,21 +270,48 @@ function windowsSupervisorEnvironment(
     "userprofile",
     "windir",
   ]);
-  const environment = Object.fromEntries(
+  const environment = deduplicateWindowsEnvironment(
     Object.entries(process.env)
       .filter(([name, value]) => structuralNames.has(name.toLowerCase()) && value !== undefined)
       .map(([name, value]) => [name, value as string]),
   );
   for (const [name, value] of Object.entries(allowedValues)) {
-    for (const existingName of Object.keys(environment)) {
-      if (existingName.toLowerCase() === name.toLowerCase()) {
-        delete environment[existingName];
-      }
-    }
-    environment[name] = value;
+    setWindowsEnvironmentValue(environment, name, value);
   }
   environment.MYAGENT_WINDOWS_JOB_HOST = WINDOWS_JOB_HOST_GZIP;
   return environment;
+}
+
+function deduplicateWindowsEnvironment(
+  entries: readonly (readonly [string, string])[],
+): Record<string, string> {
+  const selected = new Map<string, readonly [string, string]>();
+  const ordered = [...entries].sort(([left], [right]) => {
+    const folded = compareText(left.toLowerCase(), right.toLowerCase());
+    return folded === 0 ? compareText(left, right) : folded;
+  });
+  for (const entry of ordered) {
+    const foldedName = entry[0].toLowerCase();
+    if (!selected.has(foldedName)) selected.set(foldedName, entry);
+  }
+  return Object.fromEntries(selected.values());
+}
+
+function setWindowsEnvironmentValue(
+  environment: Record<string, string>,
+  name: string,
+  value: string,
+): void {
+  for (const existingName of Object.keys(environment)) {
+    if (existingName.toLowerCase() === name.toLowerCase()) {
+      delete environment[existingName];
+    }
+  }
+  environment[name] = value;
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 const WINDOWS_JOB_HOST_GZIP = gzipSync(Buffer.from(String.raw`

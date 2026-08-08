@@ -21,10 +21,21 @@ import { ExecutionRegistry } from "../../src/runtime/execution-registry.js";
 import { FakeClock } from "./fake-clock.js";
 import { tempPath } from "./temp-dir.js";
 
-export async function startTestApp(options: { sse?: SseStreamOptions } = {}) {
-  const connection = openDatabase({ path: tempPath("http-test.db"), busyTimeoutMs: 5_000 });
+export async function startTestApp(
+  options: {
+    sse?: SseStreamOptions;
+    configPath?: string;
+    databasePath?: string;
+  } = {},
+) {
+  const connection = openDatabase({
+    path: options.databasePath ?? tempPath("http-test.db"),
+    busyTimeoutMs: 5_000,
+  });
   migrate(connection.db);
-  const catalog = new CatalogService(await loadCatalog("test/fixtures/config/valid/myagent.yaml"));
+  const catalog = new CatalogService(await loadCatalog(
+    options.configPath ?? "test/fixtures/config/valid/myagent.yaml",
+  ));
   const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
   const ids = new UuidIdGenerator();
   const runs = new SqliteRunRepository(connection.db, new SqliteCatalogRepository(connection.db));

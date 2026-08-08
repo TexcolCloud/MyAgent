@@ -14,6 +14,7 @@ import { CreateRunService } from "../../src/application/create-run.js";
 import { PolicyEngine } from "../../src/application/policy-engine.js";
 import { PromptAssembler } from "../../src/application/prompt-assembler.js";
 import { ToolRegistry } from "../../src/adapters/tools/registry.js";
+import { readFileTool } from "../../src/adapters/tools/read-file.js";
 import { loadCatalog, type CatalogSnapshot } from "../../src/config/catalog-loader.js";
 import { CatalogService } from "../../src/config/catalog-service.js";
 import {
@@ -217,6 +218,105 @@ describe("AdvanceRunService", () => {
       expect(fakeTool.executions).toBe(0);
       expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
         .toEqual(expect.arrayContaining(["tool.proposed", "tool.policy_decided"]));
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("persists invalid known-Tool arguments as a denial the model can recover from", async () => {
+    const connection = openDatabase({
+      path: tempPath("advance-invalid-tool-arguments.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const tools = new SqliteToolRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000181")],
+        runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000181")],
+        toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000181")],
+        attemptIds: [
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000181"),
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000182"),
+        ],
+      });
+      const created = new CreateRunService(
+        new CatalogService(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:invalid-tool-arguments",
+        input: { type: "text", text: "recover from malformed arguments" },
+        idempotencyKey: "advance-invalid-tool-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const registry = new ToolRegistry();
+      registry.register(readFileTool);
+      const model = new ScriptedModel();
+      model.script(
+        {
+          chunks: [
+            {
+              type: "tool_call",
+              call: { name: "read_file", arguments: { path: 42 } },
+            },
+            {
+              type: "completed",
+              finishReason: "tool_calls",
+              usage: { inputTokens: 10, outputTokens: 2 },
+            },
+          ],
+        },
+        completedText("recovered after Tool denial"),
+      );
+      const service = new AdvanceRunService({
+        runs,
+        tools,
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+      });
+
+      await expect(service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).resolves.toMatchObject({ type: "advanced" });
+      expect(tools.getLatestForRun(created.runId)).toMatchObject({
+        state: "denied",
+        toolName: "read_file",
+        arguments: { path: 42 },
+        result: { ok: false, code: "invalid_tool_arguments" },
+      });
+      expect(runs.getUnmatchedModelAttempt(created.runId)).toBeNull();
+
+      await expect(service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).resolves.toMatchObject({ type: "terminal", state: "completed" });
+      expect(
+        model.requests[1]?.messages.find((message) =>
+          message.name === "tool_results"
+        )?.content,
+      ).toContain("invalid_tool_arguments");
     } finally {
       connection.close();
     }
@@ -904,6 +1004,134 @@ describe("AdvanceRunService", () => {
     }
   });
 
+  it.each([
+    {
+      startState: "never_started" as const,
+      expectedToolState: "failed",
+      expectedRunState: "running",
+      expectedOutcome: "advanced",
+      expectedEvent: "tool.failed",
+      id: "194",
+    },
+    {
+      startState: "possibly_started" as const,
+      expectedToolState: "unknown",
+      expectedRunState: "waiting_reconciliation",
+      expectedOutcome: "waiting",
+      expectedEvent: "tool.unknown",
+      id: "195",
+    },
+  ])(
+    "persists a $startState command infrastructure failure without retrying it",
+    async ({
+      startState,
+      expectedToolState,
+      expectedRunState,
+      expectedOutcome,
+      expectedEvent,
+      id,
+    }) => {
+      const connection = openDatabase({
+        path: tempPath(`advance-command-${startState}.db`),
+        busyTimeoutMs: 5_000,
+      });
+      try {
+        migrate(connection.db);
+        const catalog = new SqliteCatalogRepository(connection.db);
+        const runs = new SqliteRunRepository(connection.db, catalog);
+        const sessions = new SqliteSessionRepository(connection.db);
+        const tools = new SqliteToolRepository(connection.db);
+        const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+        const uuid = `00000000-0000-7000-8000-000000000${id}`;
+        const ids = new FakeIds({
+          sessionIds: [sessionIdFromUuid(uuid)],
+          runIds: [runIdFromUuid(uuid)],
+          toolCallIds: [toolCallIdFromUuid(uuid)],
+          attemptIds: [attemptIdFromUuid(uuid)],
+        });
+        const created = new CreateRunService(
+          new CatalogService(catalogSnapshot),
+          runs,
+          clock,
+          ids,
+        ).execute({
+          agentId: "primary",
+          sessionKey: `unit:command-${startState}`,
+          input: { type: "text", text: "run command boundary" },
+          idempotencyKey: `advance-command-${startState}-0001`,
+          source: { kind: "http" },
+        });
+        clock.advanceBy(1_000);
+        runs.claimNextEligible(
+          "worker-unit",
+          clock.now(),
+          new Date(clock.now().getTime() + 30_000),
+        );
+        const registry = new ToolRegistry();
+        registry.register(new FakeTool({
+          name: "read_file",
+          effect: "side_effect",
+          normalizedArguments: { path: "report.md" },
+          policyFacts: { pathWithinWorkspace: true },
+          error: Object.assign(
+            new Error("tool_execution_infrastructure_failed"),
+            {
+              code: "tool_execution_infrastructure_failed" as const,
+              startState,
+            },
+          ),
+        }));
+        const model = new ScriptedModel();
+        model.script({
+          chunks: [
+            {
+              type: "tool_call",
+              call: { name: "read_file", arguments: { path: "report.md" } },
+            },
+            {
+              type: "completed",
+              finishReason: "tool_calls",
+              usage: { inputTokens: 10, outputTokens: 2 },
+            },
+          ],
+        });
+        const service = new AdvanceRunService({
+          runs,
+          tools,
+          approvals: new SqliteApprovalRepository(connection.db),
+          sessions,
+          model,
+          prompts: new PromptAssembler(sessions),
+          registry,
+          policy: new PolicyEngine(),
+          clock,
+          ids,
+        });
+
+        await service.advance(
+          created.runId,
+          "worker-unit",
+          new AbortController().signal,
+        );
+        const outcome = await service.advance(
+          created.runId,
+          "worker-unit",
+          new AbortController().signal,
+        );
+
+        expect(outcome.type).toBe(expectedOutcome);
+        expect(tools.getLatestForRun(created.runId)?.state)
+          .toBe(expectedToolState);
+        expect(runs.getRun(created.runId).state).toBe(expectedRunState);
+        expect(
+          runs.listEventsAfter(created.runId, 0).map((event) => event.type),
+        ).toContain(expectedEvent);
+      } finally {
+        connection.close();
+      }
+    },
+  );
+
   it("commits Skill activation with the Tool completion checkpoint", async () => {
     const connection = openDatabase({
       path: tempPath("advance-skill-activation.db"),
@@ -1014,6 +1242,8 @@ describe("AdvanceRunService", () => {
         completeExecution: () => {
           throw new Error("injected_completion_failure");
         },
+        markExecutionUnknown: (input) =>
+          durableTools.markExecutionUnknown(input),
         recoverExecuting: (input) => durableTools.recoverExecuting(input),
       };
       const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
@@ -1331,6 +1561,7 @@ describe("AdvanceRunService", () => {
         },
         beginExecution: (input) => durableTools.beginExecution(input),
         completeExecution: (input) => durableTools.completeExecution(input),
+        markExecutionUnknown: (input) => durableTools.markExecutionUnknown(input),
         recoverExecuting: (input) => durableTools.recoverExecuting(input),
       };
       const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));

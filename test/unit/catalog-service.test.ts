@@ -53,6 +53,47 @@ describe("CatalogService", () => {
     }
   });
 
+  it.each([
+    {
+      change: "addition",
+      update: (yaml: string) => yaml.replace("  - PATH\n", "  - PATH\n  - HOME\n"),
+    },
+    {
+      change: "revocation",
+      update: (yaml: string) => yaml.replace(
+        "toolEnvironmentAllowlist:\n  - PATH\n",
+        "toolEnvironmentAllowlist: []\n",
+      ),
+    },
+  ])(
+    "rejects an environment allowlist $change without replacing the active snapshot",
+    async ({ update }) => {
+      const temporary = await mkdtemp(path.join(os.tmpdir(), "myagent-reload-env-"));
+      const configRoot = path.join(temporary, "config");
+      await cp(path.join(FIXTURE_ROOT, "valid"), configRoot, { recursive: true });
+
+      try {
+        const configPath = path.join(configRoot, "myagent.yaml");
+        const service = new CatalogService(await loadCatalog(configPath));
+        const active = service.current();
+        await writeFile(
+          configPath,
+          update(await readFile(configPath, "utf8")),
+        );
+
+        await expect(service.reload()).rejects.toMatchObject({
+          code: "restart_required",
+        });
+        expect(service.current()).toBe(active);
+        expect(service.current().global.toolEnvironmentAllowlist).toEqual([
+          "PATH",
+        ]);
+      } finally {
+        await rm(temporary, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("resolves only named environment references and redacts unavailable secrets", () => {
     const resolver = new EnvironmentSecretResolver({ PRESENT_SECRET: "sensitive-value" });
 
