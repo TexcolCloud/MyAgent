@@ -41,6 +41,7 @@ import { createStructuredLogger } from "./observability/logger.js";
 import { assertSupportedRuntime } from "./platform.js";
 import { ApprovalExpirer } from "./runtime/approval-expirer.js";
 import { ExecutionRegistry } from "./runtime/execution-registry.js";
+import { noFaults, type FaultInjector } from "./runtime/fault-injector.js";
 import { RunWorker } from "./runtime/run-worker.js";
 
 export interface BootstrapOptions {
@@ -49,6 +50,12 @@ export interface BootstrapOptions {
   log?: {
     write?: (line: string) => void;
     sensitiveKeys?: readonly string[];
+  };
+  faults?: FaultInjector;
+  worker?: {
+    concurrency?: number;
+    leaseDurationMs?: number;
+    idleDelayMs?: number;
   };
 }
 
@@ -76,6 +83,7 @@ export async function bootstrap(
       ? {}
       : { sensitiveKeys: options.log.sensitiveKeys }),
   });
+  const faults = options.faults ?? noFaults;
   await mkdir(path.dirname(catalog.current().global.database.path), { recursive: true });
   const connection = openDatabase(catalog.current().global.database);
   let app: ReturnType<typeof createHttpApp> | undefined;
@@ -117,6 +125,7 @@ export async function bootstrap(
       policy,
       clock,
       ids,
+      faults,
     });
     worker = new RunWorker({
       runs,
@@ -124,6 +133,8 @@ export async function bootstrap(
       clock,
       workerId: `worker-${randomUUID()}`,
       executions,
+      faults,
+      ...options.worker,
     });
     expirer = new ApprovalExpirer({ approvals, clock });
     app = createHttpApp({
@@ -133,7 +144,7 @@ export async function bootstrap(
       runs,
       cancelRuns: new CancelRunService(runs, executions, clock),
       approvals,
-      decideApprovals: new DecideApprovalService(approvals, clock),
+      decideApprovals: new DecideApprovalService(approvals, clock, faults),
       tools,
       reconcileTools: new ReconcileToolCallService({ tools, runs, policy, clock, ids }),
       sessions,
@@ -145,6 +156,7 @@ export async function bootstrap(
       ),
       logger,
       readiness: createReadinessProbe(catalog, connection.db, expectedMigrationVersions),
+      sse: { faults },
     });
     worker.start();
     expirer.start();

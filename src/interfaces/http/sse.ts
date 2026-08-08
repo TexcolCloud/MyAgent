@@ -4,12 +4,14 @@ import type { FastifyRequest } from "fastify";
 
 import type { RunStore } from "../../ports/run-store.js";
 import type { RunId } from "../../domain/ids.js";
+import { noFaults, type FaultInjector } from "../../runtime/fault-injector.js";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 
 export interface SseStreamOptions {
   heartbeatMs?: number;
   pollIntervalMs?: number;
+  faults?: FaultInjector;
 }
 
 export async function streamRunEvents(
@@ -24,11 +26,16 @@ export async function streamRunEvents(
   let closed = false;
   const heartbeatMs = options.heartbeatMs ?? 15_000;
   const pollIntervalMs = options.pollIntervalMs ?? 100;
+  const faults = options.faults ?? noFaults;
   let nextHeartbeatAt = Date.now() + heartbeatMs;
   raw.once("close", () => { closed = true; });
   const write = async (value: string): Promise<void> => {
     if (closed || raw.writableEnded) return;
-    if (!raw.write(value)) {
+    await faults.hit("before_sse_write");
+    if (closed || raw.writableEnded) return;
+    const writable = raw.write(value);
+    await faults.hit("after_sse_write");
+    if (!writable) {
       await waitForDrainOrClose(raw);
     }
   };

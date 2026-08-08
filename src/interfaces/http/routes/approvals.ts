@@ -18,7 +18,7 @@ export function registerApprovalRoutes(app: FastifyInstance, services: { approva
   app.post("/approvals/:approvalId/decision", { schema: { response: { 200: approvalDecisionResponseSchema } } }, async (request) => {
     const approvalId = parseSchema(identifierSchema, (request.params as { approvalId: unknown }).approvalId) as ApprovalId;
     const { decision } = parseSchema(decisionSchema, request.body);
-    const approval = services.decideApprovals.execute({ approvalId, decision });
+    const approval = await services.decideApprovals.execute({ approvalId, decision });
     return { approvalId: approval.approvalId, runId: approval.runId, state: approval.state, resolvedAt: approval.resolvedAt?.toISOString() ?? null };
   });
 }

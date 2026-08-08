@@ -3,6 +3,7 @@ import type { RunId } from "../domain/ids.js";
 import type { Clock } from "../ports/clock.js";
 import type { RunStore } from "../ports/run-store.js";
 import { ExecutionRegistry } from "./execution-registry.js";
+import { noFaults, type FaultInjector } from "./fault-injector.js";
 import { LeaseHeartbeat } from "./lease-heartbeat.js";
 
 export interface RunWorkerOptions {
@@ -14,6 +15,7 @@ export interface RunWorkerOptions {
   leaseDurationMs?: number;
   idleDelayMs?: number;
   executions?: ExecutionRegistry;
+  faults?: FaultInjector;
 }
 
 export class RunWorker {
@@ -21,6 +23,7 @@ export class RunWorker {
   private readonly leaseDurationMs: number;
   private readonly idleDelayMs: number;
   private readonly executions: ExecutionRegistry;
+  private readonly faults: FaultInjector;
   private readonly active = new Map<RunId, AbortController>();
   private loops: Promise<void>[] = [];
   private running = false;
@@ -30,6 +33,7 @@ export class RunWorker {
     this.leaseDurationMs = options.leaseDurationMs ?? 30_000;
     this.idleDelayMs = options.idleDelayMs ?? 50;
     this.executions = options.executions ?? new ExecutionRegistry();
+    this.faults = options.faults ?? noFaults;
   }
 
   start(): void {
@@ -56,11 +60,13 @@ export class RunWorker {
       let run;
       try {
         const now = this.options.clock.now();
+        await this.faults.hit("before_run_claim");
         run = this.options.runs.claimNextEligible(
           leaseOwner,
           now,
           new Date(now.getTime() + this.leaseDurationMs),
         );
+        if (run !== null) await this.faults.hit("after_run_claim");
       } catch (error) {
         if (!isSqliteBusy(error)) throw error;
         await this.options.clock.sleep(busyDelayMs);
@@ -93,7 +99,9 @@ export class RunWorker {
       let shouldBackOff = false;
       try {
         while (this.running && !controller.signal.aborted) {
+          await this.faults.hit("before_worker_resume");
           const outcome = await this.options.advance.advance(run.runId, leaseOwner, controller.signal);
+          await this.faults.hit("after_worker_resume");
           if (heartbeatFailure !== undefined) throw heartbeatFailure;
           busyDelayMs = 50;
           if (outcome.type !== "advanced") break;

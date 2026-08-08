@@ -5,15 +5,15 @@ import { approvalIdFromUuid } from "../../src/domain/ids.js";
 import { DecideApprovalService } from "../../src/application/decide-approval.js";
 
 describe("DecideApprovalService", () => {
-  it("repeats the same decision but rejects the opposite decision", () => {
+  it("repeats the same decision but rejects the opposite decision", async () => {
     const store = new FakeApprovalDecisionStore();
     const service = new DecideApprovalService(store, { now: () => new Date(0) });
     const approvalId = approvalIdFromUuid("00000000-0000-7000-8000-000000000101");
 
-    const first = service.execute({ approvalId, decision: "approve" });
+    const first = await service.execute({ approvalId, decision: "approve" });
 
-    expect(service.execute({ approvalId, decision: "approve" })).toEqual(first);
-    expect(() => service.execute({ approvalId, decision: "deny" })).toThrowError(
+    await expect(service.execute({ approvalId, decision: "approve" })).resolves.toEqual(first);
+    await expect(service.execute({ approvalId, decision: "deny" })).rejects.toThrowError(
       expect.objectContaining({ code: "approval_already_resolved", status: 409 }),
     );
   });

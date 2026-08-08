@@ -12,6 +12,7 @@
     "test:contract": "vitest run test/contract",
     "test:integration": "vitest run test/integration",
     "test:e2e": "vitest run test/e2e",
+    "test:smoke:live": "vitest run test/e2e/live-provider.smoke.test.ts",
     "check": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "private": true,

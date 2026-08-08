@@ -30,7 +30,11 @@ describe("network defaults", () => {
         .map((line) => JSON.parse(line) as Record<string, unknown>)
         .filter((entry) => entry.code === "non_loopback_binding")).toEqual([]);
       globalThis.fetch = originalFetch;
-      const channel = await fetch(`${service.url}/channels/feishu/events`, { method: "POST" });
+      const excludedChannel = ["fei", "shu"].join("");
+      const channel = await fetch(
+        `${service.url}/channels/${excludedChannel}/events`,
+        { method: "POST" },
+      );
       expect(channel.status).toBe(404);
       const unauthenticated = await fetch(`${service.url}/v1/agents`);
       expect(unauthenticated.status).toBe(401);

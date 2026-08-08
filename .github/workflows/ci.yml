@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  release-gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: >-
+          node -e "require('node:fs').mkdirSync('test-results', { recursive: true })"
+      - run: npm run lint
+      - run: npm run typecheck
+      - id: redaction
+        run: npx vitest run test/integration/secret-leak.test.ts
+      - run: npm run test:unit -- --reporter=default --reporter=junit --outputFile.junit=test-results/unit.xml
+      - run: npm run test:contract -- --reporter=default --reporter=junit --outputFile.junit=test-results/contract.xml
+      - run: npm run test:integration -- --reporter=default --reporter=junit --outputFile.junit=test-results/integration.xml
+      - run: npm run test:e2e -- --reporter=default --reporter=junit --outputFile.junit=test-results/e2e.xml
+      - run: npm run build
+      - name: Upload failing test logs
+        if: ${{ failure() && steps.redaction.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: test-results

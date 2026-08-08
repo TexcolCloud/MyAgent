@@ -17,6 +17,7 @@ import type { SessionStore } from "../ports/session-store.js";
 import type { ToolStore } from "../ports/tool-store.js";
 import type { ToolDefinition } from "../ports/tool.js";
 import type { ToolRegistry } from "../adapters/tools/registry.js";
+import { noFaults, type FaultInjector } from "../runtime/fault-injector.js";
 import { DeltaBuffer } from "./delta-buffer.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import type { PromptAssembler } from "./prompt-assembler.js";
@@ -51,6 +52,7 @@ export interface AdvanceRunServiceOptions {
   policy: PolicyEngine;
   clock: Clock;
   ids: IdGenerator;
+  faults?: FaultInjector;
 }
 
 interface CompletedAttempt {
@@ -62,8 +64,11 @@ interface CompletedAttempt {
 
 export class AdvanceRunService {
   private readonly activeAbortSafety = new Map<RunId, boolean>();
+  private readonly faults: FaultInjector;
 
-  constructor(private readonly options: AdvanceRunServiceOptions) {}
+  constructor(private readonly options: AdvanceRunServiceOptions) {
+    this.faults = options.faults ?? noFaults;
+  }
 
   isAbortSafe(runId: RunId): boolean {
     return this.activeAbortSafety.get(runId) ?? true;
@@ -130,6 +135,7 @@ export class AdvanceRunService {
       }
       const definition = this.options.registry.get(latestTool.toolName);
       if (definition === undefined) throw new DomainError("tool_not_registered");
+      await this.faults.hit("before_tool_execution");
       this.options.tools.beginExecution({
         runId, toolCallId: latestTool.toolCallId, leaseOwner, occurredAt: this.options.clock.now(),
       });
@@ -170,6 +176,7 @@ export class AdvanceRunService {
       } finally {
         this.activeAbortSafety.delete(runId);
       }
+      await this.faults.hit("after_tool_execution");
       if (result.deferred === true) {
         return { type: "waiting", runId, state: "waiting_child" };
       }
@@ -398,6 +405,7 @@ export class AdvanceRunService {
           policy: context.revision.policy,
           policyFacts: proposal.policyFacts,
         });
+        await this.faults.hit("before_model_attempt_commit");
         this.options.tools.recordProposal({
           runId,
           leaseOwner,
@@ -417,11 +425,13 @@ export class AdvanceRunService {
           } : {}),
           occurredAt: this.options.clock.now(),
         });
+        await this.faults.hit("after_model_attempt_commit");
         if (decision.effect === "ask") {
           return { type: "waiting", runId, state: "waiting_approval" };
         }
         return { type: "advanced", runId };
       }
+      await this.faults.hit("before_model_attempt_commit");
       const run = this.options.runs.completeRun({
         runId,
         leaseOwner,
@@ -429,6 +439,7 @@ export class AdvanceRunService {
         ...completed,
         occurredAt: this.options.clock.now(),
       });
+      await this.faults.hit("after_model_attempt_commit");
       return { type: "terminal", runId, state: run.state as "completed" };
     }
     throw new Error("unreachable_model_attempt_loop");

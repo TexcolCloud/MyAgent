@@ -338,14 +338,14 @@ describe("Approval and reconciliation resume", () => {
       const tools = new SqliteToolRepository(second.db);
       const approvals = new SqliteApprovalRepository(second.db);
       const decisions = new DecideApprovalService(approvals, clock);
-      const firstDecision = decisions.execute({
+      const firstDecision = await decisions.execute({
         approvalId,
         decision: "approve",
       });
-      expect(decisions.execute({ approvalId, decision: "approve" })).toEqual(
+      await expect(decisions.execute({ approvalId, decision: "approve" })).resolves.toEqual(
         firstDecision,
       );
-      expect(() => decisions.execute({ approvalId, decision: "deny" })).toThrowError(
+      await expect(decisions.execute({ approvalId, decision: "deny" })).rejects.toThrowError(
         expect.objectContaining({ code: "approval_already_resolved", status: 409 }),
       );
       runs.claimNextEligible(
