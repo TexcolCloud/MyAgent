@@ -61,30 +61,31 @@ describe("Secret containment", () => {
       });
       responses.push(await failed.text());
       expect(failed.status).toBe(500);
+      await service.shutdown();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      let persisted: string;
+      try {
+        persisted = JSON.stringify({
+          revisions: database.prepare("SELECT content_json FROM agent_revisions").all(),
+          events: database.prepare("SELECT payload_json FROM run_events").all(),
+        });
+      } finally {
+        database.close();
+      }
+      const captured = [...logs, ...responses, persisted].join("\n");
+      expect(logs.map((line) => JSON.parse(line) as Record<string, unknown>)).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: "internal_error", traceId: expect.any(String) })]),
+      );
+      expect(captured).not.toContain(OPERATOR_SECRET);
+      expect(captured).not.toContain(PROVIDER_SECRET);
+      expect(captured).not.toContain(path.join(root, "missing"));
     } finally {
       await service?.shutdown();
       restoreEnvironment("MYAGENT_BEARER_TOKEN", previousBearer);
       restoreEnvironment("MODEL_API_KEY", previousModel);
+      await rm(root, { recursive: true, force: true });
     }
-
-    const database = new DatabaseSync(databasePath, { readOnly: true });
-    let persisted: string;
-    try {
-      persisted = JSON.stringify({
-        revisions: database.prepare("SELECT content_json FROM agent_revisions").all(),
-        events: database.prepare("SELECT payload_json FROM run_events").all(),
-      });
-    } finally {
-      database.close();
-    }
-    const captured = [...logs, ...responses, persisted].join("\n");
-    expect(logs.map((line) => JSON.parse(line) as Record<string, unknown>)).toEqual(
-      expect.arrayContaining([expect.objectContaining({ code: "internal_error", traceId: expect.any(String) })]),
-    );
-    expect(captured).not.toContain(OPERATOR_SECRET);
-    expect(captured).not.toContain(PROVIDER_SECRET);
-    expect(captured).not.toContain(path.join(root, "missing"));
-    await rm(root, { recursive: true, force: true });
   });
 });
 

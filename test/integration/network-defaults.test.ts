@@ -29,16 +29,13 @@ describe("network defaults", () => {
       expect(logs
         .map((line) => JSON.parse(line) as Record<string, unknown>)
         .filter((entry) => entry.code === "non_loopback_binding")).toEqual([]);
-    } finally {
       globalThis.fetch = originalFetch;
-    }
-
-    try {
-      const channel = await fetch(`${service!.url}/channels/feishu/events`, { method: "POST" });
+      const channel = await fetch(`${service.url}/channels/feishu/events`, { method: "POST" });
       expect(channel.status).toBe(404);
-      const unauthenticated = await fetch(`${service!.url}/v1/agents`);
+      const unauthenticated = await fetch(`${service.url}/v1/agents`);
       expect(unauthenticated.status).toBe(401);
     } finally {
+      globalThis.fetch = originalFetch;
       await service?.shutdown();
       await fixture.cleanup();
     }

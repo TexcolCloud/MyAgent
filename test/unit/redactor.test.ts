@@ -51,6 +51,23 @@ describe("redact", () => {
     expect(redact(input, secrets([]))).toEqual({ safe: "ok", self: "[CIRCULAR]" });
     expect(input.self).toBe(input);
   });
+
+  it("bounds circular Error metadata", () => {
+    const error = new Error("safe") as Error & { code?: unknown };
+    error.code = error;
+
+    expect(redact(error, secrets([], { maxDepth: 2 }))).toEqual({
+      name: "Error",
+      message: "safe",
+      code: "[CIRCULAR]",
+    });
+  });
+
+  it("bounds Secret expansion without cutting redaction markers", () => {
+    expect(redact("aaaaa", secrets(["a"], { maxStringLength: 4 }))).toBe(
+      "[REDACTED][TRUNCATED]",
+    );
+  });
 });
 
 describe("createStructuredLogger", () => {

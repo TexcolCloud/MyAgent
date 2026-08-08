@@ -62,13 +62,13 @@ function redactValue(
     return redactString(String(value), policy);
   }
   if (value === undefined) return "[UNDEFINED]";
-  if (value instanceof Date) return value.toISOString();
-  if (value instanceof Error) return redactError(value, policy, depth, active);
   if (depth >= policy.maxDepth) return TRUNCATED;
   if (active.has(value)) return CIRCULAR;
 
   active.add(value);
   try {
+    if (value instanceof Date) return value.toISOString();
+    if (value instanceof Error) return redactError(value, policy, depth, active);
     if (Array.isArray(value)) {
       const output = value
         .slice(0, policy.maxCollectionEntries)
@@ -99,18 +99,18 @@ function redactObject(
       }
       entryCount += 1;
       const redactedKey = redactString(key, policy);
-    if (policy.sensitiveKeys.has(key.toLowerCase())) {
+      if (policy.sensitiveKeys.has(key.toLowerCase())) {
         output[redactedKey] = REDACTED;
-      continue;
-    }
-    try {
+        continue;
+      }
+      try {
         output[redactedKey] = redactValue(
-        (value as Record<string, unknown>)[key],
-        policy,
-        depth + 1,
-        active,
-      );
-    } catch {
+          (value as Record<string, unknown>)[key],
+          policy,
+          depth + 1,
+          active,
+        );
+      } catch {
         output[redactedKey] = UNAVAILABLE;
       }
     }
@@ -135,12 +135,24 @@ function redactError(
 }
 
 function redactString(value: string, policy: RedactionPolicy): string {
-  let redacted = value;
-  for (const secret of policy.secretValues) {
-    redacted = redacted.split(secret).join(REDACTED);
+  let redacted = "";
+  let index = 0;
+  while (index < value.length && redacted.length < policy.maxStringLength) {
+    const secret = policy.secretValues.find((candidate) => value.startsWith(candidate, index));
+    if (secret !== undefined) {
+      redacted += REDACTED;
+      index += secret.length;
+      continue;
+    }
+
+    const codePoint = value.codePointAt(index);
+    if (codePoint === undefined) break;
+    const character = String.fromCodePoint(codePoint);
+    if (redacted.length + character.length > policy.maxStringLength) break;
+    redacted += character;
+    index += character.length;
   }
-  if (redacted.length <= policy.maxStringLength) return redacted;
-  return `${redacted.slice(0, policy.maxStringLength)}${TRUNCATED}`;
+  return index === value.length ? redacted : `${redacted}${TRUNCATED}`;
 }
 
 function positiveInteger(value: number | undefined, fallback: number): number {
