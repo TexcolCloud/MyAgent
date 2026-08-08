@@ -264,6 +264,7 @@ export class AdvanceRunService {
           });
         },
         onAttemptFailed: async (attemptNumber, error, willRetry) => {
+          signal.throwIfAborted();
           const attemptId = summaryAttemptIds.get(attemptNumber);
           if (attemptId === undefined) {
             throw new Error("summary_attempt_checkpoint_missing");

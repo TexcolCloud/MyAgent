@@ -351,6 +351,106 @@ describe("Run cancellation", () => {
     }
   });
 
+  it("lets the worker durably finalize cancellation during a forced Summary", async () => {
+    const connection = openDatabase({
+      path: tempPath("cancel-active-summary.db"),
+      busyTimeoutMs: 5_000,
+    });
+    const executions = new ExecutionRegistry();
+    const workerClock = new SystemClock();
+    let worker: RunWorker | undefined;
+    try {
+      migrate(connection.db);
+      const limitedSnapshot = withModelInputLimit(snapshot, 2_000);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const tools = new SqliteToolRepository(connection.db);
+      const approvals = new SqliteApprovalRepository(connection.db);
+      const historicalRunId = runIdFromUuid(
+        "00000000-0000-7000-8000-000000000509",
+      );
+      const runId = runIdFromUuid("00000000-0000-7000-8000-000000000510");
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000509")],
+        runIds: [historicalRunId, runId],
+        attemptIds: ["att_00000000-0000-7000-8000-000000000509" as never],
+      });
+      const create = new CreateRunService(
+        new CatalogService(limitedSnapshot),
+        runs,
+        workerClock,
+        ids,
+      );
+      const historical = create.execute({
+        agentId: "primary",
+        sessionKey: "cancel:summary",
+        input: { type: "text", text: "old context ".repeat(2_000) },
+        idempotencyKey: "cancel-summary-0001",
+        source: { kind: "http" },
+      });
+      connection.db.prepare(
+        "UPDATE runs SET state = 'completed' WHERE run_id = ?",
+      ).run(historical.runId);
+      create.execute({
+        agentId: "primary",
+        sessionKey: "cancel:summary",
+        input: { type: "text", text: "cancel while summarizing" },
+        idempotencyKey: "cancel-summary-0002",
+        source: { kind: "http" },
+      });
+      const model = new BlockingModel();
+      const advance = new AdvanceRunService({
+        runs,
+        tools,
+        approvals,
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry: new ToolRegistry(),
+        policy: new PolicyEngine(),
+        clock: workerClock,
+        ids,
+      });
+      worker = new RunWorker({
+        runs,
+        advance,
+        clock: workerClock,
+        workerId: "cancel-summary-worker",
+        concurrency: 1,
+        idleDelayMs: 5,
+        leaseDurationMs: 3_000,
+        executions,
+      });
+      worker.start();
+      await model.waitUntilStarted();
+
+      new CancelRunService(runs, executions, workerClock).execute({ runId });
+      await waitFor(() => {
+        const state = runs.getRun(runId).state;
+        return state === "cancelled" || state === "failed";
+      });
+
+      const events = runs.listEventsAfter(runId, 0);
+      expect(model.requests.map((request) => request.purpose))
+        .toEqual(["session_summary"]);
+      expect(runs.getRun(runId).state).toBe("cancelled");
+      expect(events.filter((event) => event.type === "run.failed")).toEqual([]);
+      expect(
+        events.filter((event) => event.type === "model.attempt.failed"),
+      ).toEqual([
+        expect.objectContaining({
+          payload: expect.objectContaining({ code: "run_cancelled" }),
+        }),
+      ]);
+      expect(events.filter((event) => event.type === "run.cancelled"))
+        .toHaveLength(1);
+    } finally {
+      await worker?.stop();
+      connection.close();
+    }
+  });
+
   it("persists a side-effect result that wins the abort race and then cancels", async () => {
     const connection = openDatabase({
       path: tempPath("cancel-known-side-effect.db"),
@@ -696,6 +796,7 @@ describe("Run cancellation", () => {
 
 class BlockingModel implements ModelPort {
   aborted = false;
+  readonly requests: ModelRequest[] = [];
   private startedResolve!: () => void;
   private readonly started = new Promise<void>((resolve) => {
     this.startedResolve = resolve;
@@ -706,9 +807,10 @@ class BlockingModel implements ModelPort {
   }
 
   async *streamAttempt(
-    _request: ModelRequest,
+    request: ModelRequest,
     signal: AbortSignal,
   ): AsyncIterable<ModelChunk> {
+    this.requests.push(request);
     this.startedResolve();
     await new Promise<void>((_resolve, reject) => {
       signal.addEventListener("abort", () => {
@@ -722,6 +824,25 @@ class BlockingModel implements ModelPort {
       usage: { inputTokens: 0, outputTokens: 0 },
     };
   }
+}
+
+function withModelInputLimit(
+  snapshot: CatalogSnapshot,
+  maxInputTokens: number,
+): CatalogSnapshot {
+  const available = snapshot.available.map((agent) => ({
+    ...agent,
+    revision: {
+      ...agent.revision,
+      revisionId: `rev_model_input_${String(maxInputTokens)}`,
+      model: { ...agent.revision.model, maxInputTokens },
+    },
+  }));
+  return {
+    ...snapshot,
+    available,
+    byId: new Map(available.map((agent) => [agent.id, agent])),
+  };
 }
 
 class CompletingAfterAbortModel implements ModelPort {
