@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 
 import type { CancelRunService } from "../../application/cancel-run.js";
+import type { CreateBackupService } from "../../application/create-backup.js";
 import type { CreateRunService } from "../../application/create-run.js";
 import type { DecideApprovalService } from "../../application/decide-approval.js";
 import type { DeleteSessionService } from "../../application/delete-session.js";
@@ -14,6 +15,7 @@ import { isAuthorized } from "./auth.js";
 import { sendError, sendProblem } from "./problem.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerAgentRoutes } from "./routes/agents.js";
+import { registerBackupRoutes } from "./routes/backups.js";
 import { registerApprovalRoutes } from "./routes/approvals.js";
 import { registerConfigRoutes } from "./routes/config.js";
 import { registerRunRoutes } from "./routes/runs.js";
@@ -35,6 +37,7 @@ export interface HttpAppOptions {
   sessions?: SessionLookupStore;
   deleteSession?: DeleteSessionService;
   sse?: SseStreamOptions;
+  createBackups?: CreateBackupService;
 }
 
 export function createHttpApp(options: HttpAppOptions): FastifyInstance {
@@ -78,6 +81,9 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
   }
   if (options.sessions !== undefined && options.deleteSession !== undefined) {
     app.register((api, _routeOptions, done) => { registerSessionRoutes(api, { sessions: options.sessions!, deleteSession: options.deleteSession! }); done(); }, { prefix: "/v1" });
+  }
+  if (options.createBackups !== undefined) {
+    app.register((api, _routeOptions, done) => { registerBackupRoutes(api, options.createBackups!); done(); }, { prefix: "/v1" });
   }
   app.setErrorHandler((error, request, reply) => sendError(error, request, reply));
   app.setNotFoundHandler((request, reply) =>

@@ -1,0 +1,26 @@
+version: 1
+rules:
+  - tool: activate_skill
+    effect: allow
+  - tool: list_files
+    when:
+      pathWithinWorkspace: true
+    effect: allow
+  - tool: read_file
+    when:
+      pathWithinWorkspace: true
+    effect: allow
+  - tool: write_file
+    when:
+      pathWithinWorkspace: true
+    effect: ask
+  - tool: run_command
+    when:
+      pathWithinWorkspace: true
+    effect: ask
+  - tool: delegate_agent
+    when:
+      targetAgentInDelegates: true
+    effect: allow
+  - tool: "*"
+    effect: deny

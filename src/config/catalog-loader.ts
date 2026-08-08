@@ -43,6 +43,12 @@ export type ResolvedGlobalConfig = DeepReadonly<
 export interface AvailableAgent {
   id: AgentId;
   revision: AgentRevisionSnapshot;
+  sources?: readonly CatalogSourceFile[];
+}
+
+export interface CatalogSourceFile {
+  relativePath: string;
+  content: string;
 }
 
 export interface UnavailableAgent {
@@ -57,12 +63,14 @@ export interface CatalogSnapshot {
   available: readonly AvailableAgent[];
   unavailable: readonly UnavailableAgent[];
   byId: ReadonlyMap<AgentId, AvailableAgent>;
+  sources: readonly CatalogSourceFile[];
 }
 
 export async function loadCatalog(configPath: string): Promise<CatalogSnapshot> {
   const absoluteConfigPath = path.resolve(configPath);
   const configDirectory = path.dirname(absoluteConfigPath);
-  const global = await loadGlobalConfig(absoluteConfigPath, configDirectory);
+  const globalSource = await readGlobalConfig(absoluteConfigPath);
+  const global = loadGlobalConfig(globalSource, configDirectory);
   const { skills, agentDirectories } = await loadGlobalResources(global);
   const available: AvailableAgent[] = [];
   const unavailable: UnavailableAgent[] = [];
@@ -80,13 +88,38 @@ export async function loadCatalog(configPath: string): Promise<CatalogSnapshot> 
   isolated.available.sort((left, right) => left.id.localeCompare(right.id));
   isolated.unavailable.sort((left, right) => left.id.localeCompare(right.id));
 
+  const sourceFiles = new Map<string, CatalogSourceFile>();
+  sourceFiles.set("myagent.yaml", Object.freeze({ relativePath: "myagent.yaml", content: globalSource }));
+  for (const agent of isolated.available) {
+    for (const source of agent.sources ?? []) sourceFiles.set(source.relativePath, source);
+    for (const skill of agent.revision.skills) {
+      const source = skills.sources.get(skill.name);
+      if (source === undefined) throw new DomainError("active_skill_source_missing");
+      const relativePath = `skills/${skill.name}/SKILL.md`;
+      sourceFiles.set(relativePath, Object.freeze({ relativePath, content: source.source }));
+    }
+  }
+
   return Object.freeze({
     configPath: absoluteConfigPath,
     global,
     available: Object.freeze(isolated.available),
     unavailable: Object.freeze(isolated.unavailable),
     byId: new Map(isolated.available.map((agent) => [agent.id, agent])),
+    sources: Object.freeze([...sourceFiles.values()].sort((left, right) => left.relativePath.localeCompare(right.relativePath))),
   });
+}
+
+async function readGlobalConfig(configPath: string): Promise<string> {
+  try {
+    return await readFile(configPath, "utf8");
+  } catch (error) {
+    throw new DomainError(
+      "invalid_global_config",
+      "invalid_global_config",
+      { cause: error instanceof Error ? error.message : "unknown" },
+    );
+  }
 }
 
 interface GlobalResources {
@@ -151,12 +184,12 @@ function isolateDuplicateAgents(
   };
 }
 
-async function loadGlobalConfig(
-  configPath: string,
+function loadGlobalConfig(
+  source: string,
   configDirectory: string,
-): Promise<ResolvedGlobalConfig> {
+): ResolvedGlobalConfig {
   try {
-    const parsed = globalConfigSchema.parse(parseYaml(await readFile(configPath, "utf8")));
+    const parsed = globalConfigSchema.parse(parseYaml(source));
     return deepFreeze({
       ...parsed,
       database: {
@@ -197,7 +230,9 @@ async function loadAgent(
 ): Promise<AvailableAgent | UnavailableAgent> {
   let fallbackId = path.basename(directory);
   try {
-    const raw = parseYaml(await readFile(path.join(directory, "agent.yaml"), "utf8"));
+    const agentConfigPath = await confinedFile(directory, "agent.yaml");
+    const agentSource = await readFile(agentConfigPath, "utf8");
+    const raw = parseYaml(agentSource);
     if (isObject(raw) && typeof raw.id === "string") {
       fallbackId = raw.id;
     }
@@ -212,8 +247,9 @@ async function loadAgent(
     const promptPath = await confinedFile(directory, config.prompt);
     const policyPath = await confinedFile(directory, config.policy);
     const prompt = await readFile(promptPath, "utf8");
+    const policySource = await readFile(policyPath, "utf8");
     const policy = policyConfigSchema.parse(
-      parseYaml(await readFile(policyPath, "utf8")),
+      parseYaml(policySource),
     );
     const selectedSkills = config.skills.map((name) => {
       const loadError = skills.unavailable.get(name);
@@ -235,7 +271,13 @@ async function loadAgent(
       directory,
       skills: selectedSkills,
     });
-    return Object.freeze({ id, revision });
+    const sourcePrefix = `agents/${id}`;
+    const sources = [
+      Object.freeze({ relativePath: `${sourcePrefix}/agent.yaml`, content: agentSource }),
+      Object.freeze({ relativePath: `${sourcePrefix}/${relativeSourcePath(directory, promptPath)}`, content: prompt }),
+      Object.freeze({ relativePath: `${sourcePrefix}/${relativeSourcePath(directory, policyPath)}`, content: policySource }),
+    ];
+    return Object.freeze({ id, revision, sources: Object.freeze(sources) });
   } catch (error) {
     return Object.freeze({
       id: fallbackId,
@@ -243,6 +285,14 @@ async function loadAgent(
       detail: error instanceof Error ? error.message : "invalid Agent configuration",
     });
   }
+}
+
+function relativeSourcePath(root: string, file: string): string {
+  const relative = path.relative(root, file);
+  if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+    throw new Error("source path escapes Agent directory");
+  }
+  return relative.split(path.sep).join("/");
 }
 
 async function confinedFile(root: string, candidate: string): Promise<string> {

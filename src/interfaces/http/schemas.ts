@@ -16,6 +16,7 @@ export const reconciliationSchema = z.strictObject({
   note: z.string().optional(),
   result: z.unknown().optional(),
 });
+export const backupRequestSchema = z.strictObject({ destination: z.string().min(1) });
 
 const runStateSchema = z.enum([
   "queued", "running", "waiting_approval", "waiting_reconciliation",
@@ -88,6 +89,12 @@ export const sessionsResponseSchema = z.strictObject({
     createdAt: z.string(),
     updatedAt: z.string(),
   })),
+});
+export const backupResponseSchema = z.strictObject({
+  destination: z.string(),
+  database: z.literal("kernel.db"),
+  fileCount: z.number().int().positive(),
+  activeRevisionIds: z.array(z.string()),
 });
 
 export function parseSchema<T>(schema: z.ZodType<T>, value: unknown): T {

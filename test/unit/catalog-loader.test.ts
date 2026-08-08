@@ -27,6 +27,37 @@ describe("loadCatalog", () => {
     ]);
   });
 
+  it("wraps an unreadable global config in the stable global error", async () => {
+    await expect(loadCatalog(fixture("missing", "myagent.yaml"))).rejects.toMatchObject({
+      code: "invalid_global_config",
+    });
+  });
+
+  it("retains immutable source contents after active files change", async () => {
+    const temporary = await mkdtemp(path.join(os.tmpdir(), "myagent-catalog-sources-"));
+    const configRoot = path.join(temporary, "config");
+    await cp(fixture("valid"), configRoot, { recursive: true });
+
+    try {
+      const catalog = await loadCatalog(path.join(configRoot, "myagent.yaml"));
+      const promptPath = path.join(configRoot, "agents", "primary", "AGENT.md");
+      const skillPath = path.join(configRoot, "skills", "research", "SKILL.md");
+      const before = new Map(catalog.sources.map((source) => [source.relativePath, source.content]));
+
+      await writeFile(promptPath, "changed after load\n");
+      await writeFile(skillPath, "---\nname: research\ndescription: changed\nversion: 1\n---\nchanged\n");
+
+      expect(catalog.sources).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ relativePath: "agents/primary/AGENT.md", content: before.get("agents/primary/AGENT.md") }),
+          expect.objectContaining({ relativePath: "skills/research/SKILL.md", content: before.get("skills/research/SKILL.md") }),
+        ]),
+      );
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  });
+
   it("maps missing configured roots to a stable global error", async () => {
     const temporary = await mkdtemp(path.join(os.tmpdir(), "myagent-missing-root-"));
     const configPath = path.join(temporary, "myagent.yaml");

@@ -13,6 +13,12 @@ const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)([\s\S]*)$/;
 export interface SkillCatalog {
   available: ReadonlyMap<string, SkillSnapshot>;
   unavailable: ReadonlyMap<string, DomainError>;
+  sources: ReadonlyMap<string, SkillSource>;
+}
+
+export interface SkillSource {
+  file: string;
+  source: string;
 }
 
 export async function loadSkills(
@@ -33,15 +39,18 @@ export async function loadSkillCatalog(
 ): Promise<SkillCatalog> {
   const available = new Map<string, SkillSnapshot>();
   const unavailable = new Map<string, DomainError>();
+  const sources = new Map<string, SkillSource>();
 
   for (const configuredRoot of configuredRoots) {
     const root = await realpath(configuredRoot);
     for (const candidate of await discoverSkillFiles(root)) {
       try {
         const file = await confinedSkillFile(root, candidate.file);
-        const skill = parseSkillMarkdown(await readFile(file, "utf8"));
+        const source = await readFile(file, "utf8");
+        const skill = parseSkillMarkdown(source);
         if (available.has(skill.name) || unavailable.has(skill.name)) {
           available.delete(skill.name);
+          sources.delete(skill.name);
           unavailable.set(
             skill.name,
             new DomainError(
@@ -52,6 +61,7 @@ export async function loadSkillCatalog(
           continue;
         }
         available.set(skill.name, skill);
+        sources.set(skill.name, Object.freeze({ file, source }));
       } catch (error) {
         unavailable.set(candidate.name, asSkillError(error));
       }
@@ -61,6 +71,7 @@ export async function loadSkillCatalog(
   return {
     available,
     unavailable,
+    sources,
   };
 }
 

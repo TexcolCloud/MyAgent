@@ -7,8 +7,10 @@ import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { SqliteRunRepository } from "../../src/adapters/sqlite/run-repository.js";
 import { SqliteSessionRepository } from "../../src/adapters/sqlite/session-repository.js";
 import { SqliteToolRepository } from "../../src/adapters/sqlite/tool-repository.js";
+import { SqliteBackupWriter } from "../../src/adapters/sqlite/backup.js";
 import { UuidIdGenerator } from "../../src/adapters/uuid-id-generator.js";
 import { CancelRunService } from "../../src/application/cancel-run.js";
+import { CreateBackupService } from "../../src/application/create-backup.js";
 import { CreateRunService } from "../../src/application/create-run.js";
 import { DecideApprovalService } from "../../src/application/decide-approval.js";
 import { DeleteSessionService } from "../../src/application/delete-session.js";
@@ -42,6 +44,7 @@ export async function startTestApp(options: { sse?: SseStreamOptions } = {}) {
     sessions,
     deleteSession: new DeleteSessionService(sessions),
     ...(options.sse === undefined ? {} : { sse: options.sse }),
+    createBackups: new CreateBackupService(new SqliteBackupWriter(connection.db), catalog, clock),
   });
   return { app, approvals, catalog, clock, connection, runs, sessions, tools, close: async () => { await app.close(); connection.close(); } };
 }
