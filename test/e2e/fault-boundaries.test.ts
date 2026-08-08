@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 
 import { DecideApprovalService } from "../../src/application/decide-approval.js";
@@ -123,6 +124,98 @@ describe("durable fault boundaries", () => {
       await provider.close();
     }
   }, 30_000);
+
+  it.each([
+    {
+      point: "before_model_attempt_commit" as const,
+      expectedRequests: 4,
+      expectedSummary: "SUMMARY_OUTPUT_AFTER_RESTART",
+      expectedFailedAttempts: 1,
+    },
+    {
+      point: "after_model_attempt_commit" as const,
+      expectedRequests: 3,
+      expectedSummary: "SUMMARY_OUTPUT_BEFORE_CRASH",
+      expectedFailedAttempts: 0,
+    },
+  ])("recovers a forced Summary interrupted at $point", async ({
+    point,
+    expectedRequests,
+    expectedSummary,
+    expectedFailedAttempts,
+  }) => {
+    const firstSummary = "SUMMARY_OUTPUT_BEFORE_CRASH";
+    const turns: ProviderTurn[] = [
+      { type: "text", text: "historical run completed" },
+      { type: "text", text: firstSummary },
+      ...(point === "before_model_attempt_commit"
+        ? [{ type: "text" as const, text: "SUMMARY_OUTPUT_AFTER_RESTART" }]
+        : []),
+      { type: "text", text: "final answer after Summary recovery" },
+    ];
+    const provider = await ScriptedChatServer.start(turns);
+    const fixture = await prepareE2eFixture(provider.baseUrl, {
+      maxInputTokens: 2_000,
+    });
+    const seed = new E2eServiceController(fixture.configPath);
+    const seedClient = new AgentHttpClient(() => seed.url);
+    const child = new FaultChildController(fixture, point);
+    const recovery = new E2eServiceController(fixture.configPath);
+    const faultClient = new AgentHttpClient(() => child.url);
+    const recoveryClient = new AgentHttpClient(() => recovery.url);
+
+    try {
+      await seed.start();
+      const historical = await seedClient.createRun({
+        agentId: "primary",
+        sessionKey: `fault:summary:${point}`,
+        text: "small historical input",
+        idempotencyKey: `fault-summary-history-${point}`,
+      });
+      await seedClient.waitForStatus(historical.runId, "completed", 20_000);
+      await seed.stop();
+      replaceRunInput(
+        fixture.databasePath,
+        historical.runId,
+        "HISTORICAL_CONTEXT_MARKER ".repeat(2_000),
+      );
+
+      await child.start();
+      await child.arm();
+      const run = await faultClient.createRun({
+        agentId: "primary",
+        sessionKey: `fault:summary:${point}`,
+        text: "complete after forced Summary recovery",
+        idempotencyKey: `fault-summary-current-${point}`,
+      });
+      await child.waitForHit();
+      expect(provider.requests).toHaveLength(2);
+      expect(readSummaryState(fixture.databasePath, run.runId)).toEqual(
+        point === "before_model_attempt_commit"
+          ? { count: 0, content: null }
+          : { count: 1, content: firstSummary },
+      );
+      await child.crash();
+
+      await waitForLeaseExpiry();
+      await recovery.start();
+      await recoveryClient.waitForStatus(run.runId, "completed", 20_000);
+      expect(provider.requests).toHaveLength(expectedRequests);
+      expect(readSummaryState(fixture.databasePath, run.runId)).toEqual({
+        count: 1,
+        content: expectedSummary,
+      });
+      expect(readRunEventTypes(fixture.databasePath, run.runId)
+        .filter((type) => type === "model.attempt.failed"))
+        .toHaveLength(expectedFailedAttempts);
+    } finally {
+      await seed.stop();
+      await child.stop();
+      await recovery.stop();
+      await fixture.cleanup();
+      await provider.close();
+    }
+  }, 35_000);
 
   it.each([
     { point: "before_tool_execution" as const, expectedState: "completed", expectedRequests: 2 },
@@ -263,6 +356,53 @@ describe("durable fault boundaries", () => {
     }
   }, 35_000);
 
+  it("omits emitted but uncommitted model output from SQLite and SSE replay", async () => {
+    const transientMarker = "TRANSIENT_MODEL_OUTPUT_MARKER";
+    const durableMarker = "DURABLE_MODEL_OUTPUT_MARKER";
+    const provider = await ScriptedChatServer.start([
+      { type: "held_text", text: transientMarker },
+      { type: "text", text: durableMarker },
+    ]);
+    const fixture = await prepareE2eFixture(provider.baseUrl);
+    const child = new FaultChildController(fixture, "before_model_attempt_commit");
+    const recovery = new E2eServiceController(fixture.configPath);
+    const faultClient = new AgentHttpClient(() => child.url);
+    const recoveryClient = new AgentHttpClient(() => recovery.url);
+
+    try {
+      await child.start();
+      const run = await faultClient.createRun({
+        agentId: "primary",
+        sessionKey: "fault:transient-model-output",
+        text: "discard only output that was never committed",
+        idempotencyKey: "fault-transient-model-output-0001",
+      });
+      await expect(provider.heldTextWritten).resolves.toBe(transientMarker);
+      expect(provider.requests).toHaveLength(1);
+      expect(readRunEvents(fixture.databasePath, run.runId)).not.toContain(
+        transientMarker,
+      );
+      await child.crash();
+
+      await waitForLeaseExpiry();
+      await recovery.start();
+      await recoveryClient.waitForStatus(run.runId, "completed", 20_000);
+      const replay = await recoveryClient.readEventStream(run.runId, 0);
+      const serializedReplay = JSON.stringify(replay);
+      const persistedEvents = readRunEvents(fixture.databasePath, run.runId);
+      expect(serializedReplay).toContain(durableMarker);
+      expect(serializedReplay).not.toContain(transientMarker);
+      expect(persistedEvents).toContain(durableMarker);
+      expect(persistedEvents).not.toContain(transientMarker);
+      expect(provider.requests).toHaveLength(2);
+    } finally {
+      await child.stop();
+      await recovery.stop();
+      await fixture.cleanup();
+      await provider.close();
+    }
+  }, 30_000);
+
   it.each([
     { point: "before_sse_write" as const, deliveredSequence: 0 },
     { point: "after_sse_write" as const, deliveredSequence: 1 },
@@ -307,7 +447,6 @@ describe("durable fault boundaries", () => {
       expect(replay[0]?.sequence).toBe(deliveredSequence + 1);
       expect(new Set(replay.map((event) => event.sequence)).size).toBe(replay.length);
       expect(replay.map((event) => event.type)).toContain("run.completed");
-      expect(JSON.stringify(replay)).not.toContain("never-committed");
       expect(provider.requests).toHaveLength(1);
     } finally {
       await child.stop();
@@ -333,4 +472,74 @@ async function waitForLeaseExpiry(): Promise<void> {
 async function effectLines(filePath: string): Promise<string[]> {
   const content = await readFile(filePath, "utf8");
   return content.trim().split("\n");
+}
+
+function replaceRunInput(databasePath: string, runId: string, text: string): void {
+  const database = new DatabaseSync(databasePath);
+  try {
+    const content = JSON.stringify({ type: "text", text });
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const run = database.prepare(
+        "UPDATE runs SET input_json = ? WHERE run_id = ?",
+      ).run(content, runId);
+      const message = database.prepare(
+        "UPDATE messages SET content_json = ? WHERE run_id = ? AND role = 'user'",
+      ).run(content, runId);
+      if (run.changes !== 1 || message.changes !== 1) {
+        throw new Error("historical_input_fixture_missing");
+      }
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function readSummaryState(
+  databasePath: string,
+  runId: string,
+): { count: number; content: string | null } {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    return database.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM session_summaries AS all_summaries
+          WHERE all_summaries.session_id = session.session_id) AS count,
+         current_summary.content AS content
+       FROM runs AS run
+       JOIN sessions AS session ON session.session_id = run.session_id
+       LEFT JOIN session_summaries AS current_summary
+         ON current_summary.summary_id = session.current_summary_id
+       WHERE run.run_id = ?`,
+    ).get(runId) as { count: number; content: string | null };
+  } finally {
+    database.close();
+  }
+}
+
+function readRunEventTypes(databasePath: string, runId: string): string[] {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    return (database.prepare(
+      "SELECT event_type FROM run_events WHERE run_id = ? ORDER BY sequence",
+    ).all(runId) as Array<{ event_type: string }>).map((row) => row.event_type);
+  } finally {
+    database.close();
+  }
+}
+
+function readRunEvents(databasePath: string, runId: string): string {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    return JSON.stringify(database.prepare(
+      `SELECT sequence, event_type, payload_json
+       FROM run_events WHERE run_id = ? ORDER BY sequence`,
+    ).all(runId));
+  } finally {
+    database.close();
+  }
 }

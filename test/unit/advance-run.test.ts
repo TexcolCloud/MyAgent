@@ -29,6 +29,7 @@ import {
   type ModelRequest,
 } from "../../src/ports/model.js";
 import type { ToolStore } from "../../src/ports/tool-store.js";
+import type { FaultInjector, FaultPoint } from "../../src/runtime/fault-injector.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
@@ -1225,6 +1226,21 @@ describe("AdvanceRunService", () => {
         completedText("durable compact summary"),
         completedText("final answer after summary"),
       );
+      const faultSnapshots: Array<{
+        point: FaultPoint;
+        failedAttempts: number;
+        summary: string | null;
+      }> = [];
+      const faults: FaultInjector = {
+        async hit(point): Promise<void> {
+          faultSnapshots.push({
+            point,
+            failedAttempts: runs.listEventsAfter(created.runId, 0)
+              .filter((event) => event.type === "model.attempt.failed").length,
+            summary: sessions.getCurrentSummary(created.sessionId)?.content ?? null,
+          });
+        },
+      };
       const service = new AdvanceRunService({
         runs,
         tools: new SqliteToolRepository(connection.db),
@@ -1236,6 +1252,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        faults,
       });
 
       expect(await service.advance(
@@ -1255,6 +1272,16 @@ describe("AdvanceRunService", () => {
       expect(sessions.getCurrentSummary(created.sessionId)).toMatchObject({
         content: "durable compact summary",
       });
+      expect(faultSnapshots).toEqual([
+        { point: "before_model_attempt_commit", failedAttempts: 0, summary: null },
+        { point: "after_model_attempt_commit", failedAttempts: 1, summary: null },
+        { point: "before_model_attempt_commit", failedAttempts: 1, summary: null },
+        {
+          point: "after_model_attempt_commit",
+          failedAttempts: 1,
+          summary: "durable compact summary",
+        },
+      ]);
       expect(await service.advance(
         created.runId,
         "worker-unit",

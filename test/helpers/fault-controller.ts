@@ -20,7 +20,8 @@ const MODEL_SECRET = "e2e-provider-secret";
 
 export type ProviderTurn =
   | { type: "tool"; name: string; arguments: JsonValue }
-  | { type: "text"; text: string };
+  | { type: "text"; text: string }
+  | { type: "held_text"; text: string };
 
 export interface CapturedProviderRequest {
   model?: unknown;
@@ -31,6 +32,8 @@ export interface CapturedProviderRequest {
 export class ScriptedChatServer {
   readonly requests: CapturedProviderRequest[] = [];
   readonly baseUrl: string;
+  readonly heldTextWritten: Promise<string>;
+  private resolveHeldTextWritten!: (text: string) => void;
 
   private constructor(
     private readonly server: Server,
@@ -38,6 +41,9 @@ export class ScriptedChatServer {
     port: number,
   ) {
     this.baseUrl = `http://127.0.0.1:${String(port)}/v1`;
+    this.heldTextWritten = new Promise((resolve) => {
+      this.resolveHeldTextWritten = resolve;
+    });
   }
 
   static async start(turns: readonly ProviderTurn[]): Promise<ScriptedChatServer> {
@@ -77,6 +83,13 @@ export class ScriptedChatServer {
     }
 
     response.writeHead(200, { "content-type": "text/event-stream" });
+    if (turn.type === "held_text") {
+      response.write(
+        `data: ${JSON.stringify(frame({ content: turn.text }))}\n\n`,
+        () => { this.resolveHeldTextWritten(turn.text); },
+      );
+      return;
+    }
     const events = turn.type === "text"
       ? [frame({ content: turn.text }), frame({}, "stop"), usageFrame()]
       : [
@@ -107,7 +120,7 @@ export interface E2eFixture {
 
 export async function prepareE2eFixture(
   baseUrl: string,
-  options: { allowRunCommand?: boolean } = {},
+  options: { allowRunCommand?: boolean; maxInputTokens?: number } = {},
 ): Promise<E2eFixture> {
   const root = await mkdtemp(path.join(os.tmpdir(), "myagent-e2e-"));
   const configRoot = path.join(root, "config");
@@ -127,6 +140,7 @@ export async function prepareE2eFixture(
       model: string;
       baseUrl: string;
       apiKey: { fromEnvironment: string };
+      maxInputTokens: number;
     }>;
   };
   const model = config.models.default;
@@ -134,6 +148,9 @@ export async function prepareE2eFixture(
   model.model = "test-model";
   model.baseUrl = baseUrl;
   model.apiKey = { fromEnvironment: "E2E_MODEL_API_KEY" };
+  if (options.maxInputTokens !== undefined) {
+    model.maxInputTokens = options.maxInputTokens;
+  }
   await writeFile(configPath, stringifyYaml(config), "utf8");
 
   const policyPath = path.join(configRoot, "agents", "primary", "policy.yaml");

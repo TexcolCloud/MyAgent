@@ -36,10 +36,10 @@ export interface EnsureWithinBudgetResult {
 
 export interface SummaryAttemptLifecycle {
   onAttemptStarted(attemptNumber: number): void;
-  onAttemptFailed(attemptNumber: number, error: unknown): void;
+  onAttemptFailed(attemptNumber: number, error: unknown): void | Promise<void>;
   saveSummary(
     input: Parameters<SessionStore["saveSummary"]>[0],
-  ): ReturnType<SessionStore["saveSummary"]>;
+  ): ReturnType<SessionStore["saveSummary"]> | Promise<ReturnType<SessionStore["saveSummary"]>>;
 }
 
 export class SessionSummarizer {
@@ -86,7 +86,7 @@ export class SessionSummarizer {
     }
     const saveSummary = lifecycle?.saveSummary.bind(lifecycle) ??
       this.options.sessionStore.saveSummary.bind(this.options.sessionStore);
-    saveSummary({
+    await saveSummary({
       summaryId: `summary:${input.sessionId}:${String(lastMessage.sequence)}`,
       sessionId: input.sessionId,
       sourceMessageFrom:
@@ -147,7 +147,7 @@ export class SessionSummarizer {
         }
         return { text, usage, attempts: attempt };
       } catch (error) {
-        lifecycle?.onAttemptFailed(attempt, error);
+        await lifecycle?.onAttemptFailed(attempt, error);
         if (
           !(error instanceof ModelProviderError) ||
           !error.transient ||

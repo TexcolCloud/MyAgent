@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -55,6 +55,52 @@ describe("ProcessTree", () => {
   });
 
   it.skipIf(process.platform !== "win32")(
+    "assigns the target before an immediate descendant can escape the Job",
+    async () => {
+      const launcherPath = path.join(workspace, "spawn-immediately.cmd");
+      const pidPath = path.join(workspace, "immediate-descendant.pid");
+      const descendantScript = [
+        "const { writeFileSync } = require('node:fs');",
+        `writeFileSync('${pidPath.replaceAll("\\", "/")}', String(process.pid));`,
+        "setInterval(() => {}, 1000);",
+      ].join(" ");
+      await writeFile(
+        launcherPath,
+        [
+          "@echo off",
+          `start "" /b "${process.execPath}" -e "${descendantScript}"`,
+          ":wait_for_pid",
+          `if not exist "${pidPath}" goto wait_for_pid`,
+          ":wait_for_termination",
+          "%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul",
+          "goto wait_for_termination",
+        ].join("\r\n"),
+        "utf8",
+      );
+      const command = process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe";
+      const tree = ProcessTree.start(command, ["/d", "/c", launcherPath], {
+        cwd: workspace,
+        env: {},
+      });
+      const descendantPid = Number(await waitForFile(pidPath));
+      expect(Number.isInteger(descendantPid)).toBe(true);
+
+      const termination = tree.terminate(100).then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const escaped = isProcessRunning(descendantPid);
+      if (escaped) process.kill(descendantPid, "SIGKILL");
+      const terminated = await termination;
+      if (!terminated.ok) throw terminated.error;
+
+      expect(escaped).toBe(false);
+    },
+    10_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
     "treats process exit before inherited pipes close as already exited",
     async () => {
       const tree = ProcessTree.start(
@@ -104,6 +150,24 @@ async function expectProcessToExit(pid: number): Promise<void> {
       throw new Error(`process ${String(pid)} is still running`);
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+async function waitForFile(filePath: string): Promise<string> {
+  const deadline = Date.now() + 2_000;
+  while (true) {
+    try {
+      return await readFile(filePath, "utf8");
+    } catch (error) {
+      if (
+        typeof error !== "object" || error === null ||
+        !("code" in error) || error.code !== "ENOENT" ||
+        Date.now() >= deadline
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
   }
 }
 

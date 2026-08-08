@@ -29,27 +29,31 @@ export async function streamRunEvents(
   const faults = options.faults ?? noFaults;
   let nextHeartbeatAt = Date.now() + heartbeatMs;
   raw.once("close", () => { closed = true; });
-  const write = async (value: string): Promise<void> => {
+  const writeRaw = (value: string): boolean | undefined => {
     if (closed || raw.writableEnded) return;
+    return raw.write(value);
+  };
+  const waitForBackpressure = async (writable: boolean | undefined): Promise<void> => {
+    if (writable === false) await waitForDrainOrClose(raw);
+  };
+  const writePersistedEvent = async (value: string): Promise<void> => {
     await faults.hit("before_sse_write");
-    if (closed || raw.writableEnded) return;
-    const writable = raw.write(value);
+    const writable = writeRaw(value);
+    if (writable === undefined) return;
     await faults.hit("after_sse_write");
-    if (!writable) {
-      await waitForDrainOrClose(raw);
-    }
+    await waitForBackpressure(writable);
   };
   try {
     while (!closed && !raw.writableEnded) {
       const events = runs.listEventsAfter(runId, cursor);
       for (const event of events) {
-        await write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify({ runId: event.runId, sequence: event.sequence, type: event.type, occurredAt: event.occurredAt.toISOString(), payload: event.payload })}\n\n`);
+        await writePersistedEvent(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify({ runId: event.runId, sequence: event.sequence, type: event.type, occurredAt: event.occurredAt.toISOString(), payload: event.payload })}\n\n`);
         cursor = event.sequence;
       }
       if (TERMINAL.has(runs.getRun(runId).state)) break;
       const now = Date.now();
       if (now >= nextHeartbeatAt) {
-        await write(": heartbeat\n\n");
+        await waitForBackpressure(writeRaw(": heartbeat\n\n"));
         nextHeartbeatAt = Date.now() + heartbeatMs;
       }
       if (!closed) {

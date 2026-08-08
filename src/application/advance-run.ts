@@ -256,28 +256,32 @@ export class AdvanceRunService {
             occurredAt: now,
           });
         },
-        onAttemptFailed: (attemptNumber, error) => {
+        onAttemptFailed: async (attemptNumber, error) => {
           const attemptId = summaryAttemptIds.get(attemptNumber);
           if (attemptId === undefined) {
             throw new Error("summary_attempt_checkpoint_missing");
           }
           const providerError = asProviderError(error);
-          this.options.runs.failModelAttempt({
-            runId,
-            leaseOwner,
-            attemptId,
-            code: providerError.code,
-            transient: providerError.transient,
-            occurredAt: this.options.clock.now(),
+          await this.commitModelAttempt(() => {
+            this.options.runs.failModelAttempt({
+              runId,
+              leaseOwner,
+              attemptId,
+              code: providerError.code,
+              transient: providerError.transient,
+              occurredAt: this.options.clock.now(),
+            });
           });
         },
         saveSummary: (summaryInput) =>
-          this.options.sessions.saveSummaryWithLease({
-            runId,
-            leaseOwner,
-            occurredAt: this.options.clock.now(),
-            summary: summaryInput,
-          }),
+          this.commitModelAttempt(() =>
+            this.options.sessions.saveSummaryWithLease({
+              runId,
+              leaseOwner,
+              occurredAt: this.options.clock.now(),
+              summary: summaryInput,
+            })
+          ),
       });
       const cancellation = this.finalizeCancellation(runId, leaseOwner);
       if (cancellation !== null) return cancellation;
@@ -345,13 +349,15 @@ export class AdvanceRunService {
           throw error;
         }
         const providerError = asProviderError(error);
-        this.options.runs.failModelAttempt({
-          runId,
-          leaseOwner,
-          attemptId,
-          code: providerError.code,
-          transient: providerError.transient,
-          occurredAt: this.options.clock.now(),
+        await this.commitModelAttempt(() => {
+          this.options.runs.failModelAttempt({
+            runId,
+            leaseOwner,
+            attemptId,
+            code: providerError.code,
+            transient: providerError.transient,
+            occurredAt: this.options.clock.now(),
+          });
         });
         if (!providerError.transient || attemptNumber === MAX_MODEL_ATTEMPTS) {
           this.options.runs.failRun({
@@ -373,13 +379,15 @@ export class AdvanceRunService {
       if (completed.toolCall !== undefined) {
         if (context.run.budget.toolCalls >= context.revision.limits.toolCalls) {
           const occurredAt = this.options.clock.now();
-          this.options.runs.failModelAttempt({
-            runId,
-            leaseOwner,
-            attemptId,
-            code: "run_budget_exceeded",
-            transient: false,
-            occurredAt,
+          await this.commitModelAttempt(() => {
+            this.options.runs.failModelAttempt({
+              runId,
+              leaseOwner,
+              attemptId,
+              code: "run_budget_exceeded",
+              transient: false,
+              occurredAt,
+            });
           });
           return this.failForBudget(runId, leaseOwner, occurredAt);
         }
@@ -405,41 +413,41 @@ export class AdvanceRunService {
           policy: context.revision.policy,
           policyFacts: proposal.policyFacts,
         });
-        await this.faults.hit("before_model_attempt_commit");
-        this.options.tools.recordProposal({
-          runId,
-          leaseOwner,
-          toolCallId: this.options.ids.toolCallId(),
-          toolName: proposal.toolName,
-          effect: proposal.effect,
-          arguments: proposal.arguments,
-          canonicalArguments: proposal.canonicalArguments,
-          argumentsSha256: proposal.argumentsSha256,
-          policyFacts: proposal.policyFacts,
-          policyEffect: decision.effect,
-          matchedRule: decision.matchedRule,
-          toolCallLimit: context.revision.limits.toolCalls,
-          ...(decision.effect === "ask" ? {
-            approvalId: this.options.ids.approvalId(),
-            approvalExpiresAt: new Date(this.options.clock.now().getTime() + 24 * 60 * 60 * 1_000),
-          } : {}),
-          occurredAt: this.options.clock.now(),
+        await this.commitModelAttempt(() => {
+          this.options.tools.recordProposal({
+            runId,
+            leaseOwner,
+            toolCallId: this.options.ids.toolCallId(),
+            toolName: proposal.toolName,
+            effect: proposal.effect,
+            arguments: proposal.arguments,
+            canonicalArguments: proposal.canonicalArguments,
+            argumentsSha256: proposal.argumentsSha256,
+            policyFacts: proposal.policyFacts,
+            policyEffect: decision.effect,
+            matchedRule: decision.matchedRule,
+            toolCallLimit: context.revision.limits.toolCalls,
+            ...(decision.effect === "ask" ? {
+              approvalId: this.options.ids.approvalId(),
+              approvalExpiresAt: new Date(this.options.clock.now().getTime() + 24 * 60 * 60 * 1_000),
+            } : {}),
+            occurredAt: this.options.clock.now(),
+          });
         });
-        await this.faults.hit("after_model_attempt_commit");
         if (decision.effect === "ask") {
           return { type: "waiting", runId, state: "waiting_approval" };
         }
         return { type: "advanced", runId };
       }
-      await this.faults.hit("before_model_attempt_commit");
-      const run = this.options.runs.completeRun({
-        runId,
-        leaseOwner,
-        attemptId,
-        ...completed,
-        occurredAt: this.options.clock.now(),
-      });
-      await this.faults.hit("after_model_attempt_commit");
+      const run = await this.commitModelAttempt(() =>
+        this.options.runs.completeRun({
+          runId,
+          leaseOwner,
+          attemptId,
+          ...completed,
+          occurredAt: this.options.clock.now(),
+        })
+      );
       return { type: "terminal", runId, state: run.state as "completed" };
     }
     throw new Error("unreachable_model_attempt_loop");
@@ -457,6 +465,13 @@ export class AdvanceRunService {
       occurredAt,
     });
     return { type: "terminal", runId, state: "failed" };
+  }
+
+  private async commitModelAttempt<T>(commit: () => T): Promise<T> {
+    await this.faults.hit("before_model_attempt_commit");
+    const result = commit();
+    await this.faults.hit("after_model_attempt_commit");
+    return result;
   }
 
   private async collectAttempt(

@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { RunId } from "../../src/domain/ids.js";
 import { streamRunEvents } from "../../src/interfaces/http/sse.js";
+import type { FaultPoint } from "../../src/runtime/fault-injector.js";
 import { startTestApp } from "../helpers/start-test-app.js";
 
 describe("SSE", () => {
@@ -39,6 +40,7 @@ describe("SSE", () => {
   it("emits a heartbeat at 15 seconds and stops polling on disconnect", async () => {
     vi.useFakeTimers();
     const response = new FakeResponse();
+    const faultPoints: FaultPoint[] = [];
     const runs = {
       getRun: () => ({ state: "running" }),
       listEventsAfter: vi.fn(() => []),
@@ -48,10 +50,12 @@ describe("SSE", () => {
       response as never,
       "run_sse_heartbeat" as RunId,
       runs as never,
+      { faults: { hit: async (point) => { faultPoints.push(point); } } },
     );
     try {
       await vi.advanceTimersByTimeAsync(15_000);
       expect(response.writes).toContain(": heartbeat\n\n");
+      expect(faultPoints).toEqual([]);
       const callsAtDisconnect = runs.listEventsAfter.mock.calls.length;
       response.emit("close");
       await vi.advanceTimersByTimeAsync(200);
@@ -60,6 +64,33 @@ describe("SSE", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("wraps each persisted event write with fault boundaries", async () => {
+    const response = new FakeResponse();
+    const faultPoints: FaultPoint[] = [];
+    const runs = {
+      getRun: () => ({ state: "completed" }),
+      listEventsAfter: () => [{
+        runId: "run_sse_persisted",
+        sequence: 1,
+        type: "run.completed",
+        occurredAt: new Date("2026-08-07T00:00:00.000Z"),
+        payload: { result: "done" },
+      }],
+    };
+
+    await streamRunEvents(
+      { headers: {} } as never,
+      response as never,
+      "run_sse_persisted" as RunId,
+      runs as never,
+      { faults: { hit: async (point) => { faultPoints.push(point); } } },
+    );
+
+    expect(faultPoints).toEqual(["before_sse_write", "after_sse_write"]);
+    expect(response.writes).toHaveLength(1);
+    expect(response.writes[0]).toContain("event: run.completed");
   });
 
   it("does not hang when a backpressured client disconnects before drain", async () => {
