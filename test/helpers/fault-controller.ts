@@ -21,7 +21,8 @@ const MODEL_SECRET = "e2e-provider-secret";
 export type ProviderTurn =
   | { type: "tool"; name: string; arguments: JsonValue }
   | { type: "text"; text: string }
-  | { type: "held_text"; text: string };
+  | { type: "held_text"; text: string }
+  | { type: "error"; status: number; code: string };
 
 export interface CapturedProviderRequest {
   model?: unknown;
@@ -79,6 +80,18 @@ export class ScriptedChatServer {
     if (turn === undefined) {
       response.writeHead(500, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: { code: "scripted_turn_missing" } }));
+      return;
+    }
+
+    if (turn.type === "error") {
+      response.writeHead(turn.status, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        error: {
+          message: turn.code,
+          type: "scripted_provider_error",
+          code: turn.code,
+        },
+      }));
       return;
     }
 
@@ -354,6 +367,7 @@ export class FaultChildController {
   readonly armPath: string;
   readonly hitPath: string;
   readonly readyPath: string;
+  readonly modelAckPath: string;
 
   #child: ChildProcess | undefined;
   #completed: Promise<void> | undefined;
@@ -361,11 +375,14 @@ export class FaultChildController {
 
   constructor(
     private readonly fixture: Pick<E2eFixture, "configPath" | "root">,
-    readonly point: FaultPoint,
+    readonly point: FaultPoint | undefined,
+    private readonly modelAckMarker?: string,
   ) {
-    this.armPath = path.join(fixture.root, `${point}.arm`);
-    this.hitPath = path.join(fixture.root, `${point}.hit`);
-    this.readyPath = path.join(fixture.root, `${point}.ready`);
+    const label = point ?? "no-fault";
+    this.armPath = path.join(fixture.root, `${label}.arm`);
+    this.hitPath = path.join(fixture.root, `${label}.hit`);
+    this.readyPath = path.join(fixture.root, `${label}.ready`);
+    this.modelAckPath = path.join(fixture.root, `${label}.model-ack`);
   }
 
   get url(): string {
@@ -393,10 +410,18 @@ export class FaultChildController {
             `--require=${userInfoShim}`,
           ].filter(Boolean).join(" "),
           MYAGENT_FAULT_CONFIG: this.fixture.configPath,
-          MYAGENT_FAULT_POINT: this.point,
           MYAGENT_FAULT_ARM: this.armPath,
           MYAGENT_FAULT_HIT: this.hitPath,
           MYAGENT_FAULT_READY: this.readyPath,
+          ...(this.point === undefined
+            ? {}
+            : { MYAGENT_FAULT_POINT: this.point }),
+          ...(this.modelAckMarker === undefined
+            ? {}
+            : {
+                MYAGENT_MODEL_ACK_MARKER: this.modelAckMarker,
+                MYAGENT_MODEL_ACK_PATH: this.modelAckPath,
+              }),
         },
         stdio: ["ignore", "ignore", "pipe"],
         windowsHide: true,
@@ -422,11 +447,20 @@ export class FaultChildController {
   }
 
   async arm(): Promise<void> {
+    if (this.point === undefined) throw new Error("fault_point_not_configured");
     await writeFile(this.armPath, this.point, "utf8");
   }
 
   async waitForHit(timeoutMs = 15_000): Promise<void> {
+    if (this.point === undefined) throw new Error("fault_point_not_configured");
     await waitForPath(this.hitPath, timeoutMs);
+  }
+
+  async waitForModelAck(timeoutMs = 15_000): Promise<void> {
+    if (this.modelAckMarker === undefined) {
+      throw new Error("model_ack_not_configured");
+    }
+    await waitForPath(this.modelAckPath, timeoutMs);
   }
 
   async crash(): Promise<void> {

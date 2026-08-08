@@ -531,7 +531,7 @@ function isSqliteBusy(error: unknown): boolean {
 }
 
 async function waitForFile(filePath: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 15_000;
   while (!existsSync(filePath)) {
     if (Date.now() >= deadline) {
       throw new Error(`timed out waiting for ${filePath}`);

@@ -109,6 +109,8 @@ export interface RunStore {
     occurredAt: Date,
   ): void;
   failModelAttempt(input: FailModelAttemptInput): void;
+  failModelAttemptAndRun(input: FailModelAttemptInput): Run;
+  getUnmatchedModelAttempt(runId: RunId): AttemptId | null;
   recoverUnmatchedModelAttempt(input: {
     runId: RunId;
     leaseOwner: string;

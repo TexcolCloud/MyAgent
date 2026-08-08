@@ -636,6 +636,7 @@ describe("AdvanceRunService", () => {
       connection.db.prepare(
         "UPDATE runs SET tool_call_count = 1 WHERE run_id = ?",
       ).run(created.runId);
+      const crash = new Error("simulated_crash_after_terminal_attempt_commit");
       const fakeTool = new FakeTool({
         name: "read_file",
         effect: "read_only",
@@ -669,15 +670,21 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        faults: {
+          async hit(point): Promise<void> {
+            if (point === "after_model_attempt_commit") throw crash;
+          },
+        },
       });
 
-      expect(await service.advance(
+      await expect(service.advance(
         created.runId,
         "worker-unit",
         new AbortController().signal,
-      )).toEqual({ type: "terminal", runId: created.runId, state: "failed" });
+      )).rejects.toBe(crash);
+      expect(runs.getRun(created.runId).state).toBe("failed");
       expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
-        .toContain("run.failed");
+        .toEqual(expect.arrayContaining(["model.attempt.failed", "run.failed"]));
       expect(tools.getLatestForRun(created.runId)).toBeNull();
       expect(fakeTool.executions).toBe(0);
     } finally {
@@ -1398,6 +1405,189 @@ describe("AdvanceRunService", () => {
     }
   });
 
+  it("atomically fails the Run when transient provider retries are exhausted", async () => {
+    const connection = openDatabase({
+      path: tempPath("advance-provider-retries-exhausted.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000142")],
+        runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000142")],
+        attemptIds: [
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000142"),
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000143"),
+          attemptIdFromUuid("00000000-0000-7000-8000-000000000144"),
+        ],
+      });
+      const created = new CreateRunService(
+        new CatalogService(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:provider-retries-exhausted",
+        input: { type: "text", text: "fail after bounded retries" },
+        idempotencyKey: "advance-provider-0002",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const model = new ScriptedModel();
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        model.script({
+          chunks: [],
+          error: new ModelProviderError({
+            transient: true,
+            code: "provider_overloaded",
+            status: 503,
+          }),
+        });
+      }
+      const crash = new Error("simulated_crash_after_terminal_attempt_commit");
+      let completedAttemptCommits = 0;
+      const service = new AdvanceRunService({
+        runs,
+        tools: new SqliteToolRepository(connection.db),
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry: new ToolRegistry(),
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        faults: {
+          async hit(point): Promise<void> {
+            if (point !== "after_model_attempt_commit") return;
+            completedAttemptCommits += 1;
+            if (completedAttemptCommits === 3) throw crash;
+          },
+        },
+      });
+
+      await expect(service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).rejects.toBe(crash);
+      expect(model.requests).toHaveLength(3);
+      expect(runs.getRun(created.runId).state).toBe("failed");
+      const eventTypes = runs.listEventsAfter(created.runId, 0)
+        .map((event) => event.type);
+      expect(eventTypes.filter((type) => type === "model.attempt.started"))
+        .toHaveLength(3);
+      expect(eventTypes.filter((type) => type === "model.attempt.failed"))
+        .toHaveLength(3);
+      expect(eventTypes.filter((type) => type === "run.failed")).toHaveLength(1);
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("atomically fails the Run when a Summary attempt terminates", async () => {
+    const connection = openDatabase({
+      path: tempPath("advance-summary-terminal-failure.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const snapshot = withModelInputLimit(catalogSnapshot, 2_000);
+      const catalog = new SqliteCatalogRepository(connection.db);
+      const runs = new SqliteRunRepository(connection.db, catalog);
+      const sessions = new SqliteSessionRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000145")],
+        runIds: [
+          runIdFromUuid("00000000-0000-7000-8000-000000000145"),
+          runIdFromUuid("00000000-0000-7000-8000-000000000146"),
+        ],
+        attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000145")],
+      });
+      const create = new CreateRunService(
+        new CatalogService(snapshot),
+        runs,
+        clock,
+        ids,
+      );
+      const historical = create.execute({
+        agentId: "primary",
+        sessionKey: "unit:summary-terminal-failure",
+        input: { type: "text", text: "old context ".repeat(2_000) },
+        idempotencyKey: "advance-summary-terminal-0001",
+        source: { kind: "http" },
+      });
+      connection.db.prepare(
+        "UPDATE runs SET state = 'completed' WHERE run_id = ?",
+      ).run(historical.runId);
+      const created = create.execute({
+        agentId: "primary",
+        sessionKey: "unit:summary-terminal-failure",
+        input: { type: "text", text: "summarize or fail durably" },
+        idempotencyKey: "advance-summary-terminal-0002",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const model = new ScriptedModel();
+      model.script({
+        chunks: [],
+        error: new ModelProviderError({
+          transient: false,
+          code: "provider_request_invalid",
+          status: 400,
+        }),
+      });
+      const crash = new Error("simulated_crash_after_terminal_attempt_commit");
+      const service = new AdvanceRunService({
+        runs,
+        tools: new SqliteToolRepository(connection.db),
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry: new ToolRegistry(),
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        faults: {
+          async hit(point): Promise<void> {
+            if (point === "after_model_attempt_commit") throw crash;
+          },
+        },
+      });
+
+      await expect(service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).rejects.toBe(crash);
+      expect(model.requests.map((request) => request.purpose))
+        .toEqual(["session_summary"]);
+      expect(runs.getRun(created.runId).state).toBe("failed");
+      expect(sessions.getCurrentSummary(created.sessionId)).toBeNull();
+      expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
+        .toEqual(expect.arrayContaining(["model.attempt.failed", "run.failed"]));
+    } finally {
+      connection.close();
+    }
+  });
+
   it("persists a permanent provider failure as a failed Run", async () => {
     const connection = openDatabase({
       path: tempPath("advance-provider-failure.db"),
@@ -1441,6 +1631,7 @@ describe("AdvanceRunService", () => {
           status: 400,
         }),
       });
+      const crash = new Error("simulated_crash_after_terminal_attempt_commit");
       const service = new AdvanceRunService({
         runs,
         tools: new SqliteToolRepository(connection.db),
@@ -1452,13 +1643,20 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        faults: {
+          async hit(point): Promise<void> {
+            if (point === "after_model_attempt_commit") throw crash;
+          },
+        },
       });
 
-      expect(await service.advance(
+      await expect(service.advance(
         created.runId,
         "worker-unit",
         new AbortController().signal,
-      )).toEqual({ type: "terminal", runId: created.runId, state: "failed" });
+      )).rejects.toBe(crash);
+      expect(model.requests).toHaveLength(1);
+      expect(runs.getRun(created.runId).state).toBe("failed");
       expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
         .toEqual(expect.arrayContaining(["model.attempt.failed", "run.failed"]));
       expect(

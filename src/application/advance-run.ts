@@ -74,17 +74,21 @@ export class AdvanceRunService {
     return this.activeAbortSafety.get(runId) ?? true;
   }
 
-  finalizeCancellation(
+  async finalizeCancellation(
     runId: RunId,
     leaseOwner: string,
-  ): AdvanceOutcome | null {
+  ): Promise<AdvanceOutcome | null> {
     const context = this.options.runs.getExecutionContext(runId);
     if (context.cancellationRequestedAt === null) return null;
-    const run = this.options.runs.finalizeCancellation({
-      runId,
-      leaseOwner,
-      occurredAt: this.options.clock.now(),
-    });
+    const finalize = () =>
+      this.options.runs.finalizeCancellation({
+        runId,
+        leaseOwner,
+        occurredAt: this.options.clock.now(),
+      });
+    const run = this.options.runs.getUnmatchedModelAttempt(runId) === null
+      ? finalize()
+      : await this.commitModelAttempt(finalize);
     return outcomeForState(run.runId, run.state);
   }
 
@@ -100,19 +104,22 @@ export class AdvanceRunService {
       return outcomeForState(context.run.runId, context.run.state);
     }
     if (context.cancellationRequestedAt !== null) {
-      const cancellation = this.finalizeCancellation(runId, leaseOwner);
+      const cancellation = await this.finalizeCancellation(runId, leaseOwner);
       if (cancellation === null) throw new DomainError("run_cancellation_not_requested");
       return cancellation;
     }
     if (this.options.approvals.getPendingForRun(runId) !== null) {
       return { type: "waiting", runId, state: "waiting_approval" };
     }
-    if (this.options.runs.recoverUnmatchedModelAttempt({
-      runId,
-      leaseOwner,
-      occurredAt: this.options.clock.now(),
-    }) !== null) {
-      return { type: "advanced", runId };
+    if (this.options.runs.getUnmatchedModelAttempt(runId) !== null) {
+      const recovered = await this.commitModelAttempt(() =>
+        this.options.runs.recoverUnmatchedModelAttempt({
+          runId,
+          leaseOwner,
+          occurredAt: this.options.clock.now(),
+        })
+      );
+      if (recovered !== null) return { type: "advanced", runId };
     }
     const latestTool = this.options.tools.getLatestForRun(runId);
     if (latestTool?.state === "executing") {
@@ -187,7 +194,7 @@ export class AdvanceRunService {
         maxRunToolOutputBytes: context.revision.limits.maxRunToolOutputBytes,
         occurredAt: this.options.clock.now(),
       });
-      const cancellation = this.finalizeCancellation(runId, leaseOwner);
+      const cancellation = await this.finalizeCancellation(runId, leaseOwner);
       if (cancellation !== null) return cancellation;
       if (this.options.runs.getRun(runId).state === "failed") {
         return { type: "terminal", runId, state: "failed" };
@@ -256,14 +263,17 @@ export class AdvanceRunService {
             occurredAt: now,
           });
         },
-        onAttemptFailed: async (attemptNumber, error) => {
+        onAttemptFailed: async (attemptNumber, error, willRetry) => {
           const attemptId = summaryAttemptIds.get(attemptNumber);
           if (attemptId === undefined) {
             throw new Error("summary_attempt_checkpoint_missing");
           }
           const providerError = asProviderError(error);
           await this.commitModelAttempt(() => {
-            this.options.runs.failModelAttempt({
+            const failAttempt = willRetry
+              ? this.options.runs.failModelAttempt.bind(this.options.runs)
+              : this.options.runs.failModelAttemptAndRun.bind(this.options.runs);
+            failAttempt({
               runId,
               leaseOwner,
               attemptId,
@@ -283,7 +293,7 @@ export class AdvanceRunService {
             })
           ),
       });
-      const cancellation = this.finalizeCancellation(runId, leaseOwner);
+      const cancellation = await this.finalizeCancellation(runId, leaseOwner);
       if (cancellation !== null) return cancellation;
       request = summary.request;
       if (summary.summarized) {
@@ -296,12 +306,6 @@ export class AdvanceRunService {
         return { type: "terminal", runId, state: "failed" };
       }
       if (error instanceof ModelProviderError) {
-        this.options.runs.failRun({
-          runId,
-          leaseOwner,
-          code: error.code,
-          occurredAt: this.options.clock.now(),
-        });
         return { type: "terminal", runId, state: "failed" };
       }
       throw error;
@@ -341,7 +345,7 @@ export class AdvanceRunService {
         );
       } catch (error) {
         if (signal.aborted) {
-          const cancellation = this.finalizeCancellation(runId, leaseOwner);
+          const cancellation = await this.finalizeCancellation(runId, leaseOwner);
           if (cancellation !== null) return cancellation;
           throw signal.reason;
         }
@@ -349,8 +353,13 @@ export class AdvanceRunService {
           throw error;
         }
         const providerError = asProviderError(error);
+        const terminalFailure = !providerError.transient ||
+          attemptNumber === MAX_MODEL_ATTEMPTS;
         await this.commitModelAttempt(() => {
-          this.options.runs.failModelAttempt({
+          const failAttempt = terminalFailure
+            ? this.options.runs.failModelAttemptAndRun.bind(this.options.runs)
+            : this.options.runs.failModelAttempt.bind(this.options.runs);
+          failAttempt({
             runId,
             leaseOwner,
             attemptId,
@@ -359,13 +368,7 @@ export class AdvanceRunService {
             occurredAt: this.options.clock.now(),
           });
         });
-        if (!providerError.transient || attemptNumber === MAX_MODEL_ATTEMPTS) {
-          this.options.runs.failRun({
-            runId,
-            leaseOwner,
-            code: providerError.code,
-            occurredAt: this.options.clock.now(),
-          });
+        if (terminalFailure) {
           return { type: "terminal", runId, state: "failed" };
         }
         await this.options.clock.sleep(
@@ -374,13 +377,13 @@ export class AdvanceRunService {
         );
         continue;
       }
-      const cancellation = this.finalizeCancellation(runId, leaseOwner);
+      const cancellation = await this.finalizeCancellation(runId, leaseOwner);
       if (cancellation !== null) return cancellation;
       if (completed.toolCall !== undefined) {
         if (context.run.budget.toolCalls >= context.revision.limits.toolCalls) {
           const occurredAt = this.options.clock.now();
           await this.commitModelAttempt(() => {
-            this.options.runs.failModelAttempt({
+            this.options.runs.failModelAttemptAndRun({
               runId,
               leaseOwner,
               attemptId,
@@ -389,7 +392,7 @@ export class AdvanceRunService {
               occurredAt,
             });
           });
-          return this.failForBudget(runId, leaseOwner, occurredAt);
+          return { type: "terminal", runId, state: "failed" };
         }
         const proposal = await normalizeToolProposal({
           registry: this.options.registry,
@@ -400,7 +403,7 @@ export class AdvanceRunService {
             revision: context.revision,
           },
         });
-        const cancellationAfterNormalization = this.finalizeCancellation(
+        const cancellationAfterNormalization = await this.finalizeCancellation(
           runId,
           leaseOwner,
         );

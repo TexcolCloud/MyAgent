@@ -125,6 +125,48 @@ describe("durable fault boundaries", () => {
     }
   }, 30_000);
 
+  it("does not retry a permanently failed attempt after the terminal commit", async () => {
+    const provider = await ScriptedChatServer.start([
+      {
+        type: "error",
+        status: 400,
+        code: "provider_request_invalid",
+      },
+    ]);
+    const fixture = await prepareE2eFixture(provider.baseUrl);
+    const child = new FaultChildController(fixture, "after_model_attempt_commit");
+    const recovery = new E2eServiceController(fixture.configPath);
+    const faultClient = new AgentHttpClient(() => child.url);
+    const recoveryClient = new AgentHttpClient(() => recovery.url);
+
+    try {
+      await child.start();
+      await child.arm();
+      const run = await faultClient.createRun({
+        agentId: "primary",
+        sessionKey: "fault:permanent-provider-failure",
+        text: "fail once and remain terminal",
+        idempotencyKey: "fault-permanent-provider-failure-0001",
+      });
+      await child.waitForHit();
+      expect(provider.requests).toHaveLength(1);
+      expect(readRunState(fixture.databasePath, run.runId)).toBe("failed");
+      expect(readRunEventTypes(fixture.databasePath, run.runId))
+        .toEqual(expect.arrayContaining(["model.attempt.failed", "run.failed"]));
+      await child.crash();
+
+      await waitForLeaseExpiry();
+      await recovery.start();
+      await recoveryClient.waitForStatus(run.runId, "failed", 20_000);
+      expect(provider.requests).toHaveLength(1);
+    } finally {
+      await child.stop();
+      await recovery.stop();
+      await fixture.cleanup();
+      await provider.close();
+    }
+  }, 30_000);
+
   it.each([
     {
       point: "before_model_attempt_commit" as const,
@@ -364,7 +406,7 @@ describe("durable fault boundaries", () => {
       { type: "text", text: durableMarker },
     ]);
     const fixture = await prepareE2eFixture(provider.baseUrl);
-    const child = new FaultChildController(fixture, "before_model_attempt_commit");
+    const child = new FaultChildController(fixture, undefined, transientMarker);
     const recovery = new E2eServiceController(fixture.configPath);
     const faultClient = new AgentHttpClient(() => child.url);
     const recoveryClient = new AgentHttpClient(() => recovery.url);
@@ -377,7 +419,7 @@ describe("durable fault boundaries", () => {
         text: "discard only output that was never committed",
         idempotencyKey: "fault-transient-model-output-0001",
       });
-      await expect(provider.heldTextWritten).resolves.toBe(transientMarker);
+      await child.waitForModelAck();
       expect(provider.requests).toHaveLength(1);
       expect(readRunEvents(fixture.databasePath, run.runId)).not.toContain(
         transientMarker,
@@ -527,6 +569,19 @@ function readRunEventTypes(databasePath: string, runId: string): string[] {
     return (database.prepare(
       "SELECT event_type FROM run_events WHERE run_id = ? ORDER BY sequence",
     ).all(runId) as Array<{ event_type: string }>).map((row) => row.event_type);
+  } finally {
+    database.close();
+  }
+}
+
+function readRunState(databasePath: string, runId: string): string {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const row = database.prepare(
+      "SELECT state FROM runs WHERE run_id = ?",
+    ).get(runId) as { state: string } | undefined;
+    if (row === undefined) throw new Error(`run_missing:${runId}`);
+    return row.state;
   } finally {
     database.close();
   }

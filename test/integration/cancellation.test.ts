@@ -25,6 +25,7 @@ import {
 } from "../../src/domain/ids.js";
 import { ExecutionRegistry } from "../../src/runtime/execution-registry.js";
 import { RunWorker } from "../../src/runtime/run-worker.js";
+import type { FaultPoint } from "../../src/runtime/fault-injector.js";
 import type { ModelChunk, ModelPort, ModelRequest } from "../../src/ports/model.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
@@ -40,7 +41,7 @@ describe("Run cancellation", () => {
     );
   });
 
-  it("publishes run.cancelled only when a durable running request becomes terminal", () => {
+  it("publishes run.cancelled only when a durable running request becomes terminal", async () => {
     const connection = openDatabase({
       path: tempPath("cancel-running.db"),
       busyTimeoutMs: 5_000,
@@ -81,6 +82,7 @@ describe("Run cancellation", () => {
       expect(
         runs.listEventsAfter(runId, 0).filter((event) => event.type === "run.cancelled"),
       ).toEqual([]);
+      const hookPoints: FaultPoint[] = [];
       const advance = new AdvanceRunService({
         runs,
         tools,
@@ -92,13 +94,19 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        faults: {
+          async hit(point): Promise<void> {
+            hookPoints.push(point);
+          },
+        },
       });
 
-      expect(advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
+      expect(await advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
         type: "terminal",
         runId,
         state: "cancelled",
       });
+      expect(hookPoints).toEqual([]);
       expect(runs.getRun(runId).state).toBe("cancelled");
       expect(
         runs.listEventsAfter(runId, 0).filter((event) => event.type === "run.cancelled"),
@@ -108,7 +116,7 @@ describe("Run cancellation", () => {
     }
   });
 
-  it("routes an interrupted side effect to reconciliation instead of cancellation", () => {
+  it("routes an interrupted side effect to reconciliation instead of cancellation", async () => {
     const connection = openDatabase({
       path: tempPath("cancel-side-effect.db"),
       busyTimeoutMs: 5_000,
@@ -167,7 +175,7 @@ describe("Run cancellation", () => {
         ids: new FakeIds(),
       });
 
-      expect(advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
+      expect(await advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
         type: "waiting",
         runId,
         state: "waiting_reconciliation",
@@ -188,7 +196,7 @@ describe("Run cancellation", () => {
     }
   });
 
-  it("fails an interrupted read-only Tool and cancels the Run", () => {
+  it("fails an interrupted read-only Tool and cancels the Run", async () => {
     const connection = openDatabase({
       path: tempPath("cancel-read-only.db"),
       busyTimeoutMs: 5_000,
@@ -243,7 +251,7 @@ describe("Run cancellation", () => {
         ids: new FakeIds(),
       });
 
-      expect(advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
+      expect(await advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
         type: "terminal",
         runId,
         state: "cancelled",
@@ -538,6 +546,11 @@ describe("Run cancellation", () => {
         new Date(clock.now().getTime() + 30_000),
       );
       const model = new CompletingAfterAbortModel();
+      const faultSnapshots: Array<{
+        point: FaultPoint;
+        failedAttempts: number;
+        runState: string;
+      }> = [];
       const advance = new AdvanceRunService({
         runs,
         tools: new SqliteToolRepository(connection.db),
@@ -549,6 +562,17 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        faults: {
+          async hit(point): Promise<void> {
+            faultSnapshots.push({
+              point,
+              failedAttempts: runs.listEventsAfter(runId, 0).filter(
+                (event) => event.type === "model.attempt.failed",
+              ).length,
+              runState: runs.getRun(runId).state,
+            });
+          },
+        },
       });
       const controller = new AbortController();
       const advancing = advance.advance(runId, "cancel-worker", controller.signal);
@@ -562,6 +586,18 @@ describe("Run cancellation", () => {
         runId,
         state: "cancelled",
       });
+      expect(faultSnapshots).toEqual([
+        {
+          point: "before_model_attempt_commit",
+          failedAttempts: 0,
+          runState: "running",
+        },
+        {
+          point: "after_model_attempt_commit",
+          failedAttempts: 1,
+          runState: "cancelled",
+        },
+      ]);
       expect(
         sessions.listMessagesThroughRun(sessionId, 0).filter(
           (message) => message.role === "assistant",

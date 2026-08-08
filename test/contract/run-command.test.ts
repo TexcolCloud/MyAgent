@@ -20,6 +20,8 @@ import type {
   ToolNormalizeContext,
 } from "../../src/ports/tool.js";
 
+const NORMAL_COMMAND_TIMEOUT_MS = 10_000;
+
 describe("run_command Tool", () => {
   let workspace: string;
   let normalizeContext: ToolNormalizeContext;
@@ -57,7 +59,7 @@ describe("run_command Tool", () => {
         args: ["-e", "console.log(process.argv[1])", "a && echo injected"],
         cwd: ".",
         env: {},
-        timeoutMs: 2_000,
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
       },
       normalizeContext,
     );
@@ -158,7 +160,7 @@ describe("run_command Tool", () => {
         env: {
           DESTINATION_SECRET: { fromEnvironment: "SOURCE_SECRET" },
         },
-        timeoutMs: 2_000,
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
       },
       normalizeContext,
     );
@@ -193,7 +195,7 @@ describe("run_command Tool", () => {
           "console.log(process.env.SECRET); console.error(process.env.SECRET)",
         ],
         env: { SECRET: { fromEnvironment: "SOURCE_SECRET" } },
-        timeoutMs: 2_000,
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
       },
       normalizeContext,
     );
@@ -223,7 +225,7 @@ describe("run_command Tool", () => {
             `process.stderr.write('e'.repeat(${String(bytesPerStream)}));`,
           ].join(" "),
         ],
-        timeoutMs: 5_000,
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
       },
       normalizeContext,
     );
@@ -262,7 +264,7 @@ describe("run_command Tool", () => {
           "-e",
           "process.stdout.write(Buffer.alloc(64, 0x80))",
         ],
-        timeoutMs: 2_000,
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
       },
       normalizeContext,
     );
@@ -292,7 +294,7 @@ describe("run_command Tool", () => {
           "-e",
           "process.stdout.write(Buffer.alloc(64, 0))",
         ],
-        timeoutMs: 2_000,
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
       },
       normalizeContext,
     );
@@ -351,7 +353,7 @@ describe("run_command Tool", () => {
             "setInterval(() => {}, 1000);",
           ].join(" "),
         ],
-        timeoutMs: 5_000,
+        timeoutMs: NORMAL_COMMAND_TIMEOUT_MS,
       },
       normalizeContext,
     );

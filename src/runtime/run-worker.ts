@@ -112,7 +112,10 @@ export class RunWorker {
         let cancellationFailure: unknown;
         if (controller.signal.aborted) {
           try {
-            cancellation = this.options.advance.finalizeCancellation(run.runId, leaseOwner);
+            cancellation = await this.options.advance.finalizeCancellation(
+              run.runId,
+              leaseOwner,
+            );
           } catch (finalizationError) {
             cancellationFailure = finalizationError;
           }

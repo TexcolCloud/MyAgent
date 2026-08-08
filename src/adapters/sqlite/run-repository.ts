@@ -488,17 +488,21 @@ export class SqliteRunRepository implements RunStore {
     const occurredAt = input.occurredAt.toISOString();
     this.inImmediateTransaction(() => {
       this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
-      this.appendEventInTransaction(
-        input.runId,
-        "model.attempt.failed",
-        canonicalize({
-          attemptId: input.attemptId,
-          code: input.code,
-          transient: input.transient,
-        }),
-        occurredAt,
-      );
+      this.failModelAttemptInTransaction(input, occurredAt);
     });
+  }
+
+  failModelAttemptAndRun(input: FailModelAttemptInput): Run {
+    const occurredAt = input.occurredAt.toISOString();
+    return this.inImmediateTransaction(() => {
+      this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
+      this.failModelAttemptInTransaction(input, occurredAt);
+      return this.failRunInTransaction(input, occurredAt);
+    });
+  }
+
+  getUnmatchedModelAttempt(runId: RunId): AttemptId | null {
+    return this.findUnmatchedModelAttempt(runId);
   }
 
   recoverUnmatchedModelAttempt(input: {
@@ -509,62 +513,21 @@ export class SqliteRunRepository implements RunStore {
     const occurredAt = input.occurredAt.toISOString();
     return this.inImmediateTransaction(() => {
       this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
-      const attempt = this.db.prepare(
-        `SELECT started.sequence,
-                json_extract(started.payload_json, '$.attemptId') AS attempt_id
-         FROM run_events AS started
-         WHERE started.run_id = ?
-           AND started.event_type = 'model.attempt.started'
-           AND NOT EXISTS (
-             SELECT 1 FROM run_events AS failed
-             WHERE failed.run_id = started.run_id
-               AND failed.event_type = 'model.attempt.failed'
-               AND json_extract(failed.payload_json, '$.attemptId') =
-                   json_extract(started.payload_json, '$.attemptId')
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM run_events AS completed
-             WHERE completed.run_id = started.run_id
-               AND completed.event_type = 'message.completed'
-               AND json_extract(completed.payload_json, '$.attemptId') =
-                   json_extract(started.payload_json, '$.attemptId')
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM run_events AS proposed
-             WHERE proposed.run_id = started.run_id
-               AND proposed.event_type = 'tool.proposed'
-               AND proposed.sequence > started.sequence
-           )
-           AND (
-             json_extract(started.payload_json, '$.purpose') <> 'session_summary'
-             OR NOT EXISTS (
-               SELECT 1
-               FROM runs AS summary_run
-               JOIN session_summaries AS summary
-                 ON summary.session_id = summary_run.session_id
-               WHERE summary_run.run_id = started.run_id
-                 AND summary.created_at >= started.created_at
-             )
-           )
-         ORDER BY started.sequence DESC
-         LIMIT 1`,
-      ).get(input.runId) as
-        | { sequence: number; attempt_id: string }
-        | undefined;
-      if (attempt === undefined) {
+      const attemptId = this.findUnmatchedModelAttempt(input.runId);
+      if (attemptId === null) {
         return null;
       }
       this.appendEventInTransaction(
         input.runId,
         "model.attempt.failed",
         canonicalize({
-          attemptId: attempt.attempt_id,
+          attemptId,
           code: "model_attempt_abandoned",
           transient: true,
         }),
         occurredAt,
       );
-      return attempt.attempt_id as AttemptId;
+      return attemptId;
     });
   }
 
@@ -572,15 +535,7 @@ export class SqliteRunRepository implements RunStore {
     const occurredAt = input.occurredAt.toISOString();
     return this.inImmediateTransaction(() => {
       this.assertCurrentLease(input.runId, input.leaseOwner, occurredAt);
-      const context = this.getExecutionContext(input.runId);
-      this.db.prepare(
-        `UPDATE runs SET state = 'failed', failure_code = ?, active_elapsed_seconds = active_elapsed_seconds + ?,
-         active_started_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE run_id = ? AND lease_owner = ?`,
-      ).run(input.code, elapsedActiveSeconds(context, input.occurredAt), occurredAt, input.runId, input.leaseOwner);
-      this.appendEventInTransaction(input.runId, "run.failed", canonicalize({ code: input.code }), occurredAt);
-      this.resumeParentFromChildInTransaction(input.runId, occurredAt);
-      return this.getRun(input.runId);
+      return this.failRunInTransaction(input, occurredAt);
     });
   }
 
@@ -845,6 +800,51 @@ export class SqliteRunRepository implements RunStore {
       state: "denied",
       reason: "run_cancelled",
     }), occurredAt);
+  }
+
+  private failModelAttemptInTransaction(
+    input: FailModelAttemptInput,
+    occurredAt: string,
+  ): void {
+    this.appendEventInTransaction(
+      input.runId,
+      "model.attempt.failed",
+      canonicalize({
+        attemptId: input.attemptId,
+        code: input.code,
+        transient: input.transient,
+      }),
+      occurredAt,
+    );
+  }
+
+  private failRunInTransaction(
+    input: { runId: RunId; leaseOwner: string; code: string; occurredAt: Date },
+    occurredAt: string,
+  ): Run {
+    const context = this.getExecutionContext(input.runId);
+    const failed = this.db.prepare(
+      `UPDATE runs SET state = 'failed', failure_code = ?,
+       active_elapsed_seconds = active_elapsed_seconds + ?,
+       active_started_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+       updated_at = ?
+       WHERE run_id = ? AND state = 'running' AND lease_owner = ?`,
+    ).run(
+      input.code,
+      elapsedActiveSeconds(context, input.occurredAt),
+      occurredAt,
+      input.runId,
+      input.leaseOwner,
+    );
+    if (failed.changes !== 1) throw new DomainError("run_lease_lost");
+    this.appendEventInTransaction(
+      input.runId,
+      "run.failed",
+      canonicalize({ code: input.code }),
+      occurredAt,
+    );
+    this.resumeParentFromChildInTransaction(input.runId, occurredAt);
+    return this.getRun(input.runId);
   }
 
   private resumeParentFromChildInTransaction(childRunId: RunId, occurredAt: string): void {

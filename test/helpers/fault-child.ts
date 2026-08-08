@@ -1,13 +1,18 @@
 import { existsSync, writeFileSync } from "node:fs";
 
+import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
+import { OpenAiChatCompletionsModel } from "../../src/adapters/model/openai-chat-completions.js";
 import { bootstrap } from "../../src/bootstrap.js";
+import type { ModelPort } from "../../src/ports/model.js";
 import type { FaultInjector, FaultPoint } from "../../src/runtime/fault-injector.js";
 
 const configPath = requiredEnvironment("MYAGENT_FAULT_CONFIG");
-const selected = requiredEnvironment("MYAGENT_FAULT_POINT") as FaultPoint;
+const selected = process.env.MYAGENT_FAULT_POINT as FaultPoint | undefined;
 const armPath = requiredEnvironment("MYAGENT_FAULT_ARM");
 const hitPath = requiredEnvironment("MYAGENT_FAULT_HIT");
 const readyPath = requiredEnvironment("MYAGENT_FAULT_READY");
+const modelAckMarker = process.env.MYAGENT_MODEL_ACK_MARKER;
+const modelAckPath = process.env.MYAGENT_MODEL_ACK_PATH;
 
 const faults: FaultInjector = {
   async hit(point): Promise<void> {
@@ -21,10 +26,18 @@ const faults: FaultInjector = {
   },
 };
 
+const innerModel = new OpenAiChatCompletionsModel({
+  secretResolver: new EnvironmentSecretResolver(),
+});
+const model = modelAckMarker === undefined || modelAckPath === undefined
+  ? innerModel
+  : acknowledgeConsumedDelta(innerModel, modelAckMarker, modelAckPath);
+
 bootstrap(configPath, {
   listen: { host: "127.0.0.1", port: 0 },
   signals: false,
   faults,
+  model,
   worker: {
     concurrency: 1,
     leaseDurationMs: 250,
@@ -46,4 +59,22 @@ function requiredEnvironment(name: string): string {
 
 function hasErrorCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function acknowledgeConsumedDelta(
+  inner: ModelPort,
+  marker: string,
+  ackPath: string,
+): ModelPort {
+  return {
+    async *streamAttempt(request, signal) {
+      for await (const chunk of inner.streamAttempt(request, signal)) {
+        yield chunk;
+        if (chunk.type === "text_delta" && chunk.text === marker) {
+          writeFileSync(ackPath, marker, { encoding: "utf8", flag: "wx" });
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        }
+      }
+    },
+  };
 }

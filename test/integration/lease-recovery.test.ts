@@ -12,6 +12,7 @@ import { AdvanceRunService } from "../../src/application/advance-run.js";
 import { CreateRunService } from "../../src/application/create-run.js";
 import { PolicyEngine } from "../../src/application/policy-engine.js";
 import { PromptAssembler } from "../../src/application/prompt-assembler.js";
+import type { FaultPoint } from "../../src/runtime/fault-injector.js";
 import { CatalogService } from "../../src/config/catalog-service.js";
 import { loadCatalog, type CatalogSnapshot } from "../../src/config/catalog-loader.js";
 import {
@@ -119,6 +120,10 @@ describe("lease recovery", () => {
       );
       const model = new ScriptedModel();
       model.script(completedText("recovered answer"));
+      const faultSnapshots: Array<{
+        point: FaultPoint;
+        failedAttempts: number;
+      }> = [];
       const service = new AdvanceRunService({
         runs,
         tools: new SqliteToolRepository(connection.db),
@@ -130,6 +135,16 @@ describe("lease recovery", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        faults: {
+          async hit(point): Promise<void> {
+            faultSnapshots.push({
+              point,
+              failedAttempts: runs.listEventsAfter(created.runId, 0).filter(
+                (event) => event.type === "model.attempt.failed",
+              ).length,
+            });
+          },
+        },
       });
 
       expect(await service.advance(
@@ -138,6 +153,10 @@ describe("lease recovery", () => {
         new AbortController().signal,
       )).toEqual({ type: "advanced", runId: created.runId });
       expect(model.requests).toHaveLength(0);
+      expect(faultSnapshots).toEqual([
+        { point: "before_model_attempt_commit", failedAttempts: 0 },
+        { point: "after_model_attempt_commit", failedAttempts: 1 },
+      ]);
       expect(
         runs.listEventsAfter(created.runId, 0).filter(
           (event) => event.type === "model.attempt.failed",

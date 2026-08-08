@@ -36,7 +36,11 @@ export interface EnsureWithinBudgetResult {
 
 export interface SummaryAttemptLifecycle {
   onAttemptStarted(attemptNumber: number): void;
-  onAttemptFailed(attemptNumber: number, error: unknown): void | Promise<void>;
+  onAttemptFailed(
+    attemptNumber: number,
+    error: unknown,
+    willRetry: boolean,
+  ): void | Promise<void>;
   saveSummary(
     input: Parameters<SessionStore["saveSummary"]>[0],
   ): ReturnType<SessionStore["saveSummary"]> | Promise<ReturnType<SessionStore["saveSummary"]>>;
@@ -147,12 +151,10 @@ export class SessionSummarizer {
         }
         return { text, usage, attempts: attempt };
       } catch (error) {
-        await lifecycle?.onAttemptFailed(attempt, error);
-        if (
-          !(error instanceof ModelProviderError) ||
-          !error.transient ||
-          attempt === MAX_MODEL_ATTEMPTS
-        ) {
+        const willRetry = error instanceof ModelProviderError &&
+          error.transient && attempt < MAX_MODEL_ATTEMPTS;
+        await lifecycle?.onAttemptFailed(attempt, error, willRetry);
+        if (!willRetry) {
           throw error;
         }
         const configuredDelay = RETRY_DELAYS_MS[attempt - 1] ?? 1_000;

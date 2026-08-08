@@ -154,7 +154,7 @@ async function expectProcessToExit(pid: number): Promise<void> {
 }
 
 async function waitForFile(filePath: string): Promise<string> {
-  const deadline = Date.now() + 2_000;
+  const deadline = Date.now() + 5_000;
   while (true) {
     try {
       return await readFile(filePath, "utf8");

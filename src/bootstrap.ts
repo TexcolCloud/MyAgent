@@ -38,6 +38,7 @@ import { loadCatalog } from "./config/catalog-loader.js";
 import { CatalogService } from "./config/catalog-service.js";
 import { createHttpApp } from "./interfaces/http/app.js";
 import { createStructuredLogger } from "./observability/logger.js";
+import type { ModelPort } from "./ports/model.js";
 import { assertSupportedRuntime } from "./platform.js";
 import { ApprovalExpirer } from "./runtime/approval-expirer.js";
 import { ExecutionRegistry } from "./runtime/execution-registry.js";
@@ -52,6 +53,7 @@ export interface BootstrapOptions {
     sensitiveKeys?: readonly string[];
   };
   faults?: FaultInjector;
+  model?: ModelPort;
   worker?: {
     concurrency?: number;
     leaseDurationMs?: number;
@@ -119,7 +121,7 @@ export async function bootstrap(
       tools,
       approvals,
       sessions,
-      model: new OpenAiChatCompletionsModel({ secretResolver: secrets }),
+      model: options.model ?? new OpenAiChatCompletionsModel({ secretResolver: secrets }),
       prompts: new PromptAssembler(sessions),
       registry,
       policy,
