@@ -117,6 +117,65 @@ describe("CLI HTTP boundary", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(write).toHaveBeenCalledWith('{"type":"run.completed"}');
   });
+
+  it("reconnects a non-terminal watch with the latest Event ID", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const fetcher = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if (fetcher.mock.calls.length === 1) {
+        expect(new Headers(init?.headers).get("last-event-id")).toBeNull();
+        return new Response(
+          "id: 4\nevent: message.delta\ndata: {\"type\":\"message.delta\"}\n\n",
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      expect(new Headers(init?.headers).get("last-event-id")).toBe("4");
+      return new Response(
+        "id: 5\nevent: run.failed\ndata: {\"type\":\"run.failed\"}\n\n",
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    const write = vi.fn();
+
+    await executeCli(["run", "watch", "run-cli-1"], {
+      environment: {
+        MYAGENT_API_URL: "http://127.0.0.1:8787",
+        MYAGENT_BEARER_TOKEN: "operator-token",
+      },
+      fetcher,
+      write,
+    });
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(write.mock.calls.map(([line]) => line)).toEqual([
+      '{"type":"message.delta"}',
+      '{"type":"run.failed"}',
+    ]);
+  });
+
+  it("parses Problem Details when explicit connection options are rejected", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const harness = await startTestApp();
+    try {
+      await expect(executeCli([
+        "agents",
+        "list",
+        "--api-url",
+        "http://127.0.0.1:8787",
+        "--token",
+        "wrong-token",
+      ], {
+        environment: {},
+        fetcher: injectFetcher(harness.app),
+        write: vi.fn(),
+      })).rejects.toMatchObject({
+        status: 401,
+        code: "unauthorized",
+        detail: "Authentication is required.",
+      });
+    } finally {
+      await harness.close();
+    }
+  });
 });
 
 function injectFetcher(app: FastifyInstance, beforeRequest?: (url: URL) => void): typeof fetch {
