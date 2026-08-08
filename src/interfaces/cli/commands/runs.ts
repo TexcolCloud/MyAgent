@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { CliClient } from "../client.js";
 import { writeJson, type CliWrite } from "../formatters.js";
 
+const TERMINAL_RUN_EVENTS = new Set(["run.completed", "run.failed", "run.cancelled"]);
+
 export async function createRun(client: CliClient, input: { agentId: string; sessionKey: string; text: string }, write: CliWrite): Promise<void> {
   writeJson(write, await client.request("/v1/runs", { method: "POST", idempotencyKey: randomUUID(), body: { agentId: input.agentId, sessionKey: input.sessionKey, input: { type: "text", text: input.text } } }));
 }
@@ -22,7 +24,12 @@ export async function watchRun(client: CliClient, runId: string, write: CliWrite
       while ((boundary = buffer.indexOf("\n\n")) >= 0) {
         const frame = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2);
         const id = frame.match(/^id: (.+)$/mu)?.[1]; if (id !== undefined) cursor = id;
+        const event = frame.match(/^event: (.+)$/mu)?.[1];
         const data = frame.match(/^data: (.+)$/mu)?.[1]; if (data !== undefined) write(data);
+        if (event !== undefined && TERMINAL_RUN_EVENTS.has(event)) {
+          await reader.cancel();
+          return;
+        }
       }
     }
   }

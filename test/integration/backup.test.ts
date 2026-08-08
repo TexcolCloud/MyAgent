@@ -1,10 +1,12 @@
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { SqliteBackupWriter } from "../../src/adapters/sqlite/backup.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
+import type { CatalogSnapshot } from "../../src/config/catalog-loader.js";
 import { tempPath } from "../helpers/temp-dir.js";
 import { startTestApp } from "../helpers/start-test-app.js";
 
@@ -89,6 +91,35 @@ describe("HTTP backup", () => {
       expect(response.json()).toMatchObject({ code: "invalid_request" });
     } finally {
       await harness.close();
+    }
+  });
+
+  it("rejects source paths that become traversal paths on another platform", async () => {
+    const databasePath = tempPath("backup-source-guard.db");
+    const destination = tempPath("backup-source-guard");
+    const escaped = path.join(path.dirname(destination), "escaped", "SKILL.md");
+    const connection = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    migrate(connection.db);
+    const writer = new SqliteBackupWriter(connection.db);
+    const catalog = {
+      available: [],
+      sources: [{
+        relativePath: "skills/..\\..\\escaped/SKILL.md",
+        content: "must remain inside the backup",
+      }],
+    } as unknown as CatalogSnapshot;
+
+    try {
+      await expect(writer.create({
+        destination,
+        catalog,
+        occurredAt: new Date("2026-08-07T00:00:00.000Z"),
+      })).rejects.toMatchObject({ code: "invalid_backup_source_path" });
+      await expect(readFile(escaped, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      connection.close();
+      await rm(destination, { recursive: true, force: true });
+      await rm(path.dirname(escaped), { recursive: true, force: true });
     }
   });
 });

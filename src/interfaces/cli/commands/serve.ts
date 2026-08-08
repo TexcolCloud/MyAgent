@@ -1,2 +1,4 @@
-import { bootstrap } from "../../../bootstrap.js";
-export async function serve(configPath: string): Promise<void> { await bootstrap(configPath); }
+export async function serve(configPath: string): Promise<void> {
+  const { bootstrap } = await import("../../../bootstrap.js");
+  await bootstrap(configPath);
+}

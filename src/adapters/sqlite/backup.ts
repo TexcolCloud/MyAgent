@@ -64,14 +64,25 @@ async function writeCatalogSource(root: string, source: CatalogSourceFile): Prom
 }
 
 function resolveBackupFile(root: string, relativePath: string): string {
-  if (relativePath.length === 0 || path.posix.isAbsolute(relativePath)) {
+  if (
+    relativePath.length === 0 ||
+    relativePath.includes("\\") ||
+    relativePath.includes("\0") ||
+    path.posix.isAbsolute(relativePath) ||
+    path.win32.isAbsolute(relativePath)
+  ) {
     throw new DomainError("invalid_backup_source_path");
   }
   const normalized = path.posix.normalize(relativePath);
   if (normalized !== relativePath || normalized === ".." || normalized.startsWith("../")) {
     throw new DomainError("invalid_backup_source_path");
   }
-  return path.join(root, ...relativePath.split("/"));
+  const destination = path.resolve(root, ...relativePath.split("/"));
+  const confined = path.relative(root, destination);
+  if (path.isAbsolute(confined) || confined === ".." || confined.startsWith(`..${path.sep}`)) {
+    throw new DomainError("invalid_backup_source_path");
+  }
+  return destination;
 }
 
 function assertPartialTarget(parent: string, name: string, partial: string): void {
