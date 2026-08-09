@@ -74,6 +74,18 @@ describe("OpenAiResponsesModel", () => {
       { type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_1", delta: '{"path":' },
       { type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_1", delta: '"a.txt"}' },
       { type: "response.function_call_arguments.done", output_index: 0, item_id: "fc_1", arguments: '{"path":"a.txt"}' },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          id: "fc_1",
+          type: "function_call",
+          call_id: "call_9",
+          name: "read_file",
+          arguments: '{"path":"a.txt"}',
+          status: "completed",
+        },
+      },
       { type: "response.completed", response: completedResponse({
         output: [{ id: "fc_1", type: "function_call", call_id: "call_9", name: "read_file", arguments: '{"path":"a.txt"}', status: "completed" }],
       }) },
@@ -188,19 +200,126 @@ describe("OpenAiResponsesModel", () => {
     expect(`${String(error)} ${JSON.stringify(error)}`).not.toContain("raw-code");
   });
 
-  it("rejects a function call outside output index zero", async () => {
-    const fake = await startServer([{
-      type: "response.output_item.added",
-      output_index: 1,
-      item: {
-        id: "fc_2",
-        type: "function_call",
-        call_id: "call_2",
-        name: "read_file",
-        arguments: "",
-        status: "in_progress",
+  it("rejects an argument delta with a mismatched function-call output index", async () => {
+    const fake = await startServer([
+      { type: "response.output_item.added", output_index: 0, item: reasoningItem("reasoning_1") },
+      functionCallAdded(1),
+      functionCallDelta(0, '{"path":'),
+      functionCallDelta(1, '"a.txt"}'),
+      functionCallArgumentsDone(1),
+      functionCallDone(1),
+      { type: "response.completed", response: functionCallResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("assembles a function call after an omitted reasoning output item", async () => {
+    const fake = await startServer([
+      { type: "response.output_item.added", output_index: 0, item: reasoningItem("reasoning_1") },
+      functionCallAdded(1),
+      functionCallDelta(1, '{"path":'),
+      functionCallDelta(1, '"a.txt"}'),
+      functionCallArgumentsDone(1),
+      functionCallDone(1),
+      { type: "response.completed", response: functionCallResponse() },
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ));
+
+    expect(chunks).toEqual([
+      { type: "tool_call", callId: "call_2", name: "read_file", arguments: { path: "a.txt" } },
+      { type: "completed", finishReason: "tool_call" },
+    ]);
+  });
+
+  it("rejects a malformed declared function-call item instead of ignoring it", async () => {
+    const fake = await startServer([
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          id: "fc_bad",
+          type: "function_call",
+          call_id: "call bad",
+          name: "read_file",
+          arguments: "",
+          status: "in_progress",
+        },
       },
-    }]);
+      { type: "response.output_text.delta", delta: "visible" },
+      { type: "response.completed", response: completedResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects an output-item done event with mismatched function-call identity", async () => {
+    const fake = await startServer([
+      { type: "response.output_item.added", output_index: 0, item: reasoningItem("reasoning_1") },
+      functionCallAdded(1),
+      functionCallDelta(1, '{"path":'),
+      functionCallDelta(1, '"a.txt"}'),
+      functionCallArgumentsDone(1),
+      {
+        type: "response.output_item.done",
+        output_index: 1,
+        item: { ...functionCallItem(), name: "other_file" },
+      },
+      { type: "response.completed", response: functionCallResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects an argument done event with a mismatched function-call output index", async () => {
+    const fake = await startServer([
+      { type: "response.output_item.added", output_index: 0, item: reasoningItem("reasoning_1") },
+      functionCallAdded(1),
+      functionCallDelta(1, '{"path":'),
+      functionCallDelta(1, '"a.txt"}'),
+      functionCallArgumentsDone(0),
+      functionCallDone(1),
+      { type: "response.completed", response: functionCallResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects terminal output whose function call does not match the streamed call", async () => {
+    const fake = await startServer([
+      functionCallAdded(0),
+      functionCallDelta(0, '{"path":'),
+      functionCallDelta(0, '"a.txt"}'),
+      functionCallArgumentsDone(0),
+      functionCallDone(0),
+      {
+        type: "response.completed",
+        response: completedResponse({
+          output: [{ ...functionCallItem(), call_id: "call_other" }],
+        }),
+      },
+    ]);
     servers.push(fake.server);
 
     await expect(collect(adapter(fake.baseUrl).streamAttempt(
@@ -211,15 +330,11 @@ describe("OpenAiResponsesModel", () => {
 
   it("rejects multiple streamed function calls", async () => {
     const fake = await startServer([
+      functionCallAdded(0),
+      { type: "response.output_item.added", output_index: 1, item: secondFunctionCallItem() },
       {
-        type: "response.output_item.added",
-        output_index: 0,
-        item: { id: "fc_1", type: "function_call", call_id: "call_1", name: "one", arguments: "", status: "in_progress" },
-      },
-      {
-        type: "response.output_item.added",
-        output_index: 1,
-        item: { id: "fc_2", type: "function_call", call_id: "call_2", name: "two", arguments: "", status: "in_progress" },
+        type: "response.completed",
+        response: completedResponse({ output: [functionCallItem(), secondFunctionCallItem()] }),
       },
     ]);
     servers.push(fake.server);
@@ -228,6 +343,77 @@ describe("OpenAiResponsesModel", () => {
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects malformed function arguments with an otherwise valid terminal response", async () => {
+    const invalidArguments = '{"path":';
+    const fake = await startServer([
+      { ...functionCallAdded(0), item: { ...functionCallItem(), arguments: "", status: "in_progress" } },
+      { type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_2", delta: invalidArguments },
+      { type: "response.function_call_arguments.done", output_index: 0, item_id: "fc_2", arguments: invalidArguments },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { ...functionCallItem(), arguments: invalidArguments },
+      },
+      {
+        type: "response.completed",
+        response: completedResponse({ output: [{ ...functionCallItem(), arguments: invalidArguments }] }),
+      },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects extra function calls in terminal output", async () => {
+    const fake = await startServer([
+      functionCallAdded(0),
+      functionCallDelta(0, '{"path":'),
+      functionCallDelta(0, '"a.txt"}'),
+      functionCallArgumentsDone(0),
+      functionCallDone(0),
+      {
+        type: "response.completed",
+        response: completedResponse({ output: [functionCallItem(), secondFunctionCallItem()] }),
+      },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects a missing terminal event after visible text", async () => {
+    const fake = await startServer([{ type: "response.output_text.delta", delta: "partial" }]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("normalizes cancellation during a Responses stream", async () => {
+    const fake = await startServer([{ type: "response.output_text.delta", delta: "partial" }], { holdOpen: true });
+    servers.push(fake.server);
+    const controller = new AbortController();
+    const pending = collect(adapter(fake.baseUrl).streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      controller.signal,
+    ));
+    await fake.requestReceived;
+    controller.abort("secret-abort-reason");
+
+    const error = await pending.catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ name: "AbortError" });
+    expect(String(error)).not.toContain("secret-abort-reason");
   });
 
   it("omits provider reasoning events from canonical output", async () => {
@@ -342,18 +528,29 @@ function request(
 
 async function startServer(
   events: readonly JsonValue[],
-  options: { status?: number; body?: JsonValue; headers?: Record<string, string> } = {},
+  options: {
+    status?: number;
+    body?: JsonValue;
+    headers?: Record<string, string>;
+    holdOpen?: boolean;
+  } = {},
 ): Promise<{
   server: Server;
   baseUrl: string;
   requests: { body: JsonValue }[];
+  requestReceived: Promise<void>;
 }> {
   const requests: { body: JsonValue }[] = [];
+  let markRequestReceived: (() => void) | undefined;
+  const requestReceived = new Promise<void>((resolve) => {
+    markRequestReceived = resolve;
+  });
   const server = createServer((incoming, response) => {
     const chunks: Buffer[] = [];
     incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
     incoming.on("end", () => {
       requests.push({ body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as JsonValue });
+      markRequestReceived?.();
       if (options.status !== undefined) {
         response.writeHead(options.status, {
           "content-type": "application/json",
@@ -364,12 +561,17 @@ async function startServer(
       }
       response.writeHead(200, { "content-type": "text/event-stream" });
       for (const event of events) response.write(`data: ${JSON.stringify(event)}\n\n`);
-      response.end("data: [DONE]\n\n");
+      if (!options.holdOpen) response.end("data: [DONE]\n\n");
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as AddressInfo;
-  return { server, baseUrl: `http://127.0.0.1:${String(address.port)}/v1`, requests };
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${String(address.port)}/v1`,
+    requests,
+    requestReceived,
+  };
 }
 
 function completedResponse(overrides: Record<string, JsonValue> = {}): JsonValue {
@@ -381,6 +583,70 @@ function completedResponse(overrides: Record<string, JsonValue> = {}): JsonValue
     status: "completed",
     output: [{ id: "msg_1", type: "message", role: "assistant", status: "completed", content: [] }],
     ...overrides,
+  };
+}
+
+function reasoningItem(id: string): Record<string, JsonValue> {
+  return { id, type: "reasoning", summary: [] };
+}
+
+function functionCallItem(): Record<string, JsonValue> {
+  return {
+    id: "fc_2",
+    type: "function_call",
+    call_id: "call_2",
+    name: "read_file",
+    arguments: '{"path":"a.txt"}',
+    status: "completed",
+  };
+}
+
+function functionCallAdded(outputIndex: number): Record<string, JsonValue> {
+  return {
+    type: "response.output_item.added",
+    output_index: outputIndex,
+    item: { ...functionCallItem(), arguments: "", status: "in_progress" },
+  };
+}
+
+function functionCallDelta(outputIndex: number, delta: string): JsonValue {
+  return {
+    type: "response.function_call_arguments.delta",
+    output_index: outputIndex,
+    item_id: "fc_2",
+    delta,
+  };
+}
+
+function functionCallArgumentsDone(outputIndex: number): JsonValue {
+  return {
+    type: "response.function_call_arguments.done",
+    output_index: outputIndex,
+    item_id: "fc_2",
+    arguments: '{"path":"a.txt"}',
+  };
+}
+
+function functionCallDone(outputIndex: number): JsonValue {
+  return {
+    type: "response.output_item.done",
+    output_index: outputIndex,
+    item: functionCallItem(),
+  };
+}
+
+function functionCallResponse(): JsonValue {
+  return completedResponse({ output: [reasoningItem("reasoning_1"), functionCallItem()] });
+}
+
+function secondFunctionCallItem(): Record<string, JsonValue> {
+  return {
+    id: "fc_3",
+    type: "function_call",
+    call_id: "call_3",
+    name: "other_file",
+    arguments: "{}",
+    status: "completed",
   };
 }
 

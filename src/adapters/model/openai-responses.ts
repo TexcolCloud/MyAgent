@@ -36,11 +36,13 @@ const canonicalizeJson = canonicalizeModule as unknown as (
 ) => string | undefined;
 
 interface FunctionCallFragments {
+  outputIndex: number;
   itemId: string;
   callId: string;
   name: string;
   arguments: string;
   argumentsDone: boolean;
+  itemDone: boolean;
 }
 
 export class OpenAiResponsesModel implements ModelPort {
@@ -94,6 +96,7 @@ export class OpenAiResponsesModel implements ModelPort {
         functionCall = appendFunctionCall(functionCall, event);
         if (event.type === "response.completed") {
           if (event.response.status !== "completed") throw protocolError();
+          reconcileTerminalOutput(event.response.output, functionCall);
           if (functionCall === undefined && !sawText) throw protocolError();
           if (functionCall !== undefined) {
             yield { type: "tool_call", ...parseFunctionCall(functionCall) };
@@ -197,19 +200,29 @@ function appendFunctionCall(
 ): FunctionCallFragments | undefined {
   if (event.type === "response.output_item.added") {
     const item = event.item;
-    if (!isFunctionCallItem(item)) return current;
+    if (!isDeclaredFunctionCall(item)) return current;
+    if (
+      !isOutputIndex(event.output_index) ||
+      !isFunctionCallItem(item) ||
+      item.status !== "in_progress"
+    ) {
+      throw protocolError();
+    }
     if (current !== undefined) throw protocolError();
     return {
+      outputIndex: event.output_index,
       itemId: item.id,
       callId: item.call_id,
       name: item.name,
       arguments: item.arguments,
       argumentsDone: false,
+      itemDone: false,
     };
   }
   if (event.type === "response.function_call_arguments.delta") {
     if (
       current === undefined ||
+      event.output_index !== current.outputIndex ||
       event.item_id !== current.itemId ||
       typeof event.delta !== "string" ||
       current.argumentsDone
@@ -222,6 +235,7 @@ function appendFunctionCall(
   if (event.type === "response.function_call_arguments.done") {
     if (
       current === undefined ||
+      event.output_index !== current.outputIndex ||
       event.item_id !== current.itemId ||
       typeof event.arguments !== "string" ||
       current.argumentsDone ||
@@ -231,7 +245,32 @@ function appendFunctionCall(
     }
     current.argumentsDone = true;
   }
+  if (event.type === "response.output_item.done") {
+    const item = event.item;
+    if (!isDeclaredFunctionCall(item)) return current;
+    if (
+      !isFunctionCallItem(item) ||
+      item.status !== "completed" ||
+      current === undefined ||
+      current.itemDone ||
+      !current.argumentsDone ||
+      event.output_index !== current.outputIndex ||
+      !sameFunctionCall(current, item)
+    ) {
+      throw protocolError();
+    }
+    current.itemDone = true;
+  }
   return current;
+}
+
+function isDeclaredFunctionCall(value: unknown): boolean {
+  return typeof value === "object" && value !== null &&
+    (value as Record<string, unknown>).type === "function_call";
+}
+
+function isOutputIndex(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isFunctionCallItem(value: unknown): value is {
@@ -240,6 +279,7 @@ function isFunctionCallItem(value: unknown): value is {
   call_id: string;
   name: string;
   arguments: string;
+  status?: unknown;
 } {
   if (typeof value !== "object" || value === null) return false;
   const item = value as Record<string, unknown>;
@@ -248,6 +288,43 @@ function isFunctionCallItem(value: unknown): value is {
     typeof item.call_id === "string" && isCallId(item.call_id) &&
     typeof item.name === "string" && item.name.length > 0 &&
     typeof item.arguments === "string";
+}
+
+function sameFunctionCall(
+  current: FunctionCallFragments,
+  item: { id: string; call_id: string; name: string; arguments: string },
+): boolean {
+  return current.itemId === item.id &&
+    current.callId === item.call_id &&
+    current.name === item.name &&
+    current.arguments === item.arguments;
+}
+
+function reconcileTerminalOutput(
+  output: unknown,
+  current: FunctionCallFragments | undefined,
+): void {
+  if (!Array.isArray(output)) throw protocolError();
+  let terminalFunctionCall: FunctionCallFragments | undefined;
+  for (let index = 0; index < output.length; index += 1) {
+    const item = output[index];
+    if (!isDeclaredFunctionCall(item)) continue;
+    if (
+      !isFunctionCallItem(item) ||
+      item.status !== "completed" ||
+      current === undefined ||
+      terminalFunctionCall !== undefined ||
+      index !== current.outputIndex ||
+      !sameFunctionCall(current, item)
+    ) {
+      throw protocolError();
+    }
+    terminalFunctionCall = current;
+  }
+  if (current !== undefined &&
+    (!current.argumentsDone || !current.itemDone || terminalFunctionCall === undefined)) {
+    throw protocolError();
+  }
 }
 
 function parseFunctionCall(call: FunctionCallFragments): {
