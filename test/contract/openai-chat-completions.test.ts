@@ -459,6 +459,59 @@ describe("OpenAiChatCompletionsModel", () => {
   });
 
   it.each([
+    {
+      name: "identical ID fragments without a continuation type",
+      events: [
+        toolDelta({ id: "ab", name: "read_", arguments: '{"path":' }),
+        frame({
+          tool_calls: [{
+            index: 0,
+            id: "ab",
+            function: { name: "file", arguments: '"b"}' },
+          }],
+        }),
+        frame({}, "tool_calls"),
+      ],
+      callId: "abab",
+      toolName: "read_file",
+    },
+    {
+      name: "identical name fragments with a consistent continuation type",
+      events: [
+        toolDelta({ id: "call_", name: "read", arguments: '{"path":' }),
+        frame({
+          tool_calls: [{
+            index: 0,
+            id: "1",
+            type: "function",
+            function: { name: "read", arguments: '"b"}' },
+          }],
+        }),
+        frame({}, "tool_calls"),
+      ],
+      callId: "call_1",
+      toolName: "readread",
+    },
+  ])("assembles $name", async ({ events, callId, toolName }) => {
+    const fake = await startServer(events);
+    servers.push(fake.server);
+
+    const chunks = await collect(
+      adapter(fake.baseUrl).streamAttempt(
+        request(fake.baseUrl),
+        new AbortController().signal,
+      ),
+    );
+
+    expect(chunks).toContainEqual({
+      type: "tool_call",
+      callId,
+      name: toolName,
+      arguments: { path: "b" },
+    });
+  });
+
+  it.each([
     ["stop", "completed"],
     ["length", "length"],
     ["content_filter", "content_filter"],
@@ -639,13 +692,14 @@ describe("OpenAiChatCompletionsModel", () => {
       ],
     },
     {
-      name: "a repeated full Tool Call ID without a type marker",
+      name: "an unsupported Tool Call continuation type",
       events: [
-        toolDelta({ id: "call_1", name: "read_", arguments: '{"path":' }),
+        toolDelta({ id: "call_", name: "read_", arguments: '{"path":' }),
         frame({
           tool_calls: [{
             index: 0,
-            id: "call_1",
+            id: "1",
+            type: "custom",
             function: { name: "file", arguments: '"b"}' },
           }],
         }),
@@ -653,14 +707,13 @@ describe("OpenAiChatCompletionsModel", () => {
       ],
     },
     {
-      name: "a repeated full Tool Call name without a type marker",
+      name: "a missing Tool Call continuation index",
       events: [
-        toolDelta({ id: "call_", name: "read_file", arguments: '{"path":' }),
+        toolDelta({ id: "call_", name: "read_", arguments: '{"path":' }),
         frame({
           tool_calls: [{
-            index: 0,
             id: "1",
-            function: { name: "read_file", arguments: '"b"}' },
+            function: { name: "file", arguments: '"b"}' },
           }],
         }),
         frame({}, "tool_calls"),

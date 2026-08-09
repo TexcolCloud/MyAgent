@@ -185,11 +185,9 @@ function appendToolCall(
     throw protocolError();
   }
   if (delta.id !== undefined && delta.id.length > 0) {
-    if (delta.id === current.callId) throw protocolError();
     current.callId += delta.id;
   }
   if (delta.function?.name !== undefined && delta.function.name.length > 0) {
-    if (delta.function.name === current.name) throw protocolError();
     current.name += delta.function.name;
   }
   if (
