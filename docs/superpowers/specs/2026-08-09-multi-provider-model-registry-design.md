@@ -210,11 +210,15 @@ The Model Control Plane is rooted at `/v1/admin`. It requires the Admin Token an
 
 ### 6.2 Concurrency and response safety
 
-Every mutation other than resource creation supplies `expectedRevision`. A mismatch returns `409 revision_conflict`. Successful mutations append a Secret-free audit event and return the new record revision.
+Every Operator/control-plane mutation and stable-resource mutation other than stable resource creation supplies `expectedRevision`. A mismatch returns `409 revision_conflict`. Successful audited mutations append a Secret-free audit event and return the new record revision.
+
+This optimistic-concurrency rule governs Operator/control-plane mutations and stable-resource changes. Internal Verification claim, attempt, lease-renewal, and completion transitions instead compare their durable state plus `leaseOwner`; informational Provider Health observations carry no configuration authority and do not emit Registry audit events.
 
 Queueing a Verification is a mutation of the owning Model Profile. Its request therefore supplies that Profile's `expectedRevision`, even though the route identifies the exact immutable Profile Revision being verified.
 
 Master-key rotation supplies the singleton Managed Secret Keyring's `expectedRevision`. The transaction increments that record only after all active Secret Versions have been re-encrypted successfully.
+
+Appending an immutable Model Profile Revision is an optimistic mutation of its stable Model Profile. The application/store command requires the Profile's `expectedRevision`, rejects retired Profiles, appends one revision, and emits one audit event without changing the active head.
 
 Credential inputs are write-only. Responses expose only an opaque Secret Version ID and `credentialConfigured`. They never return plaintext, ciphertext, Key fragments, provider response bodies, or request bodies.
 

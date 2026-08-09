@@ -13,7 +13,7 @@
 - Preserve the M1 HTTP, `(agentId, sessionKey)` isolation, immutable Run snapshot, Skill, Tool Policy, exact Approval, restart-recovery, reconciliation, delegation, SSE, and backup behavior.
 - Static configuration version is exactly `2`; it includes separate environment Secret references for `server.bearerToken` and `server.adminToken`, and contains no active model or Agent model selection.
 - The Model Control Plane is rooted at `/v1/admin`, accepts only actual loopback socket peers, requires the Admin Token, ignores forwarded-address headers, and grants no authority to the ordinary Run Token.
-- Every mutation except stable resource creation requires `expectedRevision`; a mismatch returns HTTP 409 with `revision_conflict` and leaves active revisions, defaults, and assignments unchanged.
+- Every Operator/control-plane mutation and stable-resource mutation except stable resource creation requires `expectedRevision`; a mismatch returns HTTP 409 with `revision_conflict` and leaves active revisions, defaults, and assignments unchanged. Internal Verification claim/begin/renew/complete transitions use durable state plus `leaseOwner` CAS, while informational Provider Health observations carry no configuration authority or Registry audit event.
 - Stable Provider Connection and Model Profile IDs are immutable lowercase ASCII slugs of 1-63 characters; revision and operation IDs are opaque UUID-derived identifiers.
 - Provider kinds are exactly `openai`, `deepseek`, and `openai_compatible`; invocation protocols are exactly `chat_completions` and `responses`.
 - OpenAI and DeepSeek presets require Bearer auth and prefer Responses; Custom permits Bearer or no auth and prefers Chat Completions.
@@ -373,6 +373,10 @@ export interface RecordDiscoveryInput extends MutationContext {
 export interface CreateProfileRecord extends MutationContext {
   profileId: ModelProfileId; displayName: string; revision: ModelProfileRevision;
 }
+export interface CreateProfileRevisionRecord extends MutationContext {
+  profileId: ModelProfileId; expectedRevision: number;
+  displayName?: string; revision: ModelProfileRevision;
+}
 export interface QueueVerificationRecord extends MutationContext {
   verificationId: ModelVerificationId; profileRevisionId: ModelProfileRevisionId;
   expectedRevision: number;
@@ -465,6 +469,7 @@ export interface ModelRegistryStore {
   recordDiscovery(input: RecordDiscoveryInput): DiscoveryView;
   getDiscoveredModels(revisionId: ProviderConnectionRevisionId, now: Date): DiscoveryView;
   createProfile(input: CreateProfileRecord): ModelProfileView;
+  createProfileRevision(input: CreateProfileRevisionRecord): ModelProfileView;
   getProfile(id: ModelProfileId): ModelProfileView;
   listProfiles(): readonly ModelProfileView[];
   queueVerification(input: QueueVerificationRecord): ModelVerification;
@@ -653,7 +658,7 @@ git commit -m "feat: define Model Registry domain invariants"
 
 **Interfaces:**
 - Consumes: Task 1 records and existing `DatabaseSync` transaction conventions.
-- Produces: core connection/profile CRUD, immutable revisions, promotion, assignment/default, retirement, purge, append-only audit, and optimistic `recordRevision` methods of `ModelRegistryStore`.
+- Produces: core connection/profile CRUD, optimistic immutable revision append for both resource types, promotion, assignment/default, retirement, purge, append-only audit, and optimistic `recordRevision` methods of `ModelRegistryStore`.
 
 - [ ] **Step 1: Write failing schema and atomicity tests**
 
@@ -699,7 +704,7 @@ Each successful mutation writes one `model_registry_events` row in the same tran
 
 - [ ] **Step 5: Implement promotion/default/assignment/retirement/purge rules**
 
-Connection Promotion first requires successful discovery or a passing exact dependent Verification. Profile Promotion first requires a passing exact baseline Verification and an active referenced Connection revision. Promotion then marks the previous active revision `superseded`, activates only the selected revision, and updates only the stable head. Default stores a stable Profile ID. `synchronizeAgents` creates an explicit `source = 'default'` assignment only for a new unassigned Agent and snapshots the default Profile's then-active revision. Retirement blocks new promotion/assignment but retains existing exact assignments. Purge queries all revisions, assignments, Run `agent_revisions.content_json`, Secret references, and default pointers, returning `resource_in_use` when any reference exists.
+`createConnectionRevision` and `createProfileRevision` check the stable resource's `expectedRevision` before business eligibility, reject retired resources, append immutable content, increment the stable record revision, and emit one audit event without moving active heads. Connection Promotion first requires successful discovery or a passing exact dependent Verification. Profile Promotion first requires a passing exact baseline Verification and an active referenced Connection revision. Both Promotion paths require the selected revision itself to be `verified`, then mark the previous active revision `superseded`, activate only the selected revision, and update only the stable head. Every Promotion/default/assignment mutation checks its governing `expectedRevision` before target evidence or eligibility so stale callers consistently receive `revision_conflict`. Default stores a stable Profile ID. `synchronizeAgents` creates an explicit `source = 'default'` assignment only for a new unassigned Agent and snapshots the default Profile's then-active revision. Retirement blocks new promotion/assignment but retains existing exact assignments. Purge queries all revisions, assignments, Run `agent_revisions.content_json`, Secret references, and default pointers, returning `resource_in_use` when any reference exists.
 
 - [ ] **Step 6: Prove forward-only migration and reopen behavior**
 
