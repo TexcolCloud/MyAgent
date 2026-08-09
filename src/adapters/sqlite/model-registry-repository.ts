@@ -29,6 +29,7 @@ import type {
   CreateConnectionRecord,
   CreateConnectionRevisionRecord,
   CreateProfileRecord,
+  CreateProfileRevisionRecord,
   MutationContext,
   PromoteConnectionInput,
   PromoteProfileInput,
@@ -134,8 +135,14 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
   createConnectionRevision(
     input: CreateConnectionRevisionRecord,
   ): ProviderConnectionView {
-    assertConnectionRevisionOwner(input.connectionId, input.revision);
     return this.immediate(() => {
+      this.assertMutableStableRevision(
+        "provider_connections",
+        "connection_id",
+        input.connectionId,
+        input.expectedRevision,
+      );
+      assertConnectionRevisionOwner(input.connectionId, input.revision);
       const now = input.now.toISOString();
       const displayName = input.displayName;
       const updated = displayName === undefined
@@ -224,6 +231,45 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
     });
   }
 
+  createProfileRevision(input: CreateProfileRevisionRecord): ModelProfileView {
+    return this.immediate(() => {
+      this.assertMutableStableRevision(
+        "model_profiles",
+        "profile_id",
+        input.profileId,
+        input.expectedRevision,
+      );
+      assertProfileRevisionOwner(input.profileId, input.revision);
+      const now = input.now.toISOString();
+      const displayName = input.displayName;
+      const updated = displayName === undefined
+        ? this.db.prepare(
+            `UPDATE model_profiles
+             SET record_revision = record_revision + 1, updated_at = ?
+             WHERE profile_id = ? AND record_revision = ? AND retired_at IS NULL`,
+          ).run(now, input.profileId, input.expectedRevision)
+        : this.db.prepare(
+            `UPDATE model_profiles
+             SET display_name = ?, record_revision = record_revision + 1, updated_at = ?
+             WHERE profile_id = ? AND record_revision = ? AND retired_at IS NULL`,
+          ).run(displayName, now, input.profileId, input.expectedRevision);
+      if (updated.changes !== 1) throwRevisionConflict();
+      this.insertProfileRevision(input.revision);
+      this.appendAudit(
+        input,
+        "model_profile",
+        input.profileId,
+        "profile.revision_created",
+        {
+          revisionId: input.revision.revisionId,
+          previousRecordRevision: input.expectedRevision,
+          newRecordRevision: input.expectedRevision + 1,
+        },
+      );
+      return this.getProfile(input.profileId);
+    });
+  }
+
   getProfile(id: ModelProfileId): ModelProfileView {
     const row = this.db.prepare(
       `SELECT profile_id, display_name, active_revision_id, retired_at,
@@ -258,6 +304,12 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
 
   promoteConnection(input: PromoteConnectionInput): ProviderConnectionView {
     return this.immediate(() => {
+      this.assertMutableStableRevision(
+        "provider_connections",
+        "connection_id",
+        input.connectionId,
+        input.expectedRevision,
+      );
       this.assertConnectionPromotionEvidence(input.connectionId, input.revisionId);
       const now = input.now.toISOString();
       const updated = this.db.prepare(
@@ -305,6 +357,12 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
 
   promoteProfile(input: PromoteProfileInput): ModelProfileView {
     return this.immediate(() => {
+      this.assertMutableStableRevision(
+        "model_profiles",
+        "profile_id",
+        input.profileId,
+        input.expectedRevision,
+      );
       const evidence = this.profilePromotionEvidence(input.profileId, input.revisionId);
       const now = input.now.toISOString();
       const updated = this.db.prepare(
@@ -342,11 +400,15 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
 
   setDefaultProfile(input: SetDefaultProfileInput): DefaultModelProfile {
     return this.immediate(() => {
-      this.assertProfileDefaultEligible(input.profileId);
       const existing = this.defaultRow();
-      let newRevision: number;
       if (existing === undefined) {
         if (input.expectedRevision !== 0) throwRevisionConflict();
+      } else if (existing.record_revision !== input.expectedRevision) {
+        throwRevisionConflict();
+      }
+      this.assertProfileDefaultEligible(input.profileId);
+      let newRevision: number;
+      if (existing === undefined) {
         this.db.prepare(
           `INSERT INTO default_model_profile (
              singleton_id, profile_id, record_revision, updated_at
@@ -383,11 +445,15 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
 
   setAssignment(input: SetModelAssignmentInput): ModelAssignment {
     return this.immediate(() => {
-      this.assertAssignmentEligible(input.profileRevisionId);
       const existing = this.assignmentRow(input.agentId);
-      let newRevision: number;
       if (existing === undefined) {
         if (input.expectedRevision !== 0) throwRevisionConflict();
+      } else if (existing.record_revision !== input.expectedRevision) {
+        throwRevisionConflict();
+      }
+      this.assertAssignmentEligible(input.profileRevisionId);
+      let newRevision: number;
+      if (existing === undefined) {
         this.db.prepare(
           `INSERT INTO model_assignments (
              agent_id, model_profile_revision_id, source,
@@ -653,7 +719,7 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
     const revision = this.db.prepare(
       `SELECT 1 AS present
        FROM provider_connection_revisions
-       WHERE revision_id = ? AND connection_id = ?`,
+       WHERE revision_id = ? AND connection_id = ? AND state = 'verified'`,
     ).get(revisionId, connectionId);
     if (revision === undefined) throw new DomainError("verification_required");
     const evidence = this.db.prepare(
@@ -697,6 +763,7 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
          ON connection.connection_id = connection_revision.connection_id
        WHERE profile_revision.revision_id = ?
          AND profile_revision.profile_id = ?
+         AND profile_revision.state = 'verified'
          AND verification.state = 'passed'
          AND verification.capability_baseline = profile_revision.capability_baseline
          AND connection_revision.state = 'active'
@@ -848,6 +915,23 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
     ).get(id) as unknown as { record_revision: number } | undefined;
     if (row === undefined) throw new Error("registry_resource_not_found");
     if (row.record_revision !== expectedRevision) throwRevisionConflict();
+  }
+
+  private assertMutableStableRevision(
+    table: "provider_connections" | "model_profiles",
+    idColumn: "connection_id" | "profile_id",
+    id: string,
+    expectedRevision: number,
+  ): void {
+    const row = this.db.prepare(
+      `SELECT record_revision, retired_at FROM ${table} WHERE ${idColumn} = ?`,
+    ).get(id) as unknown as {
+      record_revision: number;
+      retired_at: string | null;
+    } | undefined;
+    if (row === undefined) throw new Error("registry_resource_not_found");
+    if (row.record_revision !== expectedRevision) throwRevisionConflict();
+    if (row.retired_at !== null) throw new DomainError("resource_retired");
   }
 
   private throwMutationFailure(

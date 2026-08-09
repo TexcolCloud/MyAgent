@@ -62,6 +62,13 @@ export interface CreateProfileRecord extends MutationContext {
   readonly revision: ModelProfileRevision;
 }
 
+export interface CreateProfileRevisionRecord extends MutationContext {
+  readonly profileId: ModelProfileId;
+  readonly expectedRevision: number;
+  readonly displayName?: string;
+  readonly revision: ModelProfileRevision;
+}
+
 export interface QueueVerificationRecord extends MutationContext {
   readonly verificationId: ModelVerificationId;
   readonly profileRevisionId: ModelProfileRevisionId;
@@ -206,6 +213,7 @@ export interface ModelRegistryStore {
   recordDiscovery(input: RecordDiscoveryInput): DiscoveryView;
   getDiscoveredModels(revisionId: ProviderConnectionRevisionId, now: Date): DiscoveryView;
   createProfile(input: CreateProfileRecord): ModelProfileView;
+  createProfileRevision(input: CreateProfileRevisionRecord): ModelProfileView;
   getProfile(id: ModelProfileId): ModelProfileView;
   listProfiles(): readonly ModelProfileView[];
   queueVerification(input: QueueVerificationRecord): ModelVerification;
@@ -238,6 +246,7 @@ export type CoreModelRegistryStore = Pick<
   | "getConnection"
   | "listConnections"
   | "createProfile"
+  | "createProfileRevision"
   | "getProfile"
   | "listProfiles"
   | "promoteConnection"

@@ -106,6 +106,128 @@ describe("SqliteModelRegistryRepository", () => {
     });
   });
 
+  it("returns revision conflict before Connection revision ownership validation", () => {
+    usingFixture("connection-revision-cas-precedence", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      const eventCount = count(db, "model_registry_events");
+
+      expect(() => repository.createConnectionRevision({
+        ...context("event-stale-owner", LATER),
+        connectionId: connectionId("connection-a"),
+        expectedRevision: 99,
+        revision: connectionRevision("pcr-mismatch", "different-connection"),
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
+      expect(db.prepare(
+        "SELECT revision_id FROM provider_connection_revisions WHERE revision_id = ?",
+      ).get("pcr-mismatch")).toBeUndefined();
+      expect(count(db, "model_registry_events")).toBe(eventCount);
+    });
+  });
+
+  it("appends an immutable Profile revision without moving its active head", () => {
+    usingFixture("profile-revision", ({ db, repository }) => {
+      seedActiveRegistry(db, repository);
+
+      const updated = repository.createProfileRevision({
+        ...context("event-profile-revision", LATER),
+        profileId: profileId("assistant"),
+        expectedRevision: 1,
+        displayName: "Assistant v2",
+        revision: profileRevision("mpr-b", "assistant", "pcr-a", { createdAt: LATER }),
+      });
+
+      expect(updated.activeRevisionId).toBe("mpr-a");
+      expect(updated.displayName).toBe("Assistant v2");
+      expect(updated.recordRevision).toBe(2);
+      expect(updated.revisions.map(({ revisionId }) => revisionId)).toEqual(["mpr-a", "mpr-b"]);
+      expect(db.prepare(
+        `SELECT action, payload_json FROM model_registry_events
+         WHERE event_id = ?`,
+      ).get("event-profile-revision")).toEqual({
+        action: "profile.revision_created",
+        payload_json: JSON.stringify({
+          action: "profile.revision_created",
+          newRecordRevision: 2,
+          previousRecordRevision: 1,
+          resourceId: "assistant",
+          revisionId: "mpr-b",
+          timestamp: LATER.toISOString(),
+          traceId: "trace-test",
+        }),
+      });
+    });
+  });
+
+  it("rolls back Profile revision append on stale CAS", () => {
+    usingFixture("profile-revision-conflict", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("assistant", "mpr-a", "pcr-a"));
+      const eventCount = count(db, "model_registry_events");
+
+      expect(() => repository.createProfileRevision({
+        ...context("event-profile-conflict", LATER),
+        profileId: profileId("assistant"),
+        expectedRevision: 99,
+        displayName: "Must not persist",
+        revision: profileRevision("mpr-conflict", "assistant", "pcr-a", { createdAt: LATER }),
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
+
+      expect(repository.getProfile(profileId("assistant"))).toEqual(expect.objectContaining({
+        displayName: "assistant",
+        activeRevisionId: null,
+        recordRevision: 0,
+      }));
+      expect(db.prepare(
+        "SELECT revision_id FROM model_profile_revisions WHERE revision_id = ?",
+      ).get("mpr-conflict")).toBeUndefined();
+      expect(count(db, "model_registry_events")).toBe(eventCount);
+    });
+  });
+
+  it("returns revision conflict before Profile revision ownership validation", () => {
+    usingFixture("profile-revision-cas-precedence", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("assistant", "mpr-a", "pcr-a"));
+      const eventCount = count(db, "model_registry_events");
+
+      expect(() => repository.createProfileRevision({
+        ...context("event-stale-owner", LATER),
+        profileId: profileId("assistant"),
+        expectedRevision: 99,
+        revision: profileRevision("mpr-mismatch", "different-profile", "pcr-a"),
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
+      expect(db.prepare(
+        "SELECT revision_id FROM model_profile_revisions WHERE revision_id = ?",
+      ).get("mpr-mismatch")).toBeUndefined();
+      expect(count(db, "model_registry_events")).toBe(eventCount);
+    });
+  });
+
+  it("rejects Profile revision append after retirement", () => {
+    usingFixture("profile-revision-retired", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("assistant", "mpr-a", "pcr-a"));
+      repository.retireProfile({
+        ...context("event-retire", LATER),
+        profileId: profileId("assistant"),
+        expectedRevision: 0,
+      });
+      const eventCount = count(db, "model_registry_events");
+
+      expect(() => repository.createProfileRevision({
+        ...context("event-profile-retired", LATER),
+        profileId: profileId("assistant"),
+        expectedRevision: 1,
+        revision: profileRevision("mpr-retired", "assistant", "pcr-a", { createdAt: LATER }),
+      })).toThrowError(expect.objectContaining({ code: "resource_retired" }));
+
+      expect(db.prepare(
+        "SELECT revision_id FROM model_profile_revisions WHERE revision_id = ?",
+      ).get("mpr-retired")).toBeUndefined();
+      expect(count(db, "model_registry_events")).toBe(eventCount);
+    });
+  });
+
   it("promotes only verified exact revisions without moving existing Assignments", () => {
     usingFixture("promotion", ({ db, repository }) => {
       repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
@@ -133,13 +255,18 @@ describe("SqliteModelRegistryRepository", () => {
         expectedRevision: 0,
       });
 
-      seedProfileRevision(db, profileRevision("mpr-new", "assistant", "pcr-a", { createdAt: LATER }));
+      repository.createProfileRevision({
+        ...context("event-create-new", LATER),
+        profileId: profileId("assistant"),
+        expectedRevision: 1,
+        revision: profileRevision("mpr-new", "assistant", "pcr-a", { createdAt: LATER }),
+      });
       seedPassingVerification(db, "ver-new", "mpr-new");
       const promoted = repository.promoteProfile({
         ...context("event-promote-new", LATER),
         profileId: profileId("assistant"),
         revisionId: profileRevisionId("mpr-new"),
-        expectedRevision: 1,
+        expectedRevision: 2,
       });
 
       expect(promoted.activeRevisionId).toBe("mpr-new");
@@ -150,7 +277,12 @@ describe("SqliteModelRegistryRepository", () => {
       expect(repository.getAssignment(agentId("primary"))?.modelProfileRevisionId)
         .toBe("mpr-old");
 
-      seedProfileRevision(db, profileRevision("mpr-conflict", "assistant", "pcr-a", { createdAt: LATER }));
+      repository.createProfileRevision({
+        ...context("event-create-conflict", LATER),
+        profileId: profileId("assistant"),
+        expectedRevision: 3,
+        revision: profileRevision("mpr-conflict", "assistant", "pcr-a", { createdAt: LATER }),
+      });
       seedPassingVerification(db, "ver-conflict", "mpr-conflict");
       const eventCount = count(db, "model_registry_events");
       expect(() => repository.promoteProfile({
@@ -160,6 +292,123 @@ describe("SqliteModelRegistryRepository", () => {
         expectedRevision: 99,
       })).toThrowError(expect.objectContaining({ code: "revision_conflict" }));
       expect(repository.getProfile(profileId("assistant")).activeRevisionId).toBe("mpr-new");
+      expect(count(db, "model_registry_events")).toBe(eventCount);
+    });
+  });
+
+  it.each(["draft", "failed", "superseded"] as const)(
+    "rejects %s Connection revision promotion despite historical discovery",
+    (state) => {
+      usingFixture(`connection-state-${state}`, ({ db, repository }) => {
+        repository.createConnection({
+          ...createConnectionInput("connection-a", "pcr-a"),
+          revision: connectionRevision("pcr-a", "connection-a", { state }),
+        });
+        seedSuccessfulDiscovery(db, "pcr-a", "dgn-a");
+        const eventCount = count(db, "model_registry_events");
+
+        expect(() => repository.promoteConnection({
+          ...context("event-invalid-state", LATER),
+          connectionId: connectionId("connection-a"),
+          revisionId: connectionRevisionId("pcr-a"),
+          expectedRevision: 0,
+        })).toThrowError(expect.objectContaining({ code: "verification_required" }));
+        expect(repository.getConnection(connectionId("connection-a")).activeRevisionId).toBeNull();
+        expect(count(db, "model_registry_events")).toBe(eventCount);
+      });
+    },
+  );
+
+  it.each(["draft", "failed", "superseded"] as const)(
+    "rejects %s Profile revision promotion despite historical Verification",
+    (state) => {
+      usingFixture(`profile-state-${state}`, ({ db, repository }) => {
+        repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+        seedSuccessfulDiscovery(db, "pcr-a", "dgn-a");
+        repository.promoteConnection({
+          ...context("event-promote-connection", LATER),
+          connectionId: connectionId("connection-a"),
+          revisionId: connectionRevisionId("pcr-a"),
+          expectedRevision: 0,
+        });
+        repository.createProfile({
+          ...createProfileInput("assistant", "mpr-a", "pcr-a"),
+          revision: profileRevision("mpr-a", "assistant", "pcr-a", { state }),
+        });
+        seedPassingVerification(db, "ver-a", "mpr-a");
+        const eventCount = count(db, "model_registry_events");
+
+        expect(() => repository.promoteProfile({
+          ...context("event-invalid-state", LATER),
+          profileId: profileId("assistant"),
+          revisionId: profileRevisionId("mpr-a"),
+          expectedRevision: 0,
+        })).toThrowError(expect.objectContaining({ code: "verification_required" }));
+        expect(repository.getProfile(profileId("assistant")).activeRevisionId).toBeNull();
+        expect(count(db, "model_registry_events")).toBe(eventCount);
+      });
+    },
+  );
+
+  it("returns revision conflict before invalid Connection promotion evidence", () => {
+    usingFixture("connection-cas-precedence", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      const eventCount = count(db, "model_registry_events");
+
+      expect(() => repository.promoteConnection({
+        ...context("event-stale", LATER),
+        connectionId: connectionId("connection-a"),
+        revisionId: connectionRevisionId("pcr-missing"),
+        expectedRevision: 99,
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
+      expect(repository.getConnection(connectionId("connection-a")).activeRevisionId).toBeNull();
+      expect(count(db, "model_registry_events")).toBe(eventCount);
+    });
+  });
+
+  it("returns revision conflict before invalid Profile promotion evidence", () => {
+    usingFixture("profile-cas-precedence", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("assistant", "mpr-a", "pcr-a"));
+      const eventCount = count(db, "model_registry_events");
+
+      expect(() => repository.promoteProfile({
+        ...context("event-stale", LATER),
+        profileId: profileId("assistant"),
+        revisionId: profileRevisionId("mpr-missing"),
+        expectedRevision: 99,
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
+      expect(repository.getProfile(profileId("assistant")).activeRevisionId).toBeNull();
+      expect(count(db, "model_registry_events")).toBe(eventCount);
+    });
+  });
+
+  it("returns revision conflict before invalid default target eligibility", () => {
+    usingFixture("default-cas-precedence", ({ db, repository }) => {
+      const eventCount = count(db, "model_registry_events");
+
+      expect(() => repository.setDefaultProfile({
+        ...context("event-stale", LATER),
+        profileId: profileId("missing"),
+        expectedRevision: 99,
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
+      expect(repository.getDefaultProfile()).toBeNull();
+      expect(count(db, "model_registry_events")).toBe(eventCount);
+    });
+  });
+
+  it("returns revision conflict before invalid Assignment target eligibility", () => {
+    usingFixture("assignment-cas-precedence", ({ db, repository }) => {
+      const eventCount = count(db, "model_registry_events");
+
+      expect(() => repository.setAssignment({
+        ...context("event-stale", LATER),
+        agentId: agentId("primary"),
+        profileRevisionId: profileRevisionId("mpr-missing"),
+        source: "explicit",
+        expectedRevision: 99,
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
+      expect(repository.getAssignment(agentId("primary"))).toBeNull();
       expect(count(db, "model_registry_events")).toBe(eventCount);
     });
   });
@@ -462,29 +711,6 @@ function seedPassingVerification(
     verificationId(verification), revision, "text_and_single_tool_call_v1", "passed",
     1, JSON.stringify(capabilities), "trace-verification", 0,
     NOW.toISOString(), NOW.toISOString(),
-  );
-}
-
-function seedProfileRevision(db: DatabaseSync, revision: ModelProfileRevision): void {
-  db.prepare(
-    `INSERT INTO model_profile_revisions (
-       revision_id, profile_id, connection_revision_id, state,
-       provider_model_id, invocation_protocol, max_input_tokens,
-       context_window_source, capability_baseline,
-       verified_capabilities_json, created_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    revision.revisionId,
-    revision.profileId,
-    revision.connectionRevisionId,
-    revision.state,
-    revision.providerModelId,
-    revision.invocationProtocol,
-    revision.maxInputTokens,
-    revision.contextWindowSource,
-    revision.capabilityBaseline,
-    JSON.stringify(revision.verifiedCapabilities),
-    revision.createdAt.toISOString(),
   );
 }
 
