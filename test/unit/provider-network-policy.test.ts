@@ -16,8 +16,11 @@ import type { ProviderConnectionRevision } from "../../src/domain/provider-conne
 describe("provider network policy", () => {
   it.each([
     "https://user@example.com/v1",
+    "https://@example.com/v1",
     "https://example.com/v1?q=x",
+    "https://example.com/v1?",
     "https://example.com/v1#x",
+    "https://example.com/v1#",
     "http://169.254.169.254/latest",
     "http://0.0.0.0/v1",
     "http://8.8.8.8/v1",

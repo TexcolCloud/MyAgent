@@ -10,6 +10,7 @@ import {
 import { createServer as createNetServer, type Server as NetServer } from "node:net";
 import type { AddressInfo, Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
+import { gzipSync } from "node:zlib";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -133,6 +134,132 @@ describe("NodeProviderHttpTransport", () => {
     ]);
   });
 
+  it("owns Accept-Encoding and requests an identity response", async () => {
+    let acceptEncoding: string | undefined;
+    const local = await startHttpServer((request, response) => {
+      acceptEncoding = request.headers["accept-encoding"];
+      response.end("identity");
+    });
+    servers.push(local.server);
+    const providerFetch = transport().createFetch({
+      connection: connection(local.url),
+      timeoutMs: 500,
+      maxResponseBytes: 64,
+    });
+
+    const response = await providerFetch(local.url, {
+      headers: { "Accept-Encoding": "gzip, deflate, br" },
+    });
+
+    await expect(response.text()).resolves.toBe("identity");
+    expect(acceptEncoding).toBe("identity");
+  });
+
+  it("rejects an encoded success response instead of exposing compressed bytes", async () => {
+    const local = await startHttpServer((_request, response) => {
+      response.writeHead(200, {
+        "content-encoding": "gzip",
+        "content-type": "application/json",
+      });
+      response.end(gzipSync('{"ok":true}'));
+    });
+    servers.push(local.server);
+    const providerFetch = transport().createFetch({
+      connection: connection(local.url),
+      timeoutMs: 500,
+      maxResponseBytes: 64,
+    });
+
+    const error = await providerFetch(local.url)
+      .then(async (response) => response.json())
+      .catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "model_protocol_error", transient: false });
+    expect(error).not.toHaveProperty("cause");
+  });
+
+  it("does not retain error listeners across upload backpressure", async () => {
+    const warnings: Error[] = [];
+    const onWarning = (warning: Error): void => {
+      if (
+        warning.name === "MaxListenersExceededWarning" &&
+        warning.message.includes("ClientRequest")
+      ) {
+        warnings.push(warning);
+      }
+    };
+    process.on("warning", onWarning);
+    const local = await startHttpServer((request, response) => {
+      request.resume();
+      request.on("end", () => response.end("uploaded"));
+    });
+    servers.push(local.server);
+    let chunk = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (chunk === 12) {
+          controller.close();
+          return;
+        }
+        chunk += 1;
+        controller.enqueue(new Uint8Array(64 * 1024));
+      },
+    });
+    const providerFetch = transport().createFetch({
+      connection: connection(local.url),
+      timeoutMs: 2_000,
+      maxResponseBytes: 64,
+    });
+
+    try {
+      const response = await providerFetch(local.url, {
+        method: "POST",
+        body,
+        duplex: "half",
+      } as RequestInit);
+      await expect(response.text()).resolves.toBe("uploaded");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(warnings).toEqual([]);
+    } finally {
+      process.off("warning", onWarning);
+    }
+  });
+
+  it("cancels a stalled streaming body when the request is aborted", async () => {
+    const controller = new AbortController();
+    let observeCancellation: (() => void) | undefined;
+    const cancellation = new Promise<void>((resolve) => {
+      observeCancellation = resolve;
+    });
+    const body = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        streamController.enqueue(new Uint8Array([1]));
+      },
+      cancel() {
+        observeCancellation?.();
+      },
+    });
+    const local = await startHttpServer((request) => {
+      request.once("data", () => controller.abort("secret abort reason"));
+    });
+    servers.push(local.server);
+    const providerFetch = transport().createFetch({
+      connection: connection(local.url),
+      timeoutMs: 500,
+      maxResponseBytes: 64,
+    });
+
+    const error = await providerFetch(local.url, {
+      method: "POST",
+      body,
+      duplex: "half",
+      signal: controller.signal,
+    } as RequestInit).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ name: "AbortError" });
+    await expect(settlesWithin(cancellation, 100)).resolves.toBe(true);
+  });
+
   it("strips SDK authorization when the connection has no auth", async () => {
     let authorization: string | undefined;
     const local = await startHttpServer((request, response) => {
@@ -211,6 +338,49 @@ describe("NodeProviderHttpTransport", () => {
     expect(authorizations).toEqual(["Bearer redirect-token", "Bearer redirect-token"]);
     expect(resolutions).toBe(2);
   });
+
+  it.each([
+    [301, "GET", "GET"],
+    [301, "HEAD", "HEAD"],
+    [301, "POST", "GET"],
+    [302, "GET", "GET"],
+    [302, "HEAD", "HEAD"],
+    [302, "POST", "GET"],
+    [303, "GET", "GET"],
+    [303, "HEAD", "HEAD"],
+    [303, "POST", "GET"],
+    [307, "GET", "GET"],
+    [307, "HEAD", "HEAD"],
+    [307, "POST", "POST"],
+    [308, "GET", "GET"],
+    [308, "HEAD", "HEAD"],
+    [308, "POST", "POST"],
+  ] as const)(
+    "handles HTTP %i redirect from %s as %s",
+    async (status, method, redirectedMethod) => {
+      const methods: string[] = [];
+      const local = await startHttpServer((request, response) => {
+        methods.push(request.method ?? "");
+        if (request.url === "/start") {
+          response.writeHead(status, { location: "/end" });
+          response.end();
+          return;
+        }
+        response.end("redirected");
+      });
+      servers.push(local.server);
+      const providerFetch = transport().createFetch({
+        connection: connection(local.url),
+        timeoutMs: 500,
+        maxResponseBytes: 64,
+      });
+
+      const response = await providerFetch(`${local.url}/start`, { method });
+      await response.arrayBuffer();
+
+      expect(methods).toEqual([method, redirectedMethod]);
+    },
+  );
 
   it("rejects cross-origin redirects without contacting or authorizing the target", async () => {
     let targetRequests = 0;
@@ -522,6 +692,16 @@ async function listen(server: TestServer): Promise<void> {
     server.listen(0, "127.0.0.1", () => {
       server.off("error", reject);
       resolve();
+    });
+  });
+}
+
+async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMs);
+    promise.then(() => {
+      clearTimeout(timeout);
+      resolve(true);
     });
   });
 }
