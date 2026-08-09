@@ -1,3 +1,4 @@
+import canonicalizeModule from "canonicalize";
 import OpenAI from "openai";
 import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import type {
@@ -36,6 +37,10 @@ interface ToolCallFragments {
 
 const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_BYTES = 16 * 1_024 * 1_024;
+const MAX_RETRY_AFTER_MS = 30_000;
+const canonicalizeJson = canonicalizeModule as unknown as (
+  input: unknown,
+) => string | undefined;
 
 export class OpenAiChatCompletionsModel implements ModelPort {
   constructor(private readonly options: OpenAiChatCompletionsModelOptions) {}
@@ -44,7 +49,7 @@ export class OpenAiChatCompletionsModel implements ModelPort {
     request: ModelRequest,
     signal: AbortSignal,
   ): AsyncIterable<ModelChunk> {
-    signal.throwIfAborted();
+    if (signal.aborted) throw abortError();
     if (request.model.invocationProtocol !== "chat_completions") {
       throw new ModelProviderError({
         transient: false,
@@ -73,6 +78,7 @@ export class OpenAiChatCompletionsModel implements ModelPort {
     let toolCall: ToolCallFragments | undefined;
     let finishReason: string | undefined;
     let usage: ModelUsage | undefined;
+    let sawText = false;
 
     try {
       const stream = await client.chat.completions.create(
@@ -86,9 +92,10 @@ export class OpenAiChatCompletionsModel implements ModelPort {
             : {
                 tools,
                 parallel_tool_calls: false,
-                ...(request.toolChoice === undefined
-                  ? {}
-                  : { tool_choice: request.toolChoice }),
+                ...(request.purpose === "verification_tool" &&
+                    request.toolChoice === "required"
+                  ? { tool_choice: "required" as const }
+                  : {}),
               }),
         },
         { signal },
@@ -99,14 +106,23 @@ export class OpenAiChatCompletionsModel implements ModelPort {
         if (extractedUsage !== undefined) {
           usage = extractedUsage;
         }
-        for (const choice of chunk.choices) {
-          if (choice.delta.content !== null && choice.delta.content !== undefined) {
-            yield { type: "text_delta", text: choice.delta.content };
-          }
-          toolCall = appendToolCall(toolCall, choice);
-          if (choice.finish_reason !== null) {
-            finishReason = choice.finish_reason;
-          }
+        if (chunk.choices.length > 1) throw protocolError();
+        const choice = chunk.choices[0];
+        if (choice === undefined) continue;
+        if (finishReason !== undefined || choice.index !== 0) {
+          throw protocolError();
+        }
+        if (
+          choice.delta.content !== null &&
+          choice.delta.content !== undefined &&
+          choice.delta.content.length > 0
+        ) {
+          sawText = true;
+          yield { type: "text_delta", text: choice.delta.content };
+        }
+        toolCall = appendToolCall(toolCall, choice);
+        if (choice.finish_reason !== null) {
+          finishReason = choice.finish_reason;
         }
       }
     } catch (error) {
@@ -119,7 +135,8 @@ export class OpenAiChatCompletionsModel implements ModelPort {
     const normalizedFinishReason = normalizeFinishReason(finishReason);
     if (
       (toolCall === undefined && normalizedFinishReason === "tool_call") ||
-      (toolCall !== undefined && normalizedFinishReason !== "tool_call")
+      (toolCall !== undefined && normalizedFinishReason !== "tool_call") ||
+      (toolCall === undefined && !sawText)
     ) {
       throw protocolError();
     }
@@ -138,19 +155,25 @@ function appendToolCall(
   current: ToolCallFragments | undefined,
   choice: ChatCompletionChunk.Choice,
 ): ToolCallFragments | undefined {
-  for (const delta of choice.delta.tool_calls ?? []) {
+  const deltas = choice.delta.tool_calls ?? [];
+  if (deltas.length > 1) throw protocolError();
+  for (const delta of deltas) {
     if (current !== undefined && current.index !== delta.index) {
       throw protocolError();
     }
     current ??= { index: delta.index, callId: "", name: "", arguments: "" };
-    if (delta.id !== undefined) {
-      if (current.callId.length > 0 && current.callId !== delta.id) {
-        throw protocolError();
-      }
-      current.callId = delta.id;
+    if (delta.id !== undefined && delta.id.length > 0) {
+      current.callId += delta.id;
     }
-    current.name += delta.function?.name ?? "";
-    current.arguments += delta.function?.arguments ?? "";
+    if (delta.function?.name !== undefined && delta.function.name.length > 0) {
+      current.name += delta.function.name;
+    }
+    if (
+      delta.function?.arguments !== undefined &&
+      delta.function.arguments.length > 0
+    ) {
+      current.arguments += delta.function.arguments;
+    }
   }
   return current;
 }
@@ -158,7 +181,11 @@ function appendToolCall(
 function parseToolCall(
   call: ToolCallFragments,
 ): { callId: string; name: string; arguments: JsonValue } {
-  if (call.callId.length === 0 || call.name.length === 0) {
+  if (
+    !/^[\x21-\x7e]{1,200}$/.test(call.callId) ||
+    call.name.length === 0 ||
+    call.arguments.length === 0
+  ) {
     throw protocolError();
   }
   try {
@@ -191,20 +218,13 @@ function mapUsage(chunk: ChatCompletionChunk): ModelUsage | undefined {
 
 function toModelProviderError(error: unknown, signal: AbortSignal): Error {
   if (signal.aborted) {
-    return signal.reason instanceof Error
-      ? signal.reason
-      : new DOMException("The operation was aborted", "AbortError");
+    return abortError();
   }
   const providerError = findProviderError(error);
   if (providerError !== undefined) return providerError;
   if (error instanceof OpenAI.APIError) {
     const status = error.status;
-    return new ModelProviderError({
-      transient: isTransientStatus(status),
-      code: safeProviderCode(error.code, status),
-      ...(status === undefined ? {} : { status }),
-      ...retryAfter(error.headers),
-    });
+    return safeStatusError(status, error.headers);
   }
   return new ModelProviderError({ transient: true, code: "provider_unavailable" });
 }
@@ -256,34 +276,47 @@ function sameAuth(
 }
 
 function chatMessages(input: readonly ModelInput[]): ChatCompletionMessageParam[] {
-  return input.map((entry): ChatCompletionMessageParam => {
+  const messages: ChatCompletionMessageParam[] = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const entry = input[index] as ModelInput;
     if (entry.type === "message") {
-      return {
+      messages.push({
         role: entry.role,
         content: entry.content,
         ...(entry.name === undefined ? {} : { name: entry.name }),
-      } as ChatCompletionMessageParam;
+      } as ChatCompletionMessageParam);
+      continue;
     }
-    if (entry.type === "assistant_tool_call") {
-      return {
-        role: "assistant",
-        content: null,
-        tool_calls: [{
-          id: entry.callId,
-          type: "function",
-          function: {
-            name: entry.name,
-            arguments: JSON.stringify(entry.arguments),
-          },
-        }],
-      };
+    if (entry.type === "tool_result") throw protocolError();
+    const result = input[index + 1];
+    if (
+      result === undefined ||
+      result.type !== "tool_result" ||
+      result.callId !== entry.callId ||
+      result.name !== entry.name ||
+      !/^[\x21-\x7e]{1,200}$/.test(entry.callId)
+    ) {
+      throw protocolError();
     }
-    return {
+    messages.push({
+      role: "assistant",
+      tool_calls: [{
+        id: entry.callId,
+        type: "function",
+        function: {
+          name: entry.name,
+          arguments: canonicalJson(entry.arguments),
+        },
+      }],
+    });
+    messages.push({
       role: "tool",
-      tool_call_id: entry.callId,
-      content: JSON.stringify(entry.output),
-    };
-  });
+      tool_call_id: result.callId,
+      content: canonicalJson(result.output),
+    });
+    index += 1;
+  }
+  return messages;
 }
 
 function normalizeFinishReason(value: string): ModelFinishReason {
@@ -305,14 +338,44 @@ function protocolError(): ModelProviderError {
   return new ModelProviderError({ transient: false, code: "model_protocol_error" });
 }
 
-function safeProviderCode(code: string | null | undefined, status: number | undefined): string {
-  return code !== undefined && code !== null && /^[a-z0-9_]{1,64}$/i.test(code)
-    ? code
-    : `http_${String(status ?? "error")}`;
-}
-
-function isTransientStatus(status: number | undefined): boolean {
-  return status === 408 || status === 409 || status === 425 || status === 429 || (status !== undefined && status >= 500);
+function safeStatusError(
+  status: number | undefined,
+  headers: Headers | undefined,
+): ModelProviderError {
+  if (status === undefined) {
+    return new ModelProviderError({
+      transient: true,
+      code: "provider_unavailable",
+    });
+  }
+  if (status === 401 || status === 403) {
+    return new ModelProviderError({
+      transient: false,
+      code: "provider_auth_failed",
+      status,
+    });
+  }
+  if (status === 429) {
+    return new ModelProviderError({
+      transient: true,
+      code: "provider_rate_limited",
+      status,
+      ...retryAfter(headers),
+    });
+  }
+  if (status === 408 || status === 425 || status >= 500) {
+    return new ModelProviderError({
+      transient: true,
+      code: "provider_unavailable",
+      status,
+      ...retryAfter(headers),
+    });
+  }
+  return new ModelProviderError({
+    transient: false,
+    code: "model_protocol_error",
+    status,
+  });
 }
 
 function retryAfter(headers: Headers | undefined): { retryAfterMs?: number } {
@@ -322,12 +385,22 @@ function retryAfter(headers: Headers | undefined): { retryAfterMs?: number } {
   }
   const seconds = Number(value);
   if (Number.isFinite(seconds) && seconds >= 0) {
-    return { retryAfterMs: Math.round(seconds * 1_000) };
+    return { retryAfterMs: Math.min(Math.round(seconds * 1_000), MAX_RETRY_AFTER_MS) };
   }
   const retryAt = Date.parse(value);
   return Number.isFinite(retryAt)
-    ? { retryAfterMs: Math.max(0, retryAt - Date.now()) }
+    ? { retryAfterMs: Math.min(Math.max(0, retryAt - Date.now()), MAX_RETRY_AFTER_MS) }
     : {};
+}
+
+function canonicalJson(value: JsonValue): string {
+  const encoded = canonicalizeJson(value);
+  if (encoded === undefined) throw protocolError();
+  return encoded;
+}
+
+function abortError(): DOMException {
+  return new DOMException("The operation was aborted", "AbortError");
 }
 
 function isJsonValue(value: unknown): value is JsonValue {
