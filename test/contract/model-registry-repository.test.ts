@@ -5,7 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
-import type { AgentId, ManagedSecretVersionId, ModelProfileId, ModelProfileRevisionId, ModelRegistryEventId, ModelVerificationId, ProviderConnectionId, ProviderConnectionRevisionId } from "../../src/domain/ids.js";
+import type { AgentId, DiscoveryGenerationId, ManagedSecretVersionId, ModelProfileId, ModelProfileRevisionId, ModelRegistryEventId, ModelVerificationId, ProviderConnectionId, ProviderConnectionRevisionId } from "../../src/domain/ids.js";
 import type { ModelProfileRevision } from "../../src/domain/model-profile.js";
 import type { ProviderAuth, ProviderConnectionRevision } from "../../src/domain/provider-connection.js";
 import type { MutationContext } from "../../src/ports/model-registry-store.js";
@@ -15,6 +15,594 @@ const NOW = new Date("2026-08-09T00:00:00.000Z");
 const LATER = new Date("2026-08-09T00:01:00.000Z");
 
 describe("SqliteModelRegistryRepository", () => {
+  it("replaces discovery generations atomically and preserves stale models on refresh failure", () => {
+    usingFixture("discovery-generations", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+
+      expect(repository.recordDiscovery({
+        ...context("event-discovery-a", NOW),
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        generationId: discoveryGenerationId("dgn-a"),
+        expectedRevision: 0,
+        state: "fresh",
+        models: [
+          { id: "model-a", owner: "provider", createdAt: NOW },
+          { id: "model-old" },
+        ],
+        expiresAt: LATER,
+      })).toEqual({
+        connectionRevisionId: "pcr-a",
+        state: "fresh",
+        models: [
+          { id: "model-a", owner: "provider", createdAt: NOW },
+          { id: "model-old" },
+        ],
+        fetchedAt: NOW,
+        expiresAt: LATER,
+      });
+      expect(repository.getConnection(connectionId("connection-a"))).toMatchObject({
+        activeRevisionId: null,
+        recordRevision: 1,
+        revisions: [expect.objectContaining({ revisionId: "pcr-a", state: "verified" })],
+      });
+
+      expect(() => repository.recordDiscovery({
+        ...context("event-discovery-invalid", LATER),
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        generationId: discoveryGenerationId("dgn-invalid"),
+        expectedRevision: 1,
+        state: "fresh",
+        models: [{ id: "duplicate" }, { id: "duplicate" }],
+        expiresAt: new Date("2026-08-09T00:02:00.000Z"),
+      })).toThrow();
+      expect(db.prepare(
+        "SELECT generation_id FROM discovery_generations WHERE generation_id = ?",
+      ).get("dgn-invalid")).toBeUndefined();
+      expect(repository.getConnection(connectionId("connection-a")).recordRevision).toBe(1);
+
+      expect(repository.recordDiscovery({
+        ...context("event-discovery-failed", LATER),
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        generationId: discoveryGenerationId("dgn-failed"),
+        expectedRevision: 1,
+        state: "failed",
+        models: [],
+        error: { code: "provider_unavailable", status: 503 },
+      })).toEqual({
+        connectionRevisionId: "pcr-a",
+        state: "stale",
+        models: [
+          { id: "model-a", owner: "provider", createdAt: NOW },
+          { id: "model-old" },
+        ],
+        fetchedAt: NOW,
+        expiresAt: LATER,
+        refreshError: {
+          code: "provider_unavailable",
+          status: 503,
+          traceId: "trace-test",
+        },
+      });
+      expect(repository.getDiscoveredModels(
+        connectionRevisionId("pcr-a"),
+        LATER,
+      )).toEqual(expect.objectContaining({
+        state: "stale",
+        models: [
+          { id: "model-a", owner: "provider", createdAt: NOW },
+          { id: "model-old" },
+        ],
+        refreshError: { code: "provider_unavailable", status: 503, traceId: "trace-test" },
+      }));
+      expect(db.prepare(
+        "SELECT COUNT(*) AS count FROM discovered_models WHERE generation_id = ?",
+      ).get("dgn-failed")).toEqual({ count: 0 });
+    });
+  });
+
+  it.each(["fresh", "empty"] as const)(
+    "makes only the exact Connection revision verified after %s discovery",
+    (state) => {
+      usingFixture(`discovery-${state}`, ({ repository }) => {
+        repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+        repository.createConnectionRevision({
+          ...context("event-revision-b", NOW),
+          connectionId: connectionId("connection-a"),
+          expectedRevision: 0,
+          revision: connectionRevision("pcr-b", "connection-a", { state: "draft" }),
+        });
+
+        repository.recordDiscovery({
+          ...context(`event-discovery-${state}`, LATER),
+          connectionRevisionId: connectionRevisionId("pcr-b"),
+          generationId: discoveryGenerationId(`dgn-${state}`),
+          expectedRevision: 1,
+          state,
+          models: state === "fresh" ? [{ id: "model-b" }] : [],
+          expiresAt: new Date("2026-08-09T00:02:00.000Z"),
+        });
+
+        const connection = repository.getConnection(connectionId("connection-a"));
+        expect(connection.activeRevisionId).toBeNull();
+        expect(connection.revisions.map(({ revisionId, state: revisionState }) => ({
+          revisionId,
+          state: revisionState,
+        }))).toEqual([
+          { revisionId: "pcr-a", state: "verified" },
+          { revisionId: "pcr-b", state: "verified" },
+        ]);
+      });
+    },
+  );
+
+  it.each(["unsupported", "failed"] as const)(
+    "does not verify a Connection revision after %s discovery",
+    (state) => {
+      usingFixture(`discovery-${state}`, ({ repository }) => {
+        repository.createConnection({
+          ...createConnectionInput("connection-a", "pcr-a"),
+          revision: connectionRevision("pcr-a", "connection-a", { state: "draft" }),
+        });
+
+        repository.recordDiscovery({
+          ...context(`event-discovery-${state}`, LATER),
+          connectionRevisionId: connectionRevisionId("pcr-a"),
+          generationId: discoveryGenerationId(`dgn-${state}`),
+          expectedRevision: 0,
+          state,
+          models: [],
+          ...(state === "failed"
+            ? { error: { code: "provider_unavailable" } }
+            : {}),
+        });
+
+        expect(repository.getConnection(connectionId("connection-a")).revisions[0]?.state)
+          .toBe("draft");
+      });
+    },
+  );
+
+  it("claims FIFO Verification work and reclaims expiry after restart without counting an attempt", () => {
+    usingFixture("verification-claim", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("profile-a", "mpr-a", "pcr-a"));
+      repository.createProfile(createProfileInput("profile-b", "mpr-b", "pcr-a"));
+      repository.queueVerification(queueInput("ver-a", "mpr-a", "event-queue-a", NOW));
+      repository.queueVerification(queueInput(
+        "ver-b",
+        "mpr-b",
+        "event-queue-b",
+        new Date("2026-08-09T00:00:01.000Z"),
+      ));
+
+      const first = repository.claimVerification({
+        leaseOwner: "worker-a",
+        now: NOW,
+        leaseUntil: new Date("2026-08-09T00:00:30.000Z"),
+      });
+      expect(first).toMatchObject({
+        verificationId: "ver-a",
+        state: "running",
+        attemptCount: 0,
+        leaseOwner: "worker-a",
+      });
+      expect(repository.claimVerification({
+        leaseOwner: "worker-b",
+        now: new Date("2026-08-09T00:00:10.000Z"),
+        leaseUntil: new Date("2026-08-09T00:00:40.000Z"),
+      })?.verificationId).toBe("ver-b");
+      expect(repository.claimVerification({
+        leaseOwner: "worker-c",
+        now: new Date("2026-08-09T00:00:20.000Z"),
+        leaseUntil: new Date("2026-08-09T00:00:50.000Z"),
+      })).toBeNull();
+      const restartedRepository = new SqliteModelRegistryRepository(db);
+      expect(restartedRepository.claimVerification({
+        leaseOwner: "worker-c",
+        now: new Date("2026-08-09T00:00:30.000Z"),
+        leaseUntil: new Date("2026-08-09T00:01:00.000Z"),
+      })).toMatchObject({
+        verificationId: "ver-a",
+        state: "running",
+        attemptCount: 0,
+        leaseOwner: "worker-c",
+      });
+    });
+  });
+
+  it("counts attempts only for a live owner and renews only an unexpired owned lease", () => {
+    usingFixture("verification-attempt-renew", ({ repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("profile-a", "mpr-a", "pcr-a"));
+      repository.queueVerification(queueInput("ver-a", "mpr-a", "event-queue", NOW));
+      repository.claimVerification({
+        leaseOwner: "worker-a",
+        now: NOW,
+        leaseUntil: new Date("2026-08-09T00:00:30.000Z"),
+      });
+
+      expect(() => repository.beginVerificationAttempt({
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-b",
+        now: new Date("2026-08-09T00:00:10.000Z"),
+      })).toThrow();
+      expect(repository.beginVerificationAttempt({
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        now: new Date("2026-08-09T00:00:10.000Z"),
+      }).attemptCount).toBe(1);
+      expect(repository.renewVerificationLease({
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-b",
+        now: new Date("2026-08-09T00:00:20.000Z"),
+        leaseUntil: new Date("2026-08-09T00:01:00.000Z"),
+      })).toBe(false);
+      expect(repository.renewVerificationLease({
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        now: new Date("2026-08-09T00:00:20.000Z"),
+        leaseUntil: new Date("2026-08-09T00:01:00.000Z"),
+      })).toBe(true);
+      expect(repository.beginVerificationAttempt({
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        now: new Date("2026-08-09T00:00:59.000Z"),
+      }).attemptCount).toBe(2);
+      expect(repository.renewVerificationLease({
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        now: new Date("2026-08-09T00:01:00.000Z"),
+        leaseUntil: new Date("2026-08-09T00:01:30.000Z"),
+      })).toBe(false);
+      expect(() => repository.completeVerification({
+        ...context("event-expired-complete", new Date("2026-08-09T00:01:00.000Z")),
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        outcome: "failed",
+        capabilities: [],
+        resultCode: "provider_unavailable",
+      })).toThrowError(expect.objectContaining({ code: "verification_lease_lost" }));
+      expect(repository.getVerification(verificationId("ver-a")).attemptCount).toBe(2);
+    });
+  });
+
+  it("cancels non-terminal Verification work idempotently and retains its history", () => {
+    usingFixture("verification-cancel", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("profile-a", "mpr-a", "pcr-a"));
+      repository.queueVerification(queueInput("ver-a", "mpr-a", "event-queue", NOW));
+
+      const cancelled = repository.cancelVerification({
+        ...context("event-cancel", LATER),
+        verificationId: verificationId("ver-a"),
+        expectedRevision: 0,
+      });
+      expect(cancelled).toMatchObject({
+        verificationId: "ver-a",
+        state: "cancelled",
+        cancellationRequestedAt: LATER,
+        recordRevision: 1,
+      });
+      expect(repository.cancelVerification({
+        ...context("event-cancel-repeat", LATER),
+        verificationId: verificationId("ver-a"),
+        expectedRevision: 1,
+      })).toEqual(cancelled);
+      expect(db.prepare(
+        "SELECT verification_id, state FROM model_verifications WHERE verification_id = ?",
+      ).get("ver-a")).toEqual({ verification_id: "ver-a", state: "cancelled" });
+      expect(db.prepare(
+        "SELECT action FROM model_registry_events WHERE resource_id = ? ORDER BY created_at",
+      ).all("ver-a")).toEqual([
+        { action: "verification.queued" },
+        { action: "verification.cancelled" },
+      ]);
+    });
+  });
+
+  it("completes passing Verification with safe evidence and exact revision state only", () => {
+    usingFixture("verification-complete-pass", ({ db, repository }) => {
+      repository.createConnection({
+        ...createConnectionInput("connection-a", "pcr-a"),
+        revision: connectionRevision("pcr-a", "connection-a", { state: "draft" }),
+      });
+      repository.createProfile({
+        ...createProfileInput("profile-a", "mpr-a", "pcr-a"),
+        revision: profileRevision("mpr-a", "profile-a", "pcr-a", {
+          state: "draft",
+          verifiedCapabilities: [],
+        }),
+      });
+      repository.queueVerification(queueInput("ver-a", "mpr-a", "event-queue", NOW));
+      repository.claimVerification({
+        leaseOwner: "worker-a",
+        now: NOW,
+        leaseUntil: new Date("2026-08-09T00:02:00.000Z"),
+      });
+      repository.beginVerificationAttempt({
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        now: new Date("2026-08-09T00:00:10.000Z"),
+      });
+
+      expect(() => repository.completeVerification({
+        ...context("event-wrong-owner", LATER),
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-b",
+        outcome: "passed",
+        capabilities: ["streaming_text", "single_tool_call"],
+      })).toThrowError(expect.objectContaining({ code: "verification_lease_lost" }));
+      expect(repository.getVerification(verificationId("ver-a"))).toMatchObject({
+        state: "running",
+        leaseOwner: "worker-a",
+        attemptCount: 1,
+      });
+
+      const completed = repository.completeVerification({
+        ...context("event-complete", LATER),
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        outcome: "passed",
+        capabilities: ["streaming_text", "single_tool_call"],
+        usage: { inputTokens: 7, outputTokens: 3 },
+      });
+      expect(completed).toMatchObject({
+        state: "passed",
+        attemptCount: 1,
+        capabilities: ["streaming_text", "single_tool_call"],
+        usage: { inputTokens: 7, outputTokens: 3 },
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        fallbackVerificationId: null,
+      });
+      expect(repository.getProfile(profileId("profile-a"))).toMatchObject({
+        activeRevisionId: null,
+        revisions: [expect.objectContaining({
+          revisionId: "mpr-a",
+          state: "verified",
+          verifiedCapabilities: ["streaming_text", "single_tool_call"],
+        })],
+      });
+      expect(repository.getConnection(connectionId("connection-a"))).toMatchObject({
+        activeRevisionId: null,
+        revisions: [expect.objectContaining({ revisionId: "pcr-a", state: "verified" })],
+      });
+      expect(db.prepare(
+        `SELECT outcome, consecutive_failures, code, safe_status, trace_id
+         FROM provider_health WHERE connection_revision_id = ? AND profile_revision_id = ?`,
+      ).get("pcr-a", "mpr-a")).toEqual({
+        outcome: "success",
+        consecutive_failures: 0,
+        code: null,
+        safe_status: null,
+        trace_id: "trace-test",
+      });
+      expect(JSON.stringify(db.prepare(
+        "SELECT * FROM model_verifications WHERE verification_id = ?",
+      ).get("ver-a"))).not.toContain("prompt");
+    });
+  });
+
+  it("fails only the exact candidate and updates exact health without configuration authority", () => {
+    usingFixture("verification-complete-failure", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("profile-a", "mpr-a", "pcr-a"));
+      repository.createProfileRevision({
+        ...context("event-profile-b", NOW),
+        profileId: profileId("profile-a"),
+        expectedRevision: 0,
+        revision: profileRevision("mpr-b", "profile-a", "pcr-a", {
+          state: "draft",
+          verifiedCapabilities: [],
+        }),
+      });
+      repository.queueVerification(queueInput(
+        "ver-b",
+        "mpr-b",
+        "event-queue",
+        NOW,
+        1,
+      ));
+      repository.claimVerification({
+        leaseOwner: "worker-a",
+        now: NOW,
+        leaseUntil: new Date("2026-08-09T00:02:00.000Z"),
+      });
+      repository.beginVerificationAttempt({
+        verificationId: verificationId("ver-b"),
+        leaseOwner: "worker-a",
+        now: new Date("2026-08-09T00:00:10.000Z"),
+      });
+
+      expect(repository.completeVerification({
+        ...context("event-complete", LATER),
+        verificationId: verificationId("ver-b"),
+        leaseOwner: "worker-a",
+        outcome: "failed",
+        capabilities: ["streaming_text"],
+        resultCode: "tool_call_unsupported",
+        safeStatus: 422,
+      })).toMatchObject({
+        state: "failed",
+        resultCode: "tool_call_unsupported",
+        safeStatus: 422,
+      });
+      expect(repository.getProfile(profileId("profile-a")).revisions.map((revision) => ({
+        revisionId: revision.revisionId,
+        state: revision.state,
+      }))).toEqual([
+        { revisionId: "mpr-a", state: "verified" },
+        { revisionId: "mpr-b", state: "failed" },
+      ]);
+      expect(repository.getConnection(connectionId("connection-a"))).toMatchObject({
+        activeRevisionId: null,
+        revisions: [expect.objectContaining({ revisionId: "pcr-a", state: "verified" })],
+      });
+      expect(db.prepare(
+        `SELECT outcome, consecutive_failures, code, safe_status
+         FROM provider_health WHERE connection_revision_id = ? AND profile_revision_id = ?`,
+      ).get("pcr-a", "mpr-b")).toEqual({
+        outcome: "failure",
+        consecutive_failures: 1,
+        code: "tool_call_unsupported",
+        safe_status: 422,
+      });
+    });
+  });
+
+  it("rolls back terminal completion when atomic fallback enqueue conflicts", () => {
+    usingFixture("verification-fallback", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile({
+        ...createProfileInput("profile-a", "mpr-a", "pcr-a"),
+        revision: profileRevision("mpr-a", "profile-a", "pcr-a", {
+          state: "draft",
+          verifiedCapabilities: [],
+        }),
+      });
+      repository.queueVerification(queueInput("ver-a", "mpr-a", "event-queue", NOW));
+      repository.claimVerification({
+        leaseOwner: "worker-a",
+        now: NOW,
+        leaseUntil: new Date("2026-08-09T00:02:00.000Z"),
+      });
+      repository.beginVerificationAttempt({
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        now: new Date("2026-08-09T00:00:10.000Z"),
+      });
+      const fallbackRevision = profileRevision("mpr-fallback", "profile-a", "pcr-a", {
+        state: "draft",
+        invocationProtocol: "chat_completions",
+        verifiedCapabilities: [],
+        createdAt: LATER,
+      });
+
+      expect(() => repository.completeVerification({
+        ...context("event-complete-conflict", LATER),
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        outcome: "failed",
+        capabilities: [],
+        resultCode: "invocation_protocol_unsupported",
+        safeStatus: 404,
+        fallback: {
+          revision: fallbackRevision,
+          verification: queueInput(
+            "ver-fallback",
+            "mpr-fallback",
+            "event-fallback",
+            LATER,
+            99,
+          ),
+        },
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
+      expect(repository.getVerification(verificationId("ver-a")).state).toBe("running");
+      expect(db.prepare(
+        "SELECT revision_id FROM model_profile_revisions WHERE revision_id = ?",
+      ).get("mpr-fallback")).toBeUndefined();
+
+      const completed = repository.completeVerification({
+        ...context("event-complete", LATER),
+        verificationId: verificationId("ver-a"),
+        leaseOwner: "worker-a",
+        outcome: "failed",
+        capabilities: [],
+        resultCode: "invocation_protocol_unsupported",
+        safeStatus: 404,
+        fallback: {
+          revision: fallbackRevision,
+          verification: queueInput(
+            "ver-fallback",
+            "mpr-fallback",
+            "event-fallback",
+            LATER,
+            1,
+          ),
+        },
+      });
+      expect(completed).toMatchObject({
+        state: "failed",
+        fallbackVerificationId: "ver-fallback",
+      });
+      expect(repository.getVerification(verificationId("ver-fallback"))).toMatchObject({
+        profileRevisionId: "mpr-fallback",
+        state: "queued",
+        attemptCount: 0,
+      });
+      expect(repository.getProfile(profileId("profile-a"))).toMatchObject({
+        recordRevision: 2,
+        activeRevisionId: null,
+        revisions: [
+          expect.objectContaining({ revisionId: "mpr-a", state: "failed" }),
+          expect.objectContaining({ revisionId: "mpr-fallback", state: "verifying" }),
+        ],
+      });
+    });
+  });
+
+  it("records exact health observations without audit or Registry configuration authority", () => {
+    usingFixture("provider-health", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile(createProfileInput("profile-a", "mpr-a", "pcr-a"));
+      const auditCount = count(db, "model_registry_events");
+      const connectionBefore = repository.getConnection(connectionId("connection-a"));
+      const profileBefore = repository.getProfile(profileId("profile-a"));
+
+      repository.recordProviderHealth({
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        profileRevisionId: profileRevisionId("mpr-a"),
+        outcome: "failure",
+        code: "provider_unavailable",
+        safeStatus: 503,
+        traceId: "trace-health-1",
+        observedAt: NOW,
+      });
+      repository.recordProviderHealth({
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        profileRevisionId: profileRevisionId("mpr-a"),
+        outcome: "failure",
+        code: "provider_rate_limited",
+        safeStatus: 429,
+        traceId: "trace-health-2",
+        observedAt: LATER,
+      });
+      expect(db.prepare(
+        `SELECT outcome, consecutive_failures, code, safe_status, trace_id, record_revision
+         FROM provider_health WHERE connection_revision_id = ? AND profile_revision_id = ?`,
+      ).get("pcr-a", "mpr-a")).toEqual({
+        outcome: "failure",
+        consecutive_failures: 2,
+        code: "provider_rate_limited",
+        safe_status: 429,
+        trace_id: "trace-health-2",
+        record_revision: 1,
+      });
+      repository.recordProviderHealth({
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        profileRevisionId: profileRevisionId("mpr-a"),
+        outcome: "success",
+        traceId: "trace-health-3",
+        observedAt: new Date("2026-08-09T00:02:00.000Z"),
+      });
+      expect(db.prepare(
+        `SELECT outcome, consecutive_failures, code, safe_status, record_revision
+         FROM provider_health WHERE connection_revision_id = ? AND profile_revision_id = ?`,
+      ).get("pcr-a", "mpr-a")).toEqual({
+        outcome: "success",
+        consecutive_failures: 0,
+        code: null,
+        safe_status: null,
+        record_revision: 2,
+      });
+      expect(repository.getConnection(connectionId("connection-a"))).toEqual(connectionBefore);
+      expect(repository.getProfile(profileId("profile-a"))).toEqual(profileBefore);
+      expect(count(db, "model_registry_events")).toBe(auditCount);
+      expect(repository.getDefaultProfile()).toBeNull();
+      expect(repository.getAssignment(agentId("primary"))).toBeNull();
+    });
+  });
+
   it("creates and reads immutable Connection revisions with atomic safe audit", () => {
     usingFixture("connection-crud", ({ db, repository }) => {
       const created = repository.createConnection({
@@ -683,6 +1271,22 @@ function context(event: string, now: Date): MutationContext {
   };
 }
 
+function queueInput(
+  verification: string,
+  profileRevision: string,
+  event: string,
+  now: Date,
+  expectedRevision = 0,
+) {
+  return {
+    ...context(event, now),
+    verificationId: verificationId(verification),
+    profileRevisionId: profileRevisionId(profileRevision),
+    expectedRevision,
+    capabilityBaseline: "text_and_single_tool_call_v1" as const,
+  };
+}
+
 function seedSuccessfulDiscovery(db: DatabaseSync, revision: string, generation: string): void {
   db.prepare(
     `INSERT INTO discovery_generations (
@@ -744,6 +1348,10 @@ function agentId(value: string): AgentId {
 
 function connectionId(value: string): ProviderConnectionId {
   return value as ProviderConnectionId;
+}
+
+function discoveryGenerationId(value: string): DiscoveryGenerationId {
+  return value as DiscoveryGenerationId;
 }
 
 function connectionRevisionId(value: string): ProviderConnectionRevisionId {

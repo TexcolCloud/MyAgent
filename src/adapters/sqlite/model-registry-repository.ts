@@ -7,6 +7,7 @@ import type {
   ManagedSecretVersionId,
   ModelProfileId,
   ModelProfileRevisionId,
+  ModelVerificationId,
   ProviderConnectionId,
   ProviderConnectionRevisionId,
 } from "../../domain/ids.js";
@@ -19,6 +20,8 @@ import type {
   ModelProfileRevision,
   ModelProfileView,
 } from "../../domain/model-profile.js";
+import type { DiscoveryView } from "../../domain/model-registry.js";
+import type { ModelVerification } from "../../domain/model-verification.js";
 import type {
   ProviderAuth,
   ProviderConnectionRevision,
@@ -26,6 +29,10 @@ import type {
 } from "../../domain/provider-connection.js";
 import type {
   CoreModelRegistryStore,
+  BeginVerificationAttemptInput,
+  CancelVerificationInput,
+  ClaimVerificationInput,
+  CompleteVerificationInput,
   CreateConnectionRecord,
   CreateConnectionRevisionRecord,
   CreateProfileRecord,
@@ -35,6 +42,10 @@ import type {
   PromoteProfileInput,
   PurgeConnectionInput,
   PurgeProfileInput,
+  QueueVerificationRecord,
+  RecordDiscoveryInput,
+  RecordProviderHealthInput,
+  RenewVerificationLeaseInput,
   RetireConnectionInput,
   RetireProfileInput,
   SetDefaultProfileInput,
@@ -104,6 +115,49 @@ interface RevisionValueRow {
 
 interface VerificationEvidenceRow {
   capabilities_json: string;
+}
+
+interface DiscoveryGenerationRow {
+  generation_id: string;
+  connection_revision_id: string;
+  state: DiscoveryView["state"];
+  fetched_at: string | null;
+  expires_at: string | null;
+  error_code: string | null;
+  safe_status: number | null;
+  trace_id: string;
+}
+
+interface DiscoveredModelRow {
+  model_id: string;
+  owner: string | null;
+  model_created_at: string | null;
+}
+
+interface VerificationRow {
+  verification_id: string;
+  profile_revision_id: string;
+  capability_baseline: ModelVerification["capabilityBaseline"];
+  state: ModelVerification["state"];
+  attempt_count: number;
+  capabilities_json: string;
+  result_code: string | null;
+  safe_status: number | null;
+  usage_json: string | null;
+  trace_id: string;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  cancellation_requested_at: string | null;
+  fallback_verification_id: string | null;
+  record_revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface VerificationTargetRow {
+  profile_revision_id: string;
+  profile_id: string;
+  connection_revision_id: string;
 }
 
 const canonicalizeJson = canonicalizeModule as unknown as (
@@ -212,6 +266,115 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
       this.getConnection(connection_id as ProviderConnectionId));
   }
 
+  recordDiscovery(input: RecordDiscoveryInput): DiscoveryView {
+    return this.immediate(() => {
+      const target = this.connectionRevisionTarget(input.connectionRevisionId);
+      this.assertMutableStableRevision(
+        "provider_connections",
+        "connection_id",
+        target.connection_id,
+        input.expectedRevision,
+      );
+      const now = input.now.toISOString();
+      this.db.prepare(
+        `INSERT INTO discovery_generations (
+           generation_id, connection_revision_id, state, fetched_at, expires_at,
+           error_code, safe_status, trace_id, record_revision, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      ).run(
+        input.generationId,
+        input.connectionRevisionId,
+        input.state,
+        now,
+        input.expiresAt?.toISOString() ?? null,
+        input.error?.code ?? null,
+        input.error?.status ?? null,
+        input.traceId,
+        now,
+        now,
+      );
+      if (input.state === "fresh" || input.state === "empty") {
+        const insertModel = this.db.prepare(
+          `INSERT INTO discovered_models (
+             generation_id, model_id, owner, model_created_at, ordinal
+           ) VALUES (?, ?, ?, ?, ?)`,
+        );
+        input.models.forEach((model, ordinal) => {
+          insertModel.run(
+            input.generationId,
+            model.id,
+            model.owner ?? null,
+            model.createdAt?.toISOString() ?? null,
+            ordinal,
+          );
+        });
+        this.db.prepare(
+          `UPDATE provider_connection_revisions
+           SET state = CASE
+             WHEN state IN ('active', 'legacy_trusted') THEN state
+             ELSE 'verified'
+           END
+           WHERE revision_id = ?`,
+        ).run(input.connectionRevisionId);
+      }
+      const updated = this.db.prepare(
+        `UPDATE provider_connections
+         SET record_revision = record_revision + 1, updated_at = ?
+         WHERE connection_id = ? AND record_revision = ? AND retired_at IS NULL`,
+      ).run(now, target.connection_id, input.expectedRevision);
+      if (updated.changes !== 1) throwRevisionConflict();
+      this.appendAudit(
+        input,
+        "provider_connection",
+        target.connection_id,
+        "connection.discovery_recorded",
+        {
+          connectionRevisionId: input.connectionRevisionId,
+          discoveryState: input.state,
+          generationId: input.generationId,
+          previousRecordRevision: input.expectedRevision,
+          newRecordRevision: input.expectedRevision + 1,
+        },
+      );
+      return this.getDiscoveredModels(input.connectionRevisionId, input.now);
+    });
+  }
+
+  getDiscoveredModels(
+    revisionId: ProviderConnectionRevisionId,
+    now: Date,
+  ): DiscoveryView {
+    const latest = this.db.prepare(
+      `SELECT generation_id, connection_revision_id, state, fetched_at, expires_at,
+              error_code, safe_status, trace_id
+       FROM discovery_generations
+       WHERE connection_revision_id = ?
+       ORDER BY created_at DESC, generation_id DESC
+       LIMIT 1`,
+    ).get(revisionId) as unknown as DiscoveryGenerationRow | undefined;
+    if (latest === undefined) {
+      return {
+        connectionRevisionId: revisionId,
+        state: "unsupported",
+        models: [],
+        fetchedAt: null,
+        expiresAt: null,
+      };
+    }
+    if (latest.state === "failed") {
+      const cached = this.latestSuccessfulDiscovery(revisionId);
+      if (cached !== undefined) {
+        return this.discoveryView(cached, "stale", latest);
+      }
+      return this.discoveryView(latest, "failed", latest);
+    }
+    if (latest.state === "fresh" || latest.state === "empty") {
+      const expired = latest.expires_at !== null && latest.expires_at <= now.toISOString();
+      return this.discoveryView(latest, expired ? "stale" : latest.state);
+    }
+    return this.discoveryView(latest, latest.state);
+  }
+
   createProfile(input: CreateProfileRecord): ModelProfileView {
     assertProfileRevisionOwner(input.profileId, input.revision);
     return this.immediate(() => {
@@ -300,6 +463,221 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
       "SELECT profile_id FROM model_profiles ORDER BY profile_id",
     ).all() as unknown as Array<{ profile_id: string }>;
     return rows.map(({ profile_id }) => this.getProfile(profile_id as ModelProfileId));
+  }
+
+  queueVerification(input: QueueVerificationRecord): ModelVerification {
+    return this.immediate(() => this.queueVerificationInTransaction(input));
+  }
+
+  claimVerification(input: ClaimVerificationInput): ModelVerification | null {
+    if (input.leaseUntil <= input.now) throw new DomainError("invalid_verification_lease");
+    return this.immediate(() => {
+      const row = this.db.prepare(
+        `SELECT verification_id
+         FROM model_verifications
+         WHERE state = 'queued'
+            OR (state = 'running' AND lease_expires_at <= ?)
+         ORDER BY created_at, verification_id
+         LIMIT 1`,
+      ).get(input.now.toISOString()) as unknown as {
+        verification_id: string;
+      } | undefined;
+      if (row === undefined) return null;
+      const updated = this.db.prepare(
+        `UPDATE model_verifications
+         SET state = 'running', lease_owner = ?, lease_expires_at = ?,
+             record_revision = record_revision + 1, updated_at = ?
+         WHERE verification_id = ?
+           AND (state = 'queued' OR (state = 'running' AND lease_expires_at <= ?))`,
+      ).run(
+        input.leaseOwner,
+        input.leaseUntil.toISOString(),
+        input.now.toISOString(),
+        row.verification_id,
+        input.now.toISOString(),
+      );
+      if (updated.changes !== 1) return null;
+      return this.getVerification(row.verification_id as ModelVerificationId);
+    });
+  }
+
+  beginVerificationAttempt(input: BeginVerificationAttemptInput): ModelVerification {
+    const updated = this.db.prepare(
+      `UPDATE model_verifications
+       SET attempt_count = attempt_count + 1,
+           record_revision = record_revision + 1, updated_at = ?
+       WHERE verification_id = ? AND state = 'running'
+         AND lease_owner = ? AND lease_expires_at > ?`,
+    ).run(
+      input.now.toISOString(),
+      input.verificationId,
+      input.leaseOwner,
+      input.now.toISOString(),
+    );
+    if (updated.changes !== 1) throw new DomainError("verification_lease_lost");
+    return this.getVerification(input.verificationId);
+  }
+
+  renewVerificationLease(input: RenewVerificationLeaseInput): boolean {
+    if (input.leaseUntil <= input.now) return false;
+    const updated = this.db.prepare(
+      `UPDATE model_verifications
+       SET lease_expires_at = ?, record_revision = record_revision + 1, updated_at = ?
+       WHERE verification_id = ? AND state = 'running'
+         AND lease_owner = ? AND lease_expires_at > ?`,
+    ).run(
+      input.leaseUntil.toISOString(),
+      input.now.toISOString(),
+      input.verificationId,
+      input.leaseOwner,
+      input.now.toISOString(),
+    );
+    return updated.changes === 1;
+  }
+
+  completeVerification(input: CompleteVerificationInput): ModelVerification {
+    return this.immediate(() => {
+      const target = this.verificationTarget(input.verificationId);
+      if (input.fallback !== undefined) {
+        this.assertMutableStableRevision(
+          "model_profiles",
+          "profile_id",
+          target.profile_id,
+          input.fallback.verification.expectedRevision,
+        );
+        assertProfileRevisionOwner(
+          target.profile_id as ModelProfileId,
+          input.fallback.revision,
+        );
+        if (
+          input.fallback.verification.profileRevisionId !==
+          input.fallback.revision.revisionId
+        ) {
+          throw new DomainError("verification_profile_revision_mismatch");
+        }
+      }
+      const updated = this.db.prepare(
+        `UPDATE model_verifications
+         SET state = ?, capabilities_json = ?, result_code = ?, safe_status = ?,
+             usage_json = ?, trace_id = ?, lease_owner = NULL,
+             lease_expires_at = NULL, fallback_verification_id = NULL,
+             record_revision = record_revision + 1, updated_at = ?
+         WHERE verification_id = ? AND state = 'running'
+           AND lease_owner = ? AND lease_expires_at > ?`,
+      ).run(
+        input.outcome,
+        serialize(input.capabilities),
+        input.resultCode ?? null,
+        input.safeStatus ?? null,
+        input.usage === undefined ? null : serialize(input.usage),
+        input.traceId,
+        input.now.toISOString(),
+        input.verificationId,
+        input.leaseOwner,
+        input.now.toISOString(),
+      );
+      if (updated.changes !== 1) throw new DomainError("verification_lease_lost");
+
+      if (input.outcome === "passed") {
+        this.db.prepare(
+          `UPDATE model_profile_revisions
+           SET state = 'verified', verified_capabilities_json = ?
+           WHERE revision_id = ?`,
+        ).run(serialize(input.capabilities), target.profile_revision_id);
+        this.db.prepare(
+          `UPDATE provider_connection_revisions
+           SET state = CASE
+             WHEN state IN ('active', 'legacy_trusted') THEN state
+             ELSE 'verified'
+           END
+           WHERE revision_id = ?`,
+        ).run(target.connection_revision_id);
+      } else {
+        this.db.prepare(
+          "UPDATE model_profile_revisions SET state = 'failed' WHERE revision_id = ?",
+        ).run(target.profile_revision_id);
+      }
+
+      this.recordProviderHealthInTransaction({
+        connectionRevisionId:
+          target.connection_revision_id as ProviderConnectionRevisionId,
+        profileRevisionId: target.profile_revision_id as ModelProfileRevisionId,
+        outcome: input.outcome === "passed" ? "success" : "failure",
+        ...(input.resultCode === undefined ? {} : { code: input.resultCode }),
+        ...(input.safeStatus === undefined ? {} : { safeStatus: input.safeStatus }),
+        traceId: input.traceId,
+        observedAt: input.now,
+      });
+
+      if (input.fallback !== undefined) {
+        this.insertProfileRevision(input.fallback.revision);
+        this.queueVerificationInTransaction(input.fallback.verification);
+        this.db.prepare(
+          `UPDATE model_verifications
+           SET fallback_verification_id = ?
+           WHERE verification_id = ?`,
+        ).run(
+          input.fallback.verification.verificationId,
+          input.verificationId,
+        );
+      }
+      this.appendAudit(
+        input,
+        "model_verification",
+        input.verificationId,
+        "verification.completed",
+        {
+          fallbackVerificationId: input.fallback?.verification.verificationId ?? null,
+          outcome: input.outcome,
+        },
+      );
+      return this.getVerification(input.verificationId);
+    });
+  }
+
+  cancelVerification(input: CancelVerificationInput): ModelVerification {
+    return this.immediate(() => {
+      const existing = this.verificationRow(input.verificationId);
+      if (existing.record_revision !== input.expectedRevision) throwRevisionConflict();
+      if (existing.state === "cancelled") return mapVerification(existing);
+      if (existing.state === "passed" || existing.state === "failed") {
+        throw new DomainError("verification_terminal");
+      }
+      const updated = this.db.prepare(
+        `UPDATE model_verifications
+         SET state = 'cancelled', cancellation_requested_at = ?,
+             lease_owner = NULL, lease_expires_at = NULL, trace_id = ?,
+             record_revision = record_revision + 1, updated_at = ?
+         WHERE verification_id = ? AND record_revision = ?
+           AND state IN ('queued', 'running')`,
+      ).run(
+        input.now.toISOString(),
+        input.traceId,
+        input.now.toISOString(),
+        input.verificationId,
+        input.expectedRevision,
+      );
+      if (updated.changes !== 1) throwRevisionConflict();
+      this.appendAudit(
+        input,
+        "model_verification",
+        input.verificationId,
+        "verification.cancelled",
+        {
+          previousRecordRevision: input.expectedRevision,
+          newRecordRevision: input.expectedRevision + 1,
+        },
+      );
+      return this.getVerification(input.verificationId);
+    });
+  }
+
+  getVerification(id: ModelVerificationId): ModelVerification {
+    return mapVerification(this.verificationRow(id));
+  }
+
+  recordProviderHealth(input: RecordProviderHealthInput): void {
+    this.recordProviderHealthInTransaction(input);
   }
 
   promoteConnection(input: PromoteConnectionInput): ProviderConnectionView {
@@ -668,6 +1046,194 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
         id: revision_id,
       })),
     ];
+  }
+
+  private connectionRevisionTarget(
+    revisionId: ProviderConnectionRevisionId,
+  ): { connection_id: string } {
+    const target = this.db.prepare(
+      `SELECT connection_id
+       FROM provider_connection_revisions
+       WHERE revision_id = ?`,
+    ).get(revisionId) as unknown as { connection_id: string } | undefined;
+    if (target === undefined) throw new Error("provider_connection_revision_not_found");
+    return target;
+  }
+
+  private latestSuccessfulDiscovery(
+    revisionId: ProviderConnectionRevisionId,
+  ): DiscoveryGenerationRow | undefined {
+    return this.db.prepare(
+      `SELECT generation_id, connection_revision_id, state, fetched_at, expires_at,
+              error_code, safe_status, trace_id
+       FROM discovery_generations
+       WHERE connection_revision_id = ? AND state IN ('fresh', 'empty')
+       ORDER BY created_at DESC, generation_id DESC
+       LIMIT 1`,
+    ).get(revisionId) as unknown as DiscoveryGenerationRow | undefined;
+  }
+
+  private discoveryView(
+    generation: DiscoveryGenerationRow,
+    state: DiscoveryView["state"],
+    refreshError?: DiscoveryGenerationRow,
+  ): DiscoveryView {
+    const rows = this.db.prepare(
+      `SELECT model_id, owner, model_created_at
+       FROM discovered_models
+       WHERE generation_id = ?
+       ORDER BY ordinal, model_id`,
+    ).all(generation.generation_id) as unknown as DiscoveredModelRow[];
+    const models = rows.map((row) => ({
+      id: row.model_id,
+      ...(row.owner === null ? {} : { owner: row.owner }),
+      ...(row.model_created_at === null
+        ? {}
+        : { createdAt: new Date(row.model_created_at) }),
+    }));
+    return {
+      connectionRevisionId:
+        generation.connection_revision_id as ProviderConnectionRevisionId,
+      state,
+      models,
+      fetchedAt: parseNullableDate(generation.fetched_at),
+      expiresAt: parseNullableDate(generation.expires_at),
+      ...(refreshError?.error_code === null || refreshError?.error_code === undefined
+        ? {}
+        : {
+            refreshError: {
+              code: refreshError.error_code,
+              ...(refreshError.safe_status === null
+                ? {}
+                : { status: refreshError.safe_status }),
+              traceId: refreshError.trace_id,
+            },
+          }),
+    };
+  }
+
+  private queueVerificationInTransaction(
+    input: QueueVerificationRecord,
+  ): ModelVerification {
+    const target = this.db.prepare(
+      `SELECT profile_revision.profile_id
+       FROM model_profile_revisions AS profile_revision
+       WHERE profile_revision.revision_id = ?`,
+    ).get(input.profileRevisionId) as unknown as { profile_id: string } | undefined;
+    if (target === undefined) throw new Error("model_profile_revision_not_found");
+    this.assertMutableStableRevision(
+      "model_profiles",
+      "profile_id",
+      target.profile_id,
+      input.expectedRevision,
+    );
+    const now = input.now.toISOString();
+    const updated = this.db.prepare(
+      `UPDATE model_profiles
+       SET record_revision = record_revision + 1, updated_at = ?
+       WHERE profile_id = ? AND record_revision = ? AND retired_at IS NULL`,
+    ).run(now, target.profile_id, input.expectedRevision);
+    if (updated.changes !== 1) throwRevisionConflict();
+    this.db.prepare(
+      `UPDATE model_profile_revisions
+       SET state = 'verifying'
+       WHERE revision_id = ?`,
+    ).run(input.profileRevisionId);
+    this.db.prepare(
+      `INSERT INTO model_verifications (
+         verification_id, profile_revision_id, capability_baseline, state,
+         attempt_count, capabilities_json, trace_id, record_revision,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, 'queued', 0, '[]', ?, 0, ?, ?)`,
+    ).run(
+      input.verificationId,
+      input.profileRevisionId,
+      input.capabilityBaseline,
+      input.traceId,
+      now,
+      now,
+    );
+    this.appendAudit(
+      input,
+      "model_verification",
+      input.verificationId,
+      "verification.queued",
+      {
+        profileRevisionId: input.profileRevisionId,
+        previousRecordRevision: input.expectedRevision,
+        newRecordRevision: input.expectedRevision + 1,
+      },
+    );
+    return this.getVerification(input.verificationId);
+  }
+
+  private verificationRow(id: ModelVerificationId): VerificationRow {
+    const row = this.db.prepare(
+      `SELECT verification_id, profile_revision_id, capability_baseline, state,
+              attempt_count, capabilities_json, result_code, safe_status,
+              usage_json, trace_id, lease_owner, lease_expires_at,
+              cancellation_requested_at, fallback_verification_id,
+              record_revision, created_at, updated_at
+       FROM model_verifications
+       WHERE verification_id = ?`,
+    ).get(id) as unknown as VerificationRow | undefined;
+    if (row === undefined) throw new Error("model_verification_not_found");
+    return row;
+  }
+
+  private verificationTarget(id: ModelVerificationId): VerificationTargetRow {
+    const row = this.db.prepare(
+      `SELECT verification.profile_revision_id, profile_revision.profile_id,
+              profile_revision.connection_revision_id
+       FROM model_verifications AS verification
+       JOIN model_profile_revisions AS profile_revision
+         ON profile_revision.revision_id = verification.profile_revision_id
+       WHERE verification.verification_id = ?`,
+    ).get(id) as unknown as VerificationTargetRow | undefined;
+    if (row === undefined) throw new Error("model_verification_not_found");
+    return row;
+  }
+
+  private recordProviderHealthInTransaction(input: RecordProviderHealthInput): void {
+    if (input.profileRevisionId !== undefined) {
+      const exactTarget = this.db.prepare(
+        `SELECT 1 AS exact_target
+         FROM model_profile_revisions
+         WHERE revision_id = ? AND connection_revision_id = ?`,
+      ).get(input.profileRevisionId, input.connectionRevisionId);
+      if (exactTarget === undefined) {
+        throw new DomainError("provider_health_target_mismatch");
+      }
+    }
+    const failureCount = input.outcome === "failure" ? 1 : 0;
+    this.db.prepare(
+      `INSERT INTO provider_health (
+         connection_revision_id, profile_revision_id, outcome,
+         consecutive_failures, code, safe_status, trace_id,
+         observed_at, record_revision
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+       ON CONFLICT DO UPDATE SET
+         outcome = excluded.outcome,
+         consecutive_failures = CASE
+           WHEN excluded.outcome = 'failure'
+             THEN provider_health.consecutive_failures + 1
+           ELSE 0
+         END,
+         code = excluded.code,
+         safe_status = excluded.safe_status,
+         trace_id = excluded.trace_id,
+         observed_at = excluded.observed_at,
+         record_revision = provider_health.record_revision + 1`,
+    ).run(
+      input.connectionRevisionId,
+      input.profileRevisionId ?? null,
+      input.outcome,
+      failureCount,
+      input.code ?? null,
+      input.safeStatus ?? null,
+      input.traceId,
+      input.observedAt.toISOString(),
+    );
   }
 
   private insertConnectionRevision(revision: ProviderConnectionRevision): void {
@@ -1056,6 +1622,35 @@ function mapProfileRevision(row: ProfileRevisionRow): ModelProfileRevision {
       row.verified_capabilities_json,
     ) as ModelProfileRevision["verifiedCapabilities"],
     createdAt: new Date(row.created_at),
+  };
+}
+
+function mapVerification(row: VerificationRow): ModelVerification {
+  return {
+    verificationId: row.verification_id as ModelVerificationId,
+    profileRevisionId: row.profile_revision_id as ModelProfileRevisionId,
+    capabilityBaseline: row.capability_baseline,
+    state: row.state,
+    attemptCount: row.attempt_count,
+    capabilities: JSON.parse(
+      row.capabilities_json,
+    ) as ModelVerification["capabilities"],
+    ...(row.result_code === null
+      ? {}
+      : { resultCode: row.result_code as NonNullable<ModelVerification["resultCode"]> }),
+    ...(row.safe_status === null ? {} : { safeStatus: row.safe_status }),
+    ...(row.usage_json === null
+      ? {}
+      : { usage: JSON.parse(row.usage_json) as NonNullable<ModelVerification["usage"]> }),
+    traceId: row.trace_id,
+    leaseOwner: row.lease_owner,
+    leaseExpiresAt: parseNullableDate(row.lease_expires_at),
+    cancellationRequestedAt: parseNullableDate(row.cancellation_requested_at),
+    fallbackVerificationId:
+      row.fallback_verification_id as ModelVerificationId | null,
+    recordRevision: row.record_revision,
+    createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
   };
 }
 
