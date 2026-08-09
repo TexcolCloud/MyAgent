@@ -590,8 +590,9 @@ export function classifyVerificationRetry(
 }
 
 export function canTryFallback(error: Pick<ModelProviderError, "status" | "code">): boolean {
-  return error.status === 404 || error.status === 405 || error.status === 501
-    || error.code === "unsupported_endpoint";
+  if (error.code === "unsupported_endpoint") return true;
+  return error.code === "invocation_protocol_unsupported"
+    && (error.status === 404 || error.status === 405 || error.status === 501);
 }
 ```
 
