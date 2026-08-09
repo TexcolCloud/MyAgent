@@ -532,7 +532,7 @@ Expected: FAIL with unresolved registry modules and ID factories.
 
 - [ ] **Step 3: Add exact IDs, enums, and immutable records**
 
-Use the registry-specific canonical shapes above without changing the existing `AgentRevisionSnapshot`, `ToolCall`, or Model Port yet. Add `parseProviderConnectionId`, `parseModelProfileId`, and UUID factories `providerConnectionRevisionIdFromUuid`, `modelProfileRevisionIdFromUuid`, `modelVerificationIdFromUuid`, `managedSecretVersionIdFromUuid`, `modelRegistryEventIdFromUuid`, and `discoveryGenerationIdFromUuid`. Extend `IdGenerator`, `UuidIdGenerator`, and `FakeIds` with matching zero-argument methods. Reuse the existing 1-63 lowercase slug grammar for stable connection/profile IDs and reject cross-type assignment at compile time.
+Use the registry-specific canonical shapes above without changing the existing `AgentRevisionSnapshot`, `ToolCall`, or Model Port yet. Add `parseProviderConnectionId`, `parseModelProfileId`, and UUID factories `providerConnectionRevisionIdFromUuid`, `modelProfileRevisionIdFromUuid`, `modelVerificationIdFromUuid`, `managedSecretVersionIdFromUuid`, `modelRegistryEventIdFromUuid`, and `discoveryGenerationIdFromUuid`. Their exact serialized prefixes are respectively `pcr_`, `mpr_`, `ver_`, `msv_`, `mre_`, and `dgn_`. Extend `IdGenerator`, `UuidIdGenerator`, and `FakeIds` with matching zero-argument methods. Reuse the existing 1-63 lowercase slug grammar for stable connection/profile IDs and reject cross-type assignment at compile time.
 
 - [ ] **Step 4: Implement pure lifecycle assertions**
 
