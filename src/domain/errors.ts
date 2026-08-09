@@ -17,7 +17,6 @@ export const PROVIDER_RUNTIME_ERROR_CODES = [
   "model_assignment_required",
   "revision_conflict",
   "model_provider_locked",
-  "unsupported_endpoint",
 ] as const;
 
 export type ProviderRuntimeErrorCode =

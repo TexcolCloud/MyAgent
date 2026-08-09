@@ -34,6 +34,23 @@ export interface VerificationProviderError {
   readonly status?: number;
 }
 
+const validatedUnsupportedEndpointBrand: unique symbol = Symbol(
+  "validated_unsupported_endpoint",
+);
+
+export interface ValidatedUnsupportedEndpointEvidence {
+  readonly code: "unsupported_endpoint";
+  readonly [validatedUnsupportedEndpointBrand]: true;
+}
+
+export function validateUnsupportedEndpointCode(
+  code: string,
+): ValidatedUnsupportedEndpointEvidence | null {
+  return code === "unsupported_endpoint"
+    ? { code, [validatedUnsupportedEndpointBrand]: true }
+    : null;
+}
+
 export type VerificationRetryDecision =
   | { shouldRetry: false }
   | { shouldRetry: true; delayMs: number };
@@ -55,7 +72,9 @@ export function classifyVerificationRetry(
 }
 
 export function canTryFallback(
-  error: Pick<VerificationProviderError, "status" | "code">,
+  error:
+    | Pick<VerificationProviderError, "status" | "code">
+    | ValidatedUnsupportedEndpointEvidence,
 ): boolean {
   if (error.code === "unsupported_endpoint") return true;
   return (
