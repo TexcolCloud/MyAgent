@@ -1,6 +1,12 @@
 import type {
   ApprovalId,
   AttemptId,
+  DiscoveryGenerationId,
+  ManagedSecretVersionId,
+  ModelProfileRevisionId,
+  ModelRegistryEventId,
+  ModelVerificationId,
+  ProviderConnectionRevisionId,
   RunId,
   SessionId,
   ToolCallId,
@@ -13,6 +19,12 @@ export interface FakeIdSeed {
   toolCallIds?: readonly ToolCallId[];
   approvalIds?: readonly ApprovalId[];
   attemptIds?: readonly AttemptId[];
+  providerConnectionRevisionIds?: readonly ProviderConnectionRevisionId[];
+  modelProfileRevisionIds?: readonly ModelProfileRevisionId[];
+  modelVerificationIds?: readonly ModelVerificationId[];
+  managedSecretVersionIds?: readonly ManagedSecretVersionId[];
+  modelRegistryEventIds?: readonly ModelRegistryEventId[];
+  discoveryGenerationIds?: readonly DiscoveryGenerationId[];
 }
 
 function take<T>(queue: T[], method: string): T {
@@ -30,6 +42,12 @@ export class FakeIds implements IdGenerator {
   private readonly toolCallIds: ToolCallId[];
   private readonly approvalIds: ApprovalId[];
   private readonly attemptIds: AttemptId[];
+  private readonly providerConnectionRevisionIds: ProviderConnectionRevisionId[];
+  private readonly modelProfileRevisionIds: ModelProfileRevisionId[];
+  private readonly modelVerificationIds: ModelVerificationId[];
+  private readonly managedSecretVersionIds: ManagedSecretVersionId[];
+  private readonly modelRegistryEventIds: ModelRegistryEventId[];
+  private readonly discoveryGenerationIds: DiscoveryGenerationId[];
 
   constructor(seed: FakeIdSeed = {}) {
     this.sessionIds = [...(seed.sessionIds ?? [])];
@@ -37,6 +55,12 @@ export class FakeIds implements IdGenerator {
     this.toolCallIds = [...(seed.toolCallIds ?? [])];
     this.approvalIds = [...(seed.approvalIds ?? [])];
     this.attemptIds = [...(seed.attemptIds ?? [])];
+    this.providerConnectionRevisionIds = [...(seed.providerConnectionRevisionIds ?? [])];
+    this.modelProfileRevisionIds = [...(seed.modelProfileRevisionIds ?? [])];
+    this.modelVerificationIds = [...(seed.modelVerificationIds ?? [])];
+    this.managedSecretVersionIds = [...(seed.managedSecretVersionIds ?? [])];
+    this.modelRegistryEventIds = [...(seed.modelRegistryEventIds ?? [])];
+    this.discoveryGenerationIds = [...(seed.discoveryGenerationIds ?? [])];
   }
 
   sessionId(): SessionId {
@@ -57,5 +81,29 @@ export class FakeIds implements IdGenerator {
 
   attemptId(): AttemptId {
     return take(this.attemptIds, "attemptId");
+  }
+
+  providerConnectionRevisionId(): ProviderConnectionRevisionId {
+    return take(this.providerConnectionRevisionIds, "providerConnectionRevisionId");
+  }
+
+  modelProfileRevisionId(): ModelProfileRevisionId {
+    return take(this.modelProfileRevisionIds, "modelProfileRevisionId");
+  }
+
+  modelVerificationId(): ModelVerificationId {
+    return take(this.modelVerificationIds, "modelVerificationId");
+  }
+
+  managedSecretVersionId(): ManagedSecretVersionId {
+    return take(this.managedSecretVersionIds, "managedSecretVersionId");
+  }
+
+  modelRegistryEventId(): ModelRegistryEventId {
+    return take(this.modelRegistryEventIds, "modelRegistryEventId");
+  }
+
+  discoveryGenerationId(): DiscoveryGenerationId {
+    return take(this.discoveryGenerationIds, "discoveryGenerationId");
   }
 }
