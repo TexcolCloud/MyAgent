@@ -102,7 +102,7 @@ describe("CatalogService", () => {
     );
     expect(() => resolver.resolve({ fromEnvironment: "MISSING_SECRET" })).toThrowError(
       expect.objectContaining({
-        code: "secret_unavailable",
+        code: "secret_locked",
         message: expect.not.stringContaining("sensitive-value"),
       }),
     );

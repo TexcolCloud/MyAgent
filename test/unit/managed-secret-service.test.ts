@@ -71,12 +71,16 @@ describe("CompositeSecretResolver", () => {
     );
 
     expect(() => resolver.resolve({ fromEnvironment: "PRIVATE_PROVIDER_KEY" }))
-      .toThrowError("secret_unavailable");
+      .toThrowError("secret_locked");
     try {
       resolver.resolve({ fromEnvironment: "PRIVATE_PROVIDER_KEY" });
     } catch (error) {
       expect(String(error)).not.toContain("PRIVATE_PROVIDER_KEY");
     }
+
+    expect(() => new EnvironmentSecretResolver({}).resolve({
+      managedSecretVersionId: managedSecretVersionIdFromUuid("wrong-reference"),
+    })).toThrowError("secret_locked");
   });
 });
 

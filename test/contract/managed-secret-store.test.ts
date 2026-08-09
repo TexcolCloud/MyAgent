@@ -256,6 +256,79 @@ describe("SqliteEncryptedSecretStore", () => {
       .toThrowError("secret_locked");
   });
 
+  it("refuses destruction when the configured master key is missing or wrong", () => {
+    for (const [index, environment] of [
+      {},
+      { MYAGENT_MASTER_KEY: NEXT_KEY },
+    ].entries()) {
+      const path = tempPath(`managed-secret-destroy-key-${index}.db`);
+      const initial = createStore(path, { MYAGENT_MASTER_KEY: CURRENT_KEY });
+      const versionId = version(`destroy-key-${index}`);
+      initial.store.createVersion(createInput(versionId, "destroy-locked-secret"));
+      initial.connection.close();
+      const restarted = createStore(path, environment);
+
+      expect(() => restarted.store.destroy({
+        versionId,
+        expectedRevision: 0,
+        now: LATER,
+      })).toThrowError("secret_locked");
+      expect(readSecretRow(restarted.db, versionId)).toMatchObject({
+        state: "active",
+        record_revision: 0,
+        destroyed_at: null,
+      });
+    }
+  });
+
+  it("refuses destruction when the Keyring is absent or mismatched", () => {
+    for (const [index, mutateKeyring] of [
+      (db: DatabaseSync) => db.prepare(
+        "DELETE FROM managed_secret_keyring WHERE singleton_id = 1",
+      ).run(),
+      (db: DatabaseSync) => db.prepare(
+        "UPDATE managed_secret_keyring SET current_key_id = ? WHERE singleton_id = 1",
+      ).run(NEXT_KEY_ID),
+    ].entries()) {
+      const { db, store } = createStore(
+        tempPath(`managed-secret-destroy-keyring-${index}.db`),
+        { MYAGENT_MASTER_KEY: CURRENT_KEY },
+      );
+      const versionId = version(`destroy-keyring-${index}`);
+      store.createVersion(createInput(versionId, "destroy-keyring-secret"));
+      mutateKeyring(db);
+
+      expect(() => store.destroy({ versionId, expectedRevision: 0, now: LATER }))
+        .toThrowError("secret_locked");
+      expect(readSecretRow(db, versionId)).toMatchObject({
+        state: "active",
+        record_revision: 0,
+        destroyed_at: null,
+      });
+    }
+  });
+
+  it("authenticates the envelope before allowing irreversible destruction", () => {
+    const { db, store } = createStore(tempPath("managed-secret-destroy-tamper.db"), {
+      MYAGENT_MASTER_KEY: CURRENT_KEY,
+    });
+    const versionId = version("destroy-tamper");
+    store.createVersion(createInput(versionId, "destroy-tamper-secret"));
+    const ciphertext = Buffer.from(readSecretRow(db, versionId).ciphertext!);
+    ciphertext[0] = ciphertext[0]! ^ 0xff;
+    db.prepare(
+      "UPDATE managed_secret_versions SET ciphertext = ? WHERE version_id = ?",
+    ).run(ciphertext, versionId);
+
+    expect(() => store.destroy({ versionId, expectedRevision: 0, now: LATER }))
+      .toThrowError("secret_locked");
+    expect(readSecretRow(db, versionId)).toMatchObject({
+      state: "active",
+      record_revision: 0,
+      destroyed_at: null,
+    });
+  });
+
   it("blocks destruction when the real registry retains a reference", () => {
     const { db, store } = createStore(tempPath("managed-secret-referenced.db"), {
       MYAGENT_MASTER_KEY: CURRENT_KEY,
@@ -367,6 +440,34 @@ describe("SqliteEncryptedSecretStore", () => {
     const currentOnly = createStore(path, { MYAGENT_MASTER_KEY: NEXT_KEY }).store;
     expect(currentOnly.resolve(firstId)).toBe("first-secret");
     expect(currentOnly.resolve(secondId)).toBe("second-secret");
+  });
+
+  it("rejects a valid old envelope replayed after the Keyring advances", () => {
+    const path = tempPath("managed-secret-old-envelope-replay.db");
+    const initial = createStore(path, { MYAGENT_MASTER_KEY: CURRENT_KEY });
+    const versionId = version("old-envelope-replay");
+    initial.store.createVersion(createInput(versionId, "old-envelope-secret"));
+    const oldEnvelope = readSecretRow(initial.db, versionId);
+    initial.connection.close();
+
+    const rotated = createStore(path, {
+      MYAGENT_MASTER_KEY: NEXT_KEY,
+      MYAGENT_PREVIOUS_MASTER_KEY: CURRENT_KEY,
+    });
+    rotated.store.rotateMasterKey({ expectedRevision: 0, now: LATER });
+    rotated.db.prepare(
+      `UPDATE managed_secret_versions
+       SET key_id = ?, ciphertext = ?, nonce = ?, authentication_tag = ?
+       WHERE version_id = ?`,
+    ).run(
+      oldEnvelope.key_id,
+      oldEnvelope.ciphertext,
+      oldEnvelope.nonce,
+      oldEnvelope.authentication_tag,
+      versionId,
+    );
+
+    expect(() => rotated.store.resolve(versionId)).toThrowError("secret_locked");
   });
 
   it.each([

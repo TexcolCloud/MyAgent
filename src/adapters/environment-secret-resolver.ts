@@ -10,11 +10,11 @@ export class EnvironmentSecretResolver implements SecretResolver {
 
   resolve(reference: SecretRef): string {
     if (!("fromEnvironment" in reference)) {
-      throw new DomainError("secret_unavailable");
+      throw new DomainError("secret_locked");
     }
     const value = this.environment[reference.fromEnvironment];
     if (value === undefined || value.length === 0) {
-      throw new DomainError("secret_unavailable");
+      throw new DomainError("secret_locked");
     }
 
     return value;

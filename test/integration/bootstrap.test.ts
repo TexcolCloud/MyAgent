@@ -10,7 +10,7 @@ import { bootstrap } from "../../src/bootstrap.js";
 const FIXTURES = fileURLToPath(new URL("../fixtures/config", import.meta.url));
 
 describe("bootstrap", () => {
-  it("fails startup before listening when a configured model secret is unavailable", async () => {
+  it("fails startup before listening when a configured model secret is locked", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "myagent-bootstrap-secret-"));
     await cp(path.join(FIXTURES, "valid"), path.join(root, "config"), { recursive: true });
     const previousBearer = process.env.MYAGENT_BEARER_TOKEN;
@@ -18,7 +18,7 @@ describe("bootstrap", () => {
     process.env.MYAGENT_BEARER_TOKEN = "bootstrap-token";
     delete process.env.MODEL_API_KEY;
     try {
-      await expect(bootstrap(path.join(root, "config", "myagent.yaml"), { signals: false })).rejects.toMatchObject({ code: "secret_unavailable" });
+      await expect(bootstrap(path.join(root, "config", "myagent.yaml"), { signals: false })).rejects.toMatchObject({ code: "secret_locked" });
     } finally {
       process.env.MYAGENT_BEARER_TOKEN = previousBearer;
       process.env.MODEL_API_KEY = previousModel;

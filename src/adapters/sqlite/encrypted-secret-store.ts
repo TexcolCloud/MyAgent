@@ -112,8 +112,7 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
         throwLocked();
       }
       const row = this.requiredActiveRow(versionId);
-      const generation = this.generation(row.key_id);
-      if (generation === null) throwLocked();
+      const generation = this.authoritativeGeneration(keyring, row);
       const plaintext = decrypt(generation, row);
       try {
         return plaintext.toString("utf8");
@@ -131,15 +130,23 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
       const row = this.row(input.versionId);
       if (row === undefined || row.state !== "active") throwLocked();
       if (row.record_revision !== input.expectedRevision) throwRevisionConflict();
-      const updated = this.db.prepare(
-        `UPDATE managed_secret_versions
-         SET ciphertext = X'', nonce = X'', authentication_tag = X'',
-             state = 'destroyed', record_revision = record_revision + 1,
-             destroyed_at = ?
-         WHERE version_id = ? AND state = 'active' AND record_revision = ?`,
-      ).run(input.now.toISOString(), input.versionId, input.expectedRevision);
-      if (updated.changes !== 1) throwRevisionConflict();
-      return this.metadata(this.requiredRow(input.versionId));
+      const keyring = this.keyring();
+      if (keyring === undefined) throwLocked();
+      const generation = this.authoritativeGeneration(keyring, row);
+      const plaintext = decrypt(generation, row);
+      try {
+        const updated = this.db.prepare(
+          `UPDATE managed_secret_versions
+           SET ciphertext = X'', nonce = X'', authentication_tag = X'',
+               state = 'destroyed', record_revision = record_revision + 1,
+               destroyed_at = ?
+           WHERE version_id = ? AND state = 'active' AND record_revision = ?`,
+        ).run(input.now.toISOString(), input.versionId, input.expectedRevision);
+        if (updated.changes !== 1) throwRevisionConflict();
+        return this.metadata(this.requiredRow(input.versionId));
+      } finally {
+        plaintext.fill(0);
+      }
     });
   }
 
@@ -231,6 +238,16 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
   private keyringMatchesConfiguredGeneration(keyring: KeyringRow): boolean {
     return keyring.current_key_id === this.current?.id ||
       keyring.current_key_id === this.previous?.id;
+  }
+
+  private authoritativeGeneration(
+    keyring: KeyringRow,
+    row: SecretRow,
+  ): KeyGeneration {
+    if (row.key_id !== keyring.current_key_id) throwLocked();
+    const generation = this.generation(keyring.current_key_id);
+    if (generation === null) throwLocked();
+    return generation;
   }
 
   private keyring(): KeyringRow | undefined {
