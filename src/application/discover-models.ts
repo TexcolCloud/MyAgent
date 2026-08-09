@@ -2,8 +2,12 @@ import { PROVIDER_RUNTIME_ERROR_CODES } from "../domain/errors.js";
 import type { ProviderConnectionRevision } from "../domain/provider-connection.js";
 import type { DiscoveryView } from "../domain/model-registry.js";
 import type { IdGenerator } from "../ports/id-generator.js";
-import type { ModelProviderError } from "../ports/model.js";
-import type { ModelDiscoveryLimits, ModelDiscoveryPort } from "../ports/model-discovery.js";
+import { ModelProviderError } from "../ports/model.js";
+import type {
+  DiscoveryResult,
+  ModelDiscoveryLimits,
+  ModelDiscoveryPort,
+} from "../ports/model-discovery.js";
 import type { ModelRegistryStore, RecordDiscoveryInput } from "../ports/model-registry-store.js";
 
 export interface DiscoverModelsCommand {
@@ -39,24 +43,9 @@ export class DiscoverModelsService {
     if (!command.refresh && shouldReturnCached(cached)) return cached;
 
     const connection = findConnectionRevision(this.registry, command.revisionId);
+    let result: DiscoveryResult;
     try {
-      const result = await this.discovery.discover(connection.revision, this.options, signal);
-      const state = result.state === "fresh" && result.models.length === 0
-        ? "empty"
-        : result.state;
-      return this.registry.recordDiscovery({
-        connectionRevisionId: command.revisionId,
-        generationId: this.ids.discoveryGenerationId(),
-        expectedRevision: connection.recordRevision,
-        state,
-        models: result.models,
-        ...(state === "fresh"
-          ? { expiresAt: new Date(command.now.getTime() + this.options.cacheSeconds * 1_000) }
-          : {}),
-        eventId: this.ids.modelRegistryEventId(),
-        traceId: command.traceId,
-        now: command.now,
-      });
+      result = await this.discovery.discover(connection.revision, this.options, signal);
     } catch (error) {
       if (signal.aborted || isAbortError(error)) throw abortError();
       return this.registry.recordDiscovery({
@@ -71,6 +60,22 @@ export class DiscoverModelsService {
         now: command.now,
       });
     }
+    const state = result.state === "fresh" && result.models.length === 0
+      ? "empty"
+      : result.state;
+    return this.registry.recordDiscovery({
+      connectionRevisionId: command.revisionId,
+      generationId: this.ids.discoveryGenerationId(),
+      expectedRevision: connection.recordRevision,
+      state,
+      models: result.models,
+      ...(state === "fresh"
+        ? { expiresAt: new Date(command.now.getTime() + this.options.cacheSeconds * 1_000) }
+        : {}),
+      eventId: this.ids.modelRegistryEventId(),
+      traceId: command.traceId,
+      now: command.now,
+    });
   }
 }
 
@@ -99,16 +104,29 @@ function findConnectionRevision(
 }
 
 function safeError(error: unknown): NonNullable<RecordDiscoveryInput["error"]> {
-  const candidate = error as Partial<ModelProviderError>;
-  const code = typeof candidate.code === "string" &&
-    PROVIDER_RUNTIME_ERROR_CODES.includes(candidate.code as typeof PROVIDER_RUNTIME_ERROR_CODES[number])
-    ? candidate.code
+  const providerError = findProviderError(error);
+  if (providerError === undefined) return { code: "provider_unavailable" };
+  const code = PROVIDER_RUNTIME_ERROR_CODES.includes(
+    providerError.code as typeof PROVIDER_RUNTIME_ERROR_CODES[number],
+  )
+    ? providerError.code
     : "provider_unavailable";
-  const status = typeof candidate.status === "number" && Number.isSafeInteger(candidate.status) &&
-    candidate.status >= 400 && candidate.status <= 599
-    ? candidate.status
+  const status = typeof providerError.status === "number" && Number.isSafeInteger(providerError.status) &&
+    providerError.status >= 400 && providerError.status <= 599
+    ? providerError.status
     : undefined;
   return { code, ...(status === undefined ? {} : { status }) };
+}
+
+function findProviderError(error: unknown): ModelProviderError | undefined {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    if (current instanceof ModelProviderError) return current;
+    seen.add(current);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
 function assertOptions(options: DiscoverModelsOptions): void {

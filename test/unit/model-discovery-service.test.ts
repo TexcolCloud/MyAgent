@@ -7,6 +7,7 @@ import {
 import type { DiscoveryView } from "../../src/domain/model-registry.js";
 import type { ProviderConnectionRevision, ProviderConnectionView } from "../../src/domain/provider-connection.js";
 import type { IdGenerator } from "../../src/ports/id-generator.js";
+import { ModelProviderError } from "../../src/ports/model.js";
 import type { ModelDiscoveryPort } from "../../src/ports/model-discovery.js";
 import type { ModelRegistryStore, RecordDiscoveryInput } from "../../src/ports/model-registry-store.js";
 
@@ -58,7 +59,7 @@ describe("DiscoverModelsService", () => {
 
   it("returns stale cache normally and retains it with a safe error after a forced refresh failure", async () => {
     const registry = new MemoryRegistry(view("stale", [{ id: "cached" }], NOW));
-    const discovery = new ScriptedDiscovery(new Error("provider-body-secret"));
+    const discovery = ScriptedDiscovery.failing(new Error("provider-body-secret"));
     const normal = await service(registry, discovery).execute(command(), new AbortController().signal);
     expect(normal.state).toBe("stale");
     expect(discovery.calls).toBe(0);
@@ -90,10 +91,12 @@ describe("DiscoverModelsService", () => {
     expect(manualModelEntryAllowed(view("fresh", [{ id: "advertised" }], NOW))).toBe(false);
   });
 
-  it("records a failed discovery without inventing unsupported evidence and forwards cancellation", async () => {
+  it("records trusted provider failures without inventing unsupported evidence and forwards cancellation", async () => {
     const registry = new MemoryRegistry(view("unsupported", [], null));
-    const error = Object.assign(new Error("provider-secret"), { code: "provider_auth_failed", status: 401 });
-    const result = await service(registry, new ScriptedDiscovery(error)).execute(command(), new AbortController().signal);
+    const error = new Error("provider-secret", {
+      cause: new ModelProviderError({ code: "provider_auth_failed", transient: false, status: 401 }),
+    });
+    const result = await service(registry, ScriptedDiscovery.failing(error)).execute(command(), new AbortController().signal);
     expect(result).toMatchObject({ state: "failed", refreshError: { code: "provider_auth_failed", status: 401 } });
     expect(result.state).not.toBe("unsupported");
     expect(JSON.stringify(result)).not.toContain("provider-secret");
@@ -104,10 +107,60 @@ describe("DiscoverModelsService", () => {
       service(registry, new ScriptedDiscovery()).execute(command({ refresh: true }), controller.signal),
     ).rejects.toMatchObject({ name: "AbortError" });
   });
+
+  it.each([
+    { name: "null", error: null },
+    { name: "undefined", error: undefined },
+    {
+      name: "a forged provider-shaped object",
+      error: { code: "provider_auth_failed", status: 401, message: "forged-provider-secret" },
+    },
+  ])("maps $name failure to a safe unavailable record", async ({ error }) => {
+    const registry = new MemoryRegistry(view("unsupported", [], null));
+    const result = await service(registry, ScriptedDiscovery.failing(error)).execute(
+      command(),
+      new AbortController().signal,
+    );
+
+    expect(result).toMatchObject({
+      state: "failed",
+      refreshError: { code: "provider_unavailable", traceId: "trace-test" },
+    });
+    expect(result.refreshError).not.toHaveProperty("status");
+    expect(JSON.stringify(result)).not.toContain("forged-provider-secret");
+  });
+
+  it("propagates identifier and repository failures without recording provider failure", async () => {
+    const identifierFailure = new Error("identifier-store-unavailable");
+    const identifierRegistry = new MemoryRegistry(view("unsupported", [], null));
+    await expect(
+      service(
+        identifierRegistry,
+        new ScriptedDiscovery({ state: "fresh", models: [{ id: "live" }], fetchedAt: NOW }),
+        fakeIds({ discoveryError: identifierFailure }),
+      ).execute(command(), new AbortController().signal),
+    ).rejects.toBe(identifierFailure);
+    expect(identifierRegistry.records).toHaveLength(0);
+
+    const repositoryFailure = new Error("repository-unavailable");
+    const repositoryRegistry = new MemoryRegistry(view("unsupported", [], null));
+    repositoryRegistry.failRecordWith(repositoryFailure);
+    await expect(
+      service(
+        repositoryRegistry,
+        new ScriptedDiscovery({ state: "fresh", models: [{ id: "live" }], fetchedAt: NOW }),
+      ).execute(command(), new AbortController().signal),
+    ).rejects.toBe(repositoryFailure);
+    expect(repositoryRegistry.records).toHaveLength(0);
+  });
 });
 
-function service(registry: MemoryRegistry, discovery: ScriptedDiscovery): DiscoverModelsService {
-  return new DiscoverModelsService(registry, discovery, fakeIds(), {
+function service(
+  registry: MemoryRegistry,
+  discovery: ScriptedDiscovery,
+  ids: Pick<IdGenerator, "discoveryGenerationId" | "modelRegistryEventId"> = fakeIds(),
+): DiscoverModelsService {
+  return new DiscoverModelsService(registry, discovery, ids, {
     cacheSeconds: 600,
     timeoutMs: 10_000,
     maxItems: 1_000,
@@ -141,7 +194,17 @@ function view(
 
 class ScriptedDiscovery implements ModelDiscoveryPort {
   calls = 0;
-  constructor(private readonly result?: Awaited<ReturnType<ModelDiscoveryPort["discover"]>> | Error) {}
+  private failure: unknown = undefined;
+  private hasFailure = false;
+
+  constructor(private readonly result?: Awaited<ReturnType<ModelDiscoveryPort["discover"]>>) {}
+
+  static failing(error: unknown): ScriptedDiscovery {
+    const discovery = new ScriptedDiscovery();
+    discovery.failure = error;
+    discovery.hasFailure = true;
+    return discovery;
+  }
 
   async discover(
     _connection: ProviderConnectionRevision,
@@ -150,7 +213,7 @@ class ScriptedDiscovery implements ModelDiscoveryPort {
   ): Promise<Awaited<ReturnType<ModelDiscoveryPort["discover"]>>> {
     signal.throwIfAborted();
     this.calls += 1;
-    if (this.result instanceof Error) throw this.result;
+    if (this.hasFailure) throw this.failure;
     return this.result ?? { state: "fresh", models: [], fetchedAt: NOW };
   }
 }
@@ -158,6 +221,7 @@ class ScriptedDiscovery implements ModelDiscoveryPort {
 class MemoryRegistry implements Pick<ModelRegistryStore, "getDiscoveredModels" | "listConnections" | "recordDiscovery"> {
   readonly records: RecordDiscoveryInput[] = [];
   private current: DiscoveryView;
+  private recordFailure: Error | undefined;
 
   constructor(initial: DiscoveryView) {
     this.current = initial;
@@ -180,6 +244,11 @@ class MemoryRegistry implements Pick<ModelRegistryStore, "getDiscoveredModels" |
   }
 
   recordDiscovery(input: RecordDiscoveryInput): DiscoveryView {
+    if (this.recordFailure !== undefined) {
+      const failure = this.recordFailure;
+      this.recordFailure = undefined;
+      throw failure;
+    }
     this.records.push(input);
     if (input.state === "failed" && this.current.models.length > 0) {
       this.current = {
@@ -199,6 +268,10 @@ class MemoryRegistry implements Pick<ModelRegistryStore, "getDiscoveredModels" |
     };
     return this.current;
   }
+
+  failRecordWith(error: Error): void {
+    this.recordFailure = error;
+  }
 }
 
 function connection(): ProviderConnectionRevision {
@@ -215,9 +288,12 @@ function connection(): ProviderConnectionRevision {
   };
 }
 
-function fakeIds(): Pick<IdGenerator, "discoveryGenerationId" | "modelRegistryEventId"> {
+function fakeIds(options: { readonly discoveryError?: Error } = {}): Pick<IdGenerator, "discoveryGenerationId" | "modelRegistryEventId"> {
   return {
-    discoveryGenerationId: () => "dgn-test" as ReturnType<IdGenerator["discoveryGenerationId"]>,
+    discoveryGenerationId: () => {
+      if (options.discoveryError !== undefined) throw options.discoveryError;
+      return "dgn-test" as ReturnType<IdGenerator["discoveryGenerationId"]>;
+    },
     modelRegistryEventId: () => "mre-test" as ReturnType<IdGenerator["modelRegistryEventId"]>,
   };
 }

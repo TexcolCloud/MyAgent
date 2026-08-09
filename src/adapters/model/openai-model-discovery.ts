@@ -15,6 +15,8 @@ interface ModelsPageBody {
   readonly last_id?: unknown;
 }
 
+const MAX_DISCOVERED_MODELS = 1_000;
+
 export class OpenAiModelDiscovery implements ModelDiscoveryPort {
   constructor(private readonly transport: ProviderHttpTransport) {}
 
@@ -50,6 +52,7 @@ export class OpenAiModelDiscovery implements ModelDiscoveryPort {
         });
         pages += 1;
         const body = pageBody(page);
+        assertPagination(body);
         for (const item of body.data) {
           const model = normalizeModel(item);
           if (identifiers.has(model.id) || models.length >= limits.maxItems) {
@@ -93,6 +96,7 @@ function assertLimits(limits: ModelDiscoveryLimits): void {
   if (
     !Number.isSafeInteger(limits.timeoutMs) || limits.timeoutMs <= 0 ||
     !Number.isSafeInteger(limits.maxItems) || limits.maxItems <= 0 ||
+    limits.maxItems > MAX_DISCOVERED_MODELS ||
     !Number.isSafeInteger(limits.maxResponseBytes) || limits.maxResponseBytes < 0
   ) {
     throw protocolError();
@@ -110,6 +114,19 @@ function isPageBody(value: unknown): value is ModelsPageBody {
     Array.isArray((value as { data?: unknown }).data);
 }
 
+function assertPagination(body: ModelsPageBody): void {
+  if (
+    (hasOwn(body, "has_more") && typeof body.has_more !== "boolean") ||
+    (hasOwn(body, "last_id") && typeof body.last_id !== "string")
+  ) {
+    throw protocolError();
+  }
+}
+
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function normalizeModel(value: unknown): { id: string; owner?: string; createdAt?: Date } {
   if (typeof value !== "object" || value === null) throw protocolError();
   const item = value as { id?: unknown; owned_by?: unknown; created?: unknown };
@@ -122,10 +139,14 @@ function normalizeModel(value: unknown): { id: string; owner?: string; createdAt
   ) {
     throw protocolError();
   }
+  const createdAt = created === undefined ? undefined : new Date(created * 1_000);
+  if (createdAt !== undefined && !Number.isFinite(createdAt.getTime())) {
+    throw protocolError();
+  }
   return {
     id: item.id,
     ...(item.owned_by === undefined ? {} : { owner: item.owned_by }),
-    ...(created === undefined ? {} : { createdAt: new Date(created * 1_000) }),
+    ...(createdAt === undefined ? {} : { createdAt }),
   };
 }
 

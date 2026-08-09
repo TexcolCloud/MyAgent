@@ -78,6 +78,17 @@ describe("OpenAiModelDiscovery", () => {
     ).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
   });
 
+  it("enforces the hard 1,000-model bound when a caller requests more", async () => {
+    const provider = await startProvider();
+    provider.modelsPages([{
+      data: Array.from({ length: 1_001 }, (_value, index) => ({ id: `model-${String(index)}` })),
+    }]);
+
+    await expect(
+      adapter().discover(connection(provider.baseUrl), { ...limits(), maxItems: 1_001 }, new AbortController().signal),
+    ).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
   it("caps non-progressing page chains even when they contain no model identifiers", async () => {
     const provider = await startProvider();
     provider.modelsPages([
@@ -102,6 +113,27 @@ describe("OpenAiModelDiscovery", () => {
     await expect(
       adapter().discover(connection(provider.baseUrl), { ...limits(), timeoutMs: 1 }, new AbortController().signal),
     ).rejects.toMatchObject({ code: "provider_unavailable" });
+  });
+
+  it.each([
+    { name: "a non-boolean has_more", page: { data: [], has_more: "true" } },
+    { name: "a non-string last_id", page: { data: [], has_more: false, last_id: 1 } },
+  ])("rejects $name instead of treating the page as terminal", async ({ page }) => {
+    const provider = await startProvider();
+    provider.modelsPages([page as unknown as { readonly data: readonly unknown[] }]);
+
+    await expect(
+      adapter().discover(connection(provider.baseUrl), limits(), new AbortController().signal),
+    ).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects Unix timestamps outside the JavaScript Date range", async () => {
+    const provider = await startProvider();
+    provider.modelsPages([{ data: [{ id: "outside-date-range", created: 8_640_000_000_001 }] }]);
+
+    await expect(
+      adapter().discover(connection(provider.baseUrl), limits(), new AbortController().signal),
+    ).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
   });
 
   it("preserves cancellation and exposes no provider response body", async () => {
