@@ -6,6 +6,8 @@ import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
+const NOW = "2026-08-09T00:00:00.000Z";
+
 describe("SQLite migrations", () => {
   it("migrates an empty database and reopens it with required pragmas", () => {
     const file = tempPath("kernel.db");
@@ -28,6 +30,7 @@ describe("SQLite migrations", () => {
       migrate(reopened.db);
       expect(reopened.db.prepare("SELECT version FROM schema_migrations").all()).toEqual([
         { version: 1 },
+        { version: 2 },
       ]);
     } finally {
       reopened.close();
@@ -44,6 +47,7 @@ describe("SQLite migrations", () => {
       expect(() => migrate(interleaved)).not.toThrow();
       expect(first.db.prepare("SELECT version FROM schema_migrations").all()).toEqual([
         { version: 1 },
+        { version: 2 },
       ]);
     } finally {
       second.close();
@@ -234,6 +238,123 @@ describe("SQLite migrations", () => {
     }
   });
 
+  it("creates the final model registry schema with every owned table", () => {
+    const connection = openDatabase({
+      path: tempPath("model-registry-schema.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+
+      expect(connection.db.prepare(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name IN (
+           'provider_connections', 'provider_connection_revisions',
+           'model_profiles', 'model_profile_revisions', 'model_assignments',
+           'default_model_profile', 'model_registry_events',
+           'discovery_generations', 'discovered_models', 'model_verifications',
+           'provider_health', 'managed_secret_versions',
+           'managed_secret_keyring', 'legacy_model_imports'
+         ) ORDER BY name`,
+      ).all()).toEqual([
+        { name: "default_model_profile" },
+        { name: "discovered_models" },
+        { name: "discovery_generations" },
+        { name: "legacy_model_imports" },
+        { name: "managed_secret_keyring" },
+        { name: "managed_secret_versions" },
+        { name: "model_assignments" },
+        { name: "model_profile_revisions" },
+        { name: "model_profiles" },
+        { name: "model_registry_events" },
+        { name: "model_verifications" },
+        { name: "provider_connection_revisions" },
+        { name: "provider_connections" },
+        { name: "provider_health" },
+      ]);
+      expect(connection.db.prepare("PRAGMA table_info(tool_calls)").all())
+        .toContainEqual(expect.objectContaining({ name: "provider_call_id", notnull: 0 }));
+      for (const table of [
+        "provider_connections",
+        "model_profiles",
+        "model_assignments",
+        "default_model_profile",
+        "discovery_generations",
+        "model_verifications",
+        "provider_health",
+        "managed_secret_versions",
+        "managed_secret_keyring",
+      ]) {
+        expect(connection.db.prepare(`PRAGMA table_info(${table})`).all())
+          .toContainEqual(expect.objectContaining({ name: "record_revision", notnull: 1 }));
+      }
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("enforces singleton keyring, immutable revisions, append-only audit, and provider call identity", () => {
+    const connection = openDatabase({
+      path: tempPath("model-registry-constraints.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      connection.db.prepare(
+        `INSERT INTO provider_connections (
+           connection_id, display_name, provider_kind, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run("connection-a", "Connection A", "openai", NOW, NOW);
+      connection.db.prepare(
+        `INSERT INTO provider_connection_revisions (
+           revision_id, connection_id, state, base_url, auth_json,
+           allow_insecure_http, protocol_preference, preset_version, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "pcr-a", "connection-a", "draft", "https://api.example.test/v1",
+        '{"type":"none"}', 0, "responses", "2026-08-09", NOW,
+      );
+      connection.db.prepare(
+        `INSERT INTO model_registry_events (
+           event_id, resource_type, resource_id, action, payload_json,
+           trace_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run("event-a", "provider_connection", "connection-a", "created", "{}", "trace-a", NOW);
+      connection.db.prepare(
+        `INSERT INTO managed_secret_keyring (
+           singleton_id, current_key_id, record_revision, updated_at
+         ) VALUES (?, ?, ?, ?)`,
+      ).run(1, "key-a", 0, NOW);
+
+      expect(() => connection.db.prepare(
+        "UPDATE provider_connection_revisions SET base_url = ? WHERE revision_id = ?",
+      ).run("https://changed.example.test/v1", "pcr-a"))
+        .toThrowError("immutable_provider_connection_revision");
+      expect(() => connection.db.prepare(
+        "DELETE FROM model_registry_events WHERE event_id = ?",
+      ).run("event-a")).toThrowError("append_only_model_registry_events");
+      expect(() => connection.db.prepare(
+        `INSERT INTO managed_secret_keyring (
+           singleton_id, current_key_id, record_revision, updated_at
+         ) VALUES (?, ?, ?, ?)`,
+      ).run(2, "key-b", 0, NOW)).toThrow();
+
+      seedRevision(connection.db);
+      seedSession(connection.db, "session-a", "session:a");
+      seedRun(connection.db, "run-a", "session-a");
+      seedToolCall(connection.db, "tool-call-a", "run-a");
+      connection.db.prepare(
+        "UPDATE tool_calls SET provider_call_id = ? WHERE tool_call_id = ?",
+      ).run("provider-call-a", "tool-call-a");
+      expect(() => connection.db.prepare(
+        "UPDATE tool_calls SET provider_call_id = ? WHERE tool_call_id = ?",
+      ).run("provider-call-b", "tool-call-a"))
+        .toThrowError("immutable_provider_call_id");
+    } finally {
+      connection.close();
+    }
+  });
+
   it("cascades deletion from a root Session through delegated Sessions", () => {
     const connection = openDatabase({
       path: tempPath("session-cascade.db"),
@@ -286,7 +407,7 @@ describe("SQLite migrations", () => {
         .prepare(
           "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
         )
-        .run(2);
+        .run(3);
 
       expect(() => migrate(connection.db)).toThrowError("database_newer_than_binary");
     } finally {
