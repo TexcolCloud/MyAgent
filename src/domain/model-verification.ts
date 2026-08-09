@@ -1,4 +1,5 @@
-import type { ModelProviderError, ModelUsage } from "../ports/model.js";
+import type { ModelUsage } from "../ports/model.js";
+import type { ProviderRuntimeErrorCode } from "./errors.js";
 import type { ModelProfileRevisionId, ModelVerificationId } from "./ids.js";
 import {
   MODEL_CAPABILITY_BASELINE,
@@ -13,7 +14,7 @@ export interface ModelVerification {
   readonly state: VerificationState;
   readonly attemptCount: number;
   readonly capabilities: readonly ModelCapability[];
-  readonly resultCode?: string;
+  readonly resultCode?: ProviderRuntimeErrorCode;
   readonly safeStatus?: number;
   readonly usage?: ModelUsage;
   readonly traceId: string;
@@ -26,12 +27,19 @@ export interface ModelVerification {
   readonly updatedAt: Date;
 }
 
+export interface VerificationProviderError {
+  readonly code: ProviderRuntimeErrorCode;
+  readonly transient: boolean;
+  readonly retryAfterMs?: number;
+  readonly status?: number;
+}
+
 export type VerificationRetryDecision =
   | { shouldRetry: false }
   | { shouldRetry: true; delayMs: number };
 
 export function classifyVerificationRetry(
-  error: Pick<ModelProviderError, "code" | "transient" | "retryAfterMs">,
+  error: Pick<VerificationProviderError, "code" | "transient" | "retryAfterMs">,
   attemptNumber: number,
 ): VerificationRetryDecision {
   const retryableCode =
@@ -47,12 +55,11 @@ export function classifyVerificationRetry(
 }
 
 export function canTryFallback(
-  error: Pick<ModelProviderError, "status" | "code">,
+  error: Pick<VerificationProviderError, "status" | "code">,
 ): boolean {
+  if (error.code === "unsupported_endpoint") return true;
   return (
-    error.status === 404 ||
-    error.status === 405 ||
-    error.status === 501 ||
-    error.code === "unsupported_endpoint"
+    error.code === "invocation_protocol_unsupported" &&
+    (error.status === 404 || error.status === 405 || error.status === 501)
   );
 }

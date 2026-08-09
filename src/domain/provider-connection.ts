@@ -11,8 +11,8 @@ import type {
 } from "./model-registry.js";
 
 export type ProviderAuth =
-  | { type: "bearer"; secret: SecretRef }
-  | { type: "none" };
+  | { readonly type: "bearer"; readonly secret: Readonly<SecretRef> }
+  | { readonly type: "none" };
 
 export interface ProviderConnectionRevision {
   readonly revisionId: ProviderConnectionRevisionId;

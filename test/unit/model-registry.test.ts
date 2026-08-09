@@ -98,6 +98,18 @@ describe("Model Registry lifecycle invariants", () => {
     expect(revision.providerModelId).toBe("other-model");
   });
 
+  it("makes nested Provider credentials immutable", () => {
+    const revision = connection({
+      auth: { type: "bearer", secret: { fromEnvironment: "OPENAI_API_KEY" } },
+    });
+
+    if (revision.auth.type === "bearer") {
+      // @ts-expect-error Nested credential content must not be mutated in place.
+      revision.auth.secret.fromEnvironment = "OPENAI_API_KEY";
+      expect(revision.auth.secret.fromEnvironment).toBe("OPENAI_API_KEY");
+    }
+  });
+
   it("requires an active Connection and verified Profile capabilities for Profile promotion", () => {
     expect(() => assertProfilePromotable(profile({ state: "verified" }), connection())).not.toThrow();
     expect(() => assertProfilePromotable(profile({ state: "verified" }), connection({ state: "superseded" }))).toThrow(
@@ -114,6 +126,15 @@ describe("Model Registry lifecycle invariants", () => {
 
     expect(assertExistingAssignmentUsable(currentAssignment, profile({ revisionId: oldRevisionId, state: "superseded" }))).toBeUndefined();
     expect(currentAssignment.modelProfileRevisionId).toBe("mpr_old");
+  });
+
+  it("rejects an assignment when the supplied Profile revision has a different identity", () => {
+    expect(() => assertExistingAssignmentUsable(assignment("explicit"), profile({ revisionId: "mpr_other" as ModelProfileRevisionId }))).toThrow(
+      "verification_required",
+    );
+    expect(() => assertExistingAssignmentUsable(assignment("legacy_import"), profile({ revisionId: "mpr_other" as ModelProfileRevisionId, state: "legacy_trusted", verifiedCapabilities: [] }))).toThrow(
+      "verification_required",
+    );
   });
 
   it("allows only imported assignments to keep a Legacy-Trusted revision", () => {

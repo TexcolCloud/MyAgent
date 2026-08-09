@@ -35,6 +35,9 @@ export function assertExistingAssignmentUsable(
   assignment: ModelAssignment,
   revision: ModelProfileRevision,
 ): void {
+  if (assignment.modelProfileRevisionId !== revision.revisionId) {
+    throw new DomainError("verification_required");
+  }
   if (assignment.source === "legacy_import" && revision.state === "legacy_trusted") {
     return;
   }
