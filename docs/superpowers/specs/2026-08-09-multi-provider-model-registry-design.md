@@ -1,6 +1,6 @@
 # Multi-Provider Model Registry and Protocol Routing Design
 
-**Status:** Pending written-spec review
+**Status:** Approved written specification
 **Date:** 2026-08-09
 **Extends:** [Personal Agent Kernel Design](./2026-08-07-personal-agent-kernel-design.md)
 
