@@ -112,6 +112,7 @@ Stable resources use Operator-selected immutable ASCII slugs and mutable display
 | `model_verifications` | Durable job and result for one exact Profile Revision and capability baseline |
 | `model_assignments` | Agent ID, exact Profile Revision, source, and record revision |
 | `managed_secret_versions` | Immutable encrypted Secret material and lifecycle metadata |
+| `managed_secret_keyring` | Singleton non-secret current Key ID, update timestamp, and optimistic record revision |
 | `discovered_models` | Minimal normalized model metadata scoped to one Connection Revision and discovery generation |
 | `provider_health` | Latest operational observation without authority to alter configuration |
 | `model_registry_events` | Secret-free append-only administrative audit events |
@@ -211,6 +212,10 @@ The Model Control Plane is rooted at `/v1/admin`. It requires the Admin Token an
 
 Every mutation other than resource creation supplies `expectedRevision`. A mismatch returns `409 revision_conflict`. Successful mutations append a Secret-free audit event and return the new record revision.
 
+Queueing a Verification is a mutation of the owning Model Profile. Its request therefore supplies that Profile's `expectedRevision`, even though the route identifies the exact immutable Profile Revision being verified.
+
+Master-key rotation supplies the singleton Managed Secret Keyring's `expectedRevision`. The transaction increments that record only after all active Secret Versions have been re-encrypted successfully.
+
 Credential inputs are write-only. Responses expose only an opaque Secret Version ID and `credentialConfigured`. They never return plaintext, ciphertext, Key fragments, provider response bodies, or request bodies.
 
 ### 6.3 Resource routes
@@ -249,6 +254,7 @@ POST /v1/admin/managed-secrets/master-key-rotation
 ```
 
 Connection or Profile purge and Managed Secret destruction are separate explicit operations. Retirement never implies Secret destruction.
+Master-key rotation returns only the number of re-encrypted versions, the non-secret current Key ID, and the new Keyring `recordRevision`.
 
 ### 6.4 Setup transaction sequence
 
@@ -505,7 +511,7 @@ The transport uses an injected fetch or dispatcher supported by the OpenAI SDK, 
 
 ## 14. Errors, Health, and Observability
 
-Control-plane and runtime failures use stable typed codes, including:
+Provider and runtime failures use the following closed set of stable typed codes:
 
 ```text
 invalid_provider_url
@@ -523,7 +529,10 @@ secret_locked
 verification_required
 model_assignment_required
 revision_conflict
+model_provider_locked
 ```
+
+Control-plane resource and lifecycle failures use separately typed codes required by the resource operations, including `legacy_assignment_forbidden`, `resource_in_use`, `connection_revision_not_active`, and `legacy_import_already_completed`; they are not provider-error normalization outputs.
 
 Provider errors retain only a normalized code, safe HTTP status, transient flag, bounded `Retry-After`, trace ID, and timestamp. Raw bodies, headers, stack traces, request payloads, Secrets, and reasoning never enter logs, HTTP Problems, Run Events, Verification Records, or audit events.
 

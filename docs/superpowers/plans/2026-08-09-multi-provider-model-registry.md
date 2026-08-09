@@ -26,7 +26,7 @@
 - Runtime routing uses only the Invocation Protocol fixed in the stored Run snapshot; it never retries through another protocol or provider.
 - Responses requests set `store: false`, never use `previous_response_id`, reconstruct all context locally, and neither expose nor persist reasoning items.
 - Both protocol adapters disable SDK retries, request one Tool Call at most, preserve the provider `callId`, allow missing Usage, and reject malformed or multiple Tool Calls as `model_protocol_error`.
-- Public/provider failure codes are the stable set `invalid_provider_url`, `insecure_provider_url`, `provider_auth_failed`, `provider_unavailable`, `provider_rate_limited`, `model_discovery_unsupported`, `model_not_found`, `invocation_protocol_unsupported`, `streaming_unsupported`, `tool_call_unsupported`, `model_protocol_error`, `secret_locked`, `verification_required`, `model_assignment_required`, `revision_conflict`, and `model_provider_locked`; raw provider codes are normalized into this set except validated `unsupported_endpoint`, which is internal fallback evidence only.
+- Provider/runtime failure codes are the closed stable set `invalid_provider_url`, `insecure_provider_url`, `provider_auth_failed`, `provider_unavailable`, `provider_rate_limited`, `model_discovery_unsupported`, `model_not_found`, `invocation_protocol_unsupported`, `streaming_unsupported`, `tool_call_unsupported`, `model_protocol_error`, `secret_locked`, `verification_required`, `model_assignment_required`, `revision_conflict`, and `model_provider_locked`; raw provider codes are normalized into this set except validated `unsupported_endpoint`, which is internal fallback evidence only. Control-plane resource/lifecycle operations retain their separately typed codes, including `legacy_assignment_forbidden`, `resource_in_use`, `connection_revision_not_active`, and `legacy_import_already_completed`.
 - Managed Secret Versions are immutable AES-256-GCM records with random 12-byte nonces, 16-byte tags, authenticated identity/version/purpose metadata, and a Base64 32-byte external master key; plaintext, ciphertext, key fragments, raw provider payloads, and reasoning never enter public responses, logs, events, snapshots, backups manifests, Verification records, health, or audit events.
 - A missing or mismatched master key does not block local service readiness; affected managed provider resources are Locked, and Run creation fails with `model_provider_locked` only when it needs one.
 - Provider network policy permits HTTPS and loopback HTTP by default, requires `allowInsecureHttp` for RFC1918 HTTP, and denies public HTTP, link-local, metadata, multicast, unspecified, URL credentials/query/fragment, cross-origin redirects, TLS bypass, and DNS rebinding.
@@ -255,7 +255,7 @@ export interface ManagedSecretStore {
   createVersion(input: { versionId: ManagedSecretVersionId; secretId: string; purpose: "provider_api_key"; plaintext: string; now: Date }): ManagedSecretVersionMetadata;
   resolve(versionId: ManagedSecretVersionId): string;
   destroy(input: { versionId: ManagedSecretVersionId; expectedRevision: number; now: Date }): ManagedSecretVersionMetadata;
-  rotateMasterKey(input: { now: Date }): { reencrypted: number; currentKeyId: string };
+  rotateMasterKey(input: { expectedRevision: number; now: Date }): { reencrypted: number; currentKeyId: string; recordRevision: number };
 }
 
 export interface DynamicRedactionRegistry {
@@ -274,6 +274,12 @@ export interface ManagedSecretVersionMetadata {
   recordRevision: number;
   createdAt: Date;
   destroyedAt: Date | null;
+}
+
+export interface ManagedSecretKeyringState {
+  currentKeyId: string;
+  recordRevision: number;
+  updatedAt: Date;
 }
 
 export interface ProviderConnectionView {
@@ -369,6 +375,7 @@ export interface CreateProfileRecord extends MutationContext {
 }
 export interface QueueVerificationRecord extends MutationContext {
   verificationId: ModelVerificationId; profileRevisionId: ModelProfileRevisionId;
+  expectedRevision: number;
   capabilityBaseline: typeof MODEL_CAPABILITY_BASELINE;
 }
 export interface ClaimVerificationInput { leaseOwner: string; now: Date; leaseUntil: Date }
@@ -609,7 +616,7 @@ Expected: FAIL because migration 2 tables and repository are absent.
 
 - [ ] **Step 3: Create migration 0002 with ownership constraints**
 
-Create the final migration in this task; later tasks must not rewrite an applied migration. Include `provider_connections`, `provider_connection_revisions`, `model_profiles`, `model_profile_revisions`, `model_assignments`, `default_model_profile`, `model_registry_events`, `discovery_generations`, `discovered_models`, `model_verifications`, `provider_health`, `managed_secret_versions`, and `legacy_model_imports`. Add nullable `provider_call_id` to existing `tool_calls` for pre-migration history and an immutability trigger for non-null values; Task 8 makes it mandatory for all new Tool proposals in application code. Store immutable revision content in typed columns, reject changes to base URL/auth/network/preset/model/protocol/context/baseline fields, and reject update/delete of append-only audit rows. Foreign keys must make every profile revision point to an exact connection revision and every assignment point to an exact profile revision. Add `record_revision INTEGER NOT NULL DEFAULT 0` to every mutable stable record.
+Create the final migration in this task; later tasks must not rewrite an applied migration. Include `provider_connections`, `provider_connection_revisions`, `model_profiles`, `model_profile_revisions`, `model_assignments`, `default_model_profile`, `model_registry_events`, `discovery_generations`, `discovered_models`, `model_verifications`, `provider_health`, `managed_secret_versions`, singleton `managed_secret_keyring`, and `legacy_model_imports`. Add nullable `provider_call_id` to existing `tool_calls` for pre-migration history and an immutability trigger for non-null values; Task 8 makes it mandatory for all new Tool proposals in application code. Store immutable revision content in typed columns, reject changes to base URL/auth/network/preset/model/protocol/context/baseline fields, and reject update/delete of append-only audit rows. Foreign keys must make every profile revision point to an exact connection revision and every assignment point to an exact profile revision. Add `record_revision INTEGER NOT NULL DEFAULT 0` to every mutable stable record, including the Keyring singleton.
 
 - [ ] **Step 4: Implement transaction and optimistic update helpers**
 
@@ -761,7 +768,7 @@ Initialize the adapter even when no key is configured. Store only ciphertext/non
 
 - [ ] **Step 4: Implement two-key rotation and destruction**
 
-Rotation requires both configured generations, decrypts every non-destroyed old-key row, re-encrypts under fresh nonces/current key in one `BEGIN IMMEDIATE` transaction, verifies no old Key ID remains, and rolls back all rows on any error. Destruction requires `inspectSecretReferences(versionId)` to return empty and an exact `expectedRevision`; it overwrites ciphertext/nonce/tag with empty blobs and marks `destroyed` without deleting audit metadata.
+Rotation requires both configured generations and the singleton Keyring's exact `expectedRevision`, decrypts every non-destroyed old-key row, re-encrypts under fresh nonces/current key in one `BEGIN IMMEDIATE` transaction, verifies no old Key ID remains, increments the Keyring `recordRevision`, and rolls back all rows plus the Keyring on any error. Destruction requires `inspectSecretReferences(versionId)` to return empty and an exact `expectedRevision`; it overwrites ciphertext/nonce/tag with empty blobs and marks `destroyed` without deleting audit metadata.
 
 - [ ] **Step 5: Make redaction registration dynamic**
 
@@ -1229,7 +1236,7 @@ Expected: FAIL because Verification orchestration/worker are absent.
 
 - [ ] **Step 3: Implement bounded probes**
 
-Queueing atomically moves the exact draft Profile revision to `verifying`. The text request contains a fixed harmless prompt and no Tools; require at least one non-empty text delta and terminal completion. The Tool request exposes only `capability_probe` with strict schema `{ nonce: string }`, sets `toolChoice: "required"`, and accepts exactly one valid call whose nonce matches the probe. Use no Run/Session/Tool/Approval repositories. Store Usage only when supplied and discard generated text/arguments immediately after validation.
+Queueing requires the owning Model Profile's `expectedRevision` and atomically moves the exact draft Profile revision to `verifying`. The text request contains a fixed harmless prompt and no Tools; require at least one non-empty text delta and terminal completion. The Tool request exposes only `capability_probe` with strict schema `{ nonce: string }`, sets `toolChoice: "required"`, and accepts exactly one valid call whose nonce matches the probe. Use no Run/Session/Tool/Approval repositories. Store Usage only when supplied and discard generated text/arguments immediately after validation.
 
 - [ ] **Step 4: Implement retry and automatic protocol candidate rules**
 
@@ -1428,7 +1435,7 @@ Expected: FAIL because these endpoints are absent.
 
 - [ ] **Step 3: Add Verification routes**
 
-`POST .../verifications` requires exact revision/baseline and returns 202 plus operation URL. GET returns only state, safe result code/status, capabilities, optional Usage, timestamps, trace ID, and fallback candidate/operation IDs. Cancel requires `expectedRevision`; it aborts queued/running work without deleting history.
+`POST .../verifications` requires the exact revision/baseline plus the owning Model Profile's `expectedRevision`, and returns 202 plus operation URL. GET returns only state, safe result code/status, capabilities, optional Usage, timestamps, trace ID, and fallback candidate/operation IDs. Cancel requires the Verification's `expectedRevision`; it aborts queued/running work without deleting history.
 
 - [ ] **Step 4: Add promotion/default/assignment routes**
 
@@ -1436,7 +1443,7 @@ Connection Promotion requires either successful discovery or a passing Verificat
 
 - [ ] **Step 5: Add retirement/purge/Secret routes**
 
-Retirement is optimistic and non-destructive. Purge returns `resource_in_use` with safe owner categories, not Run contents. Secret destruction is separate, write-only, reference-checked, and confirmation-bearing. Master-key rotation invokes transactional re-encryption, reports only `{ reencrypted, currentKeyId }`, and never accepts key material over HTTP.
+Retirement is optimistic and non-destructive. Purge returns `resource_in_use` with safe owner categories, not Run contents. Secret destruction is separate, write-only, reference-checked, and confirmation-bearing. Master-key rotation requires the Keyring singleton's `expectedRevision`, invokes transactional re-encryption, reports only `{ reencrypted, currentKeyId, recordRevision }`, and never accepts key material over HTTP.
 
 - [ ] **Step 6: Run full control-plane tests**
 
