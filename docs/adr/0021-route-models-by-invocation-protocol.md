@@ -1,0 +1,3 @@
+# Route models by invocation protocol instead of provider vendor
+
+The runtime selects a Chat Completions or Responses adapter from the Invocation Protocol fixed in a verified Model Profile Revision, while OpenAI, DeepSeek, and custom OpenAI-compatible Providers contribute only presets and narrow compatibility hints. Runtime fallback, vendor-duplicated adapters, and provider-managed conversation state were rejected because they can duplicate billed requests, fragment durable Tool Call semantics, and make recovery depend on mutable remote state; Responses calls are therefore stateless with `store: false`.

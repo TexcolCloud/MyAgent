@@ -3,6 +3,7 @@
 **Status:** Approved written specification
 **Date:** 2026-08-07
 **Reference baseline:** OpenClaw `2026.7.2`, commit [`aa21c001`](https://github.com/openclaw/openclaw/commit/aa21c001f1311b1712da92637adca306f4964aca)
+**Model extension:** Model provider configuration, discovery, verification, protocol routing, and Secret storage are superseded by [Multi-Provider Model Registry and Protocol Routing Design](./2026-08-09-multi-provider-model-registry-design.md).
 
 ## 1. Purpose
 
@@ -29,7 +30,7 @@ The canonical project language is maintained in [CONTEXT.md](../../../CONTEXT.md
 - The service listens on loopback by default and may be explicitly exposed to a trusted private network.
 - Every Operator API endpoint except liveness/readiness requires a static Bearer Token. Channel webhooks use adapter-specific signature verification instead.
 - Public Internet exposure, mutually untrusted users, and multi-tenancy are outside this design.
-- Local SQLite and files rely on operating-system account and file permissions. Application-level data encryption is not included.
+- Local SQLite and files rely on operating-system account and file permissions. Managed model-provider Secrets are the sole application-encrypted exception defined by the multi-provider model extension.
 - The configured model and Embedding provider is a trusted data processor for the context deliberately sent to it. Secret values are never part of that context.
 
 ### 2.2 User surfaces
@@ -762,6 +763,9 @@ The concise rationale for hard-to-reverse choices is stored in [docs/adr](../../
 - Canonical history with derived Session Summaries: ADR 0017
 - Per-Run configuration snapshots: ADR 0018
 - Modular monolith with SQLite: ADR 0019
+- Versioned SQLite Model Registry: ADR 0020
+- Protocol-first model routing: ADR 0021
+- Encrypted Managed Provider Secrets: ADR 0022
 
 ## 20. Next Step
 
