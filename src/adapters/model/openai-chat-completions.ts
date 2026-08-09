@@ -78,6 +78,7 @@ export class OpenAiChatCompletionsModel implements ModelPort {
     let toolCall: ToolCallFragments | undefined;
     let finishReason: string | undefined;
     let usage: ModelUsage | undefined;
+    let usageSeen = false;
     let sawText = false;
 
     try {
@@ -102,15 +103,24 @@ export class OpenAiChatCompletionsModel implements ModelPort {
       );
 
       for await (const chunk of stream) {
-        const extractedUsage = mapUsage(chunk);
-        if (extractedUsage !== undefined) {
-          usage = extractedUsage;
-        }
         if (chunk.choices.length > 1) throw protocolError();
         const choice = chunk.choices[0];
-        if (choice === undefined) continue;
+        const hasUsage = chunk.usage !== null && chunk.usage !== undefined;
+        if (choice === undefined) {
+          if (!hasUsage || finishReason === undefined || usageSeen) {
+            throw protocolError();
+          }
+          usage = mapUsage(chunk);
+          usageSeen = true;
+          continue;
+        }
         if (finishReason !== undefined || choice.index !== 0) {
           throw protocolError();
+        }
+        if (hasUsage) {
+          if (choice.finish_reason === null || usageSeen) throw protocolError();
+          usage = mapUsage(chunk);
+          usageSeen = true;
         }
         if (
           choice.delta.content !== null &&
@@ -157,23 +167,34 @@ function appendToolCall(
 ): ToolCallFragments | undefined {
   const deltas = choice.delta.tool_calls ?? [];
   if (deltas.length > 1) throw protocolError();
-  for (const delta of deltas) {
-    if (current !== undefined && current.index !== delta.index) {
+  const delta = deltas[0];
+  if (delta === undefined) return current;
+  if (delta.index !== 0) throw protocolError();
+  if (current === undefined) {
+    if (
+      delta.type !== "function" ||
+      delta.id === undefined ||
+      delta.id.length === 0 ||
+      delta.function?.name === undefined ||
+      delta.function.name.length === 0
+    ) {
       throw protocolError();
     }
-    current ??= { index: delta.index, callId: "", name: "", arguments: "" };
-    if (delta.id !== undefined && delta.id.length > 0) {
-      current.callId += delta.id;
-    }
-    if (delta.function?.name !== undefined && delta.function.name.length > 0) {
-      current.name += delta.function.name;
-    }
-    if (
-      delta.function?.arguments !== undefined &&
-      delta.function.arguments.length > 0
-    ) {
-      current.arguments += delta.function.arguments;
-    }
+    current = { index: 0, callId: "", name: "", arguments: "" };
+  } else if (delta.type !== undefined) {
+    throw protocolError();
+  }
+  if (delta.id !== undefined && delta.id.length > 0) {
+    current.callId += delta.id;
+  }
+  if (delta.function?.name !== undefined && delta.function.name.length > 0) {
+    current.name += delta.function.name;
+  }
+  if (
+    delta.function?.arguments !== undefined &&
+    delta.function.arguments.length > 0
+  ) {
+    current.arguments += delta.function.arguments;
   }
   return current;
 }
@@ -206,14 +227,23 @@ function parseToolCall(
   }
 }
 
-function mapUsage(chunk: ChatCompletionChunk): ModelUsage | undefined {
+function mapUsage(chunk: ChatCompletionChunk): ModelUsage {
   if (chunk.usage === null || chunk.usage === undefined) {
-    return undefined;
+    throw protocolError();
+  }
+  const inputTokens: unknown = chunk.usage.prompt_tokens;
+  const outputTokens: unknown = chunk.usage.completion_tokens;
+  if (!isTokenCount(inputTokens) || !isTokenCount(outputTokens)) {
+    throw protocolError();
   }
   return {
-    inputTokens: chunk.usage.prompt_tokens,
-    outputTokens: chunk.usage.completion_tokens,
+    inputTokens,
+    outputTokens,
   };
+}
+
+function isTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function toModelProviderError(error: unknown, signal: AbortSignal): Error {
@@ -394,9 +424,13 @@ function retryAfter(headers: Headers | undefined): { retryAfterMs?: number } {
 }
 
 function canonicalJson(value: JsonValue): string {
-  const encoded = canonicalizeJson(value);
-  if (encoded === undefined) throw protocolError();
-  return encoded;
+  try {
+    const encoded = canonicalizeJson(value);
+    if (encoded !== undefined) return encoded;
+  } catch {
+    // Canonical input failures are local protocol errors, never provider outages.
+  }
+  throw protocolError();
 }
 
 function abortError(): DOMException {

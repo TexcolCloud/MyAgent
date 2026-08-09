@@ -132,6 +132,40 @@ describe("OpenAiChatCompletionsModel", () => {
     expect(fake.requests).toHaveLength(0);
   });
 
+  it.each(["arguments", "result"] as const)(
+    "contains non-canonical Tool %s before transport as a protocol error",
+    async (field) => {
+      const fake = await startServer(successEvents());
+      servers.push(fake.server);
+      const input: ModelRequest["input"] = [
+        {
+          type: "assistant_tool_call",
+          callId: "call_7",
+          name: "read_file",
+          arguments: field === "arguments" ? { value: Number.NaN } : { path: "a" },
+        },
+        {
+          type: "tool_result",
+          callId: "call_7",
+          name: "read_file",
+          output: field === "result" ? { value: Number.POSITIVE_INFINITY } : { ok: true },
+        },
+      ];
+
+      const error = await collect(
+        adapter(fake.baseUrl).streamAttempt(
+          request(fake.baseUrl, { input }),
+          new AbortController().signal,
+        ),
+      ).catch((cause: unknown) => cause);
+
+      expect(error).toMatchObject(protocolErrorMatch);
+      expect(String(error)).toBe("ModelProviderError: model_protocol_error");
+      expect(error).not.toHaveProperty("cause");
+      expect(fake.requests).toHaveLength(0);
+    },
+  );
+
   it("sets streaming and one-call controls while leaving ordinary runs unforced", async () => {
     const fake = await startServer(successEvents());
     servers.push(fake.server);
@@ -233,6 +267,115 @@ describe("OpenAiChatCompletionsModel", () => {
       type: "completed",
       finishReason: "completed",
     });
+  });
+
+  it("accepts one valid Usage value attached to the terminal choice", async () => {
+    const fake = await startServer([
+      choicesFrame(
+        [choice(0, { content: "complete" }, "stop")],
+        usageValue(7, 2),
+      ),
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(
+      adapter(fake.baseUrl).streamAttempt(
+        request(fake.baseUrl),
+        new AbortController().signal,
+      ),
+    );
+
+    expect(chunks.at(-1)).toEqual({
+      type: "completed",
+      finishReason: "completed",
+      usage: { inputTokens: 7, outputTokens: 2 },
+    });
+  });
+
+  it.each([
+    {
+      name: "an empty zero-choice frame before the terminal",
+      events: [choicesFrame([]), ...successEvents()],
+    },
+    {
+      name: "a zero-choice Usage frame before the terminal",
+      events: [usageFrame(3, 1), ...successEvents()],
+    },
+    {
+      name: "duplicate zero-choice Usage frames",
+      events: [...successEvents(), usageFrame(3, 1), usageFrame(4, 2)],
+    },
+    {
+      name: "an empty zero-choice frame after the terminal",
+      events: [...successEvents(), choicesFrame([])],
+    },
+    {
+      name: "Usage attached to a nonterminal choice",
+      events: [
+        choicesFrame([choice(0, { content: "partial" })], usageValue(3, 1)),
+        frame({}, "stop"),
+      ],
+    },
+    {
+      name: "zero-choice Usage after terminal-attached Usage",
+      events: [
+        choicesFrame(
+          [choice(0, { content: "complete" }, "stop")],
+          usageValue(3, 1),
+        ),
+        usageFrame(4, 2),
+      ],
+    },
+  ])("rejects $name", async ({ events }) => {
+    const fake = await startServer(events);
+    servers.push(fake.server);
+
+    const error = await collect(
+      adapter(fake.baseUrl).streamAttempt(
+        request(fake.baseUrl),
+        new AbortController().signal,
+      ),
+    ).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject(protocolErrorMatch);
+    expect(String(error)).toBe("ModelProviderError: model_protocol_error");
+    expect(error).not.toHaveProperty("cause");
+  });
+
+  it.each([
+    {
+      name: "negative input tokens",
+      usage: usageValue(-1, 1),
+    },
+    {
+      name: "fractional output tokens",
+      usage: usageValue(1, 1.5),
+    },
+    {
+      name: "missing input tokens",
+      usage: { completion_tokens: 1, total_tokens: 1 },
+    },
+    {
+      name: "wrong-typed output tokens",
+      usage: { prompt_tokens: 1, completion_tokens: "1", total_tokens: 2 },
+    },
+  ])("rejects Usage with $name", async ({ usage }) => {
+    const fake = await startServer([
+      ...successEvents(),
+      choicesFrame([], usage),
+    ]);
+    servers.push(fake.server);
+
+    const error = await collect(
+      adapter(fake.baseUrl).streamAttempt(
+        request(fake.baseUrl),
+        new AbortController().signal,
+      ),
+    ).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject(protocolErrorMatch);
+    expect(String(error)).toBe("ModelProviderError: model_protocol_error");
+    expect(error).not.toHaveProperty("cause");
   });
 
   it("assembles fragmented Tool Call ID, name, and arguments", async () => {
@@ -409,6 +552,61 @@ describe("OpenAiChatCompletionsModel", () => {
       events: [
         toolDelta({ id: "call_", name: "read_", arguments: "{" }, 0),
         toolDelta({ id: "1", name: "file", arguments: "}" }, 1),
+      ],
+    },
+    {
+      name: "an initial nonzero Tool Call index",
+      events: [
+        toolDelta({ id: "call_1", name: "read_file", arguments: "{}" }, 1),
+        frame({}, "tool_calls"),
+      ],
+    },
+    {
+      name: "a missing initial Tool Call index",
+      events: [
+        frame({
+          tool_calls: [{
+            id: "call_1",
+            type: "function",
+            function: { name: "read_file", arguments: "{}" },
+          }],
+        }),
+        frame({}, "tool_calls"),
+      ],
+    },
+    {
+      name: "a missing Tool Call start type",
+      events: [
+        frame({
+          tool_calls: [{
+            index: 0,
+            id: "call_1",
+            function: { name: "read_file", arguments: "{}" },
+          }],
+        }),
+        frame({}, "tool_calls"),
+      ],
+    },
+    {
+      name: "an unsupported Tool Call start type",
+      events: [
+        frame({
+          tool_calls: [{
+            index: 0,
+            id: "call_1",
+            type: "custom",
+            function: { name: "read_file", arguments: "{}" },
+          }],
+        }),
+        frame({}, "tool_calls"),
+      ],
+    },
+    {
+      name: "a restarted full Tool Call ID and name",
+      events: [
+        toolDelta({ id: "call_1", name: "read_file", arguments: "{}" }),
+        toolDelta({ id: "call_1", name: "read_file", arguments: "" }),
+        frame({}, "tool_calls"),
       ],
     },
   ])("rejects $name as a model protocol error", async ({ events }) => {
@@ -818,14 +1016,17 @@ function choice(index: number, delta: JsonValue, finishReason: string | null = n
   return { index, delta, finish_reason: finishReason };
 }
 
-function choicesFrame(choices: readonly JsonValue[]): JsonValue {
+function choicesFrame(
+  choices: readonly JsonValue[],
+  usage: JsonValue | null = null,
+): JsonValue {
   return {
     id: "chatcmpl-test",
     object: "chat.completion.chunk",
     created: 0,
     model: "test-model",
     choices: [...choices],
-    usage: null,
+    usage,
   };
 }
 
@@ -848,17 +1049,14 @@ function toolDelta(
 }
 
 function usageFrame(inputTokens: number, outputTokens: number): JsonValue {
+  return choicesFrame([], usageValue(inputTokens, outputTokens));
+}
+
+function usageValue(inputTokens: number, outputTokens: number): JsonValue {
   return {
-    id: "chatcmpl-test",
-    object: "chat.completion.chunk",
-    created: 0,
-    model: "test-model",
-    choices: [],
-    usage: {
-      prompt_tokens: inputTokens,
-      completion_tokens: outputTokens,
-      total_tokens: inputTokens + outputTokens,
-    },
+    prompt_tokens: inputTokens,
+    completion_tokens: outputTokens,
+    total_tokens: inputTokens + outputTokens,
   };
 }
 
