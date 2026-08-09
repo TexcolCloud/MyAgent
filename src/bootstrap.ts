@@ -8,6 +8,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { EnvironmentSecretResolver } from "./adapters/environment-secret-resolver.js";
 import { CompositeSecretResolver } from "./adapters/composite-secret-resolver.js";
 import { OpenAiChatCompletionsModel } from "./adapters/model/openai-chat-completions.js";
+import { OpenAiResponsesModel } from "./adapters/model/openai-responses.js";
+import { ModelRuntimeRouter } from "./adapters/model/model-runtime-router.js";
 import { NodeProviderHttpTransport } from "./adapters/provider-http-transport.js";
 import { SqliteApprovalRepository } from "./adapters/sqlite/approval-repository.js";
 import { SqliteBackupWriter } from "./adapters/sqlite/backup.js";
@@ -142,9 +144,15 @@ export async function bootstrap(
       tools,
       approvals,
       sessions,
-      model: options.model ?? new OpenAiChatCompletionsModel({
-        transport: providerTransport,
-        connections: modelRegistry,
+      model: options.model ?? new ModelRuntimeRouter({
+        chatCompletions: new OpenAiChatCompletionsModel({
+          transport: providerTransport,
+          connections: modelRegistry,
+        }),
+        responses: new OpenAiResponsesModel({
+          transport: providerTransport,
+          connections: modelRegistry,
+        }),
       }),
       prompts: new PromptAssembler(sessions),
       registry,
