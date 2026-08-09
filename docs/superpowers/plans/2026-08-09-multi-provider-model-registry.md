@@ -552,6 +552,43 @@ export function assertExistingAssignmentUsable(assignment: ModelAssignment, revi
   throw new DomainError("verification_required");
 }
 
+export function assertConnectionPromotable(revision: ProviderConnectionRevision): void {
+  if (revision.state === "verified") return;
+  throw new DomainError("verification_required");
+}
+
+export function assertProfilePromotable(
+  revision: ModelProfileRevision,
+  connectionRevision: ProviderConnectionRevision,
+): void {
+  if (connectionRevision.state !== "active") throw new DomainError("connection_revision_not_active");
+  if (revision.state === "verified"
+      && revision.verifiedCapabilities.includes("streaming_text")
+      && revision.verifiedCapabilities.includes("single_tool_call")) return;
+  throw new DomainError("verification_required");
+}
+
+export function assertPurgeAllowed(referenceCount: number): void {
+  if (referenceCount === 0) return;
+  throw new DomainError("resource_in_use");
+}
+
+export type VerificationRetryDecision =
+  | { shouldRetry: false }
+  | { shouldRetry: true; delayMs: number };
+
+export function classifyVerificationRetry(
+  error: Pick<ModelProviderError, "code" | "transient" | "retryAfterMs">,
+  attemptNumber: number,
+): VerificationRetryDecision {
+  const retryableCode = error.code === "provider_unavailable" || error.code === "provider_rate_limited";
+  if (!error.transient || !retryableCode || attemptNumber >= 2) return { shouldRetry: false };
+  return {
+    shouldRetry: true,
+    delayMs: Math.min(Math.max(error.retryAfterMs ?? 1_000, 1_000), 30_000),
+  };
+}
+
 export function canTryFallback(error: Pick<ModelProviderError, "status" | "code">): boolean {
   return error.status === 404 || error.status === 405 || error.status === 501
     || error.code === "unsupported_endpoint";
