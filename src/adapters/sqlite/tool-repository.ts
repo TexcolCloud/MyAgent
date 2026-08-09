@@ -6,7 +6,7 @@ import { ApplicationError, DomainError } from "../../domain/errors.js";
 import type { ApprovalId, RunId, ToolCallId } from "../../domain/ids.js";
 import type { JsonValue } from "../../domain/json.js";
 import type { PolicyEffect } from "../../domain/policy.js";
-import type { ToolCall } from "../../domain/tool-call.js";
+import { parseProviderCallId, type ToolCall } from "../../domain/tool-call.js";
 import type { ToolCallState } from "../../domain/states.js";
 import type {
   RecordToolProposalInput,
@@ -24,6 +24,7 @@ interface ToolCallRow {
   run_id: string;
   state: ToolCallState;
   tool_name: string;
+  provider_call_id: string | null;
   effect: ToolCall["effect"];
   arguments_json: string;
   canonical_arguments: string;
@@ -47,20 +48,34 @@ export class SqliteToolRepository implements ToolStore {
   getLatestForRun(runId: RunId): ToolCall | null {
     const row = this.db
       .prepare(
-        `SELECT tool_call_id, run_id, state, tool_name, effect,
+        `SELECT tool_call_id, run_id, state, tool_name, provider_call_id, effect,
                 arguments_json, canonical_arguments, arguments_sha256,
                 policy_effect, matched_rule, policy_facts_json,
                 retry_of_tool_call_id, result_json, created_at, updated_at
          FROM tool_calls
          WHERE run_id = ?
-         ORDER BY created_at DESC, tool_call_id DESC
+         ORDER BY rowid DESC
          LIMIT 1`,
       )
       .get(runId) as ToolCallRow | undefined;
     return row === undefined ? null : mapToolCall(row);
   }
 
+  listForRun(runId: RunId): readonly ToolCall[] {
+    const rows = this.db.prepare(
+      `SELECT tool_call_id, run_id, state, tool_name, provider_call_id, effect,
+              arguments_json, canonical_arguments, arguments_sha256,
+              policy_effect, matched_rule, policy_facts_json,
+              retry_of_tool_call_id, result_json, created_at, updated_at
+       FROM tool_calls
+       WHERE run_id = ?
+       ORDER BY rowid ASC`,
+    ).all(runId) as unknown as ToolCallRow[];
+    return rows.map(mapToolCall);
+  }
+
   recordProposal(input: RecordToolProposalInput): ToolCall {
+    const providerCallId = parseProviderCallId(input.providerCallId);
     const occurredAt = input.occurredAt.toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -85,16 +100,18 @@ export class SqliteToolRepository implements ToolStore {
       this.db
         .prepare(
           `INSERT INTO tool_calls (
-            tool_call_id, run_id, state, tool_name, effect, arguments_json,
+            tool_call_id, run_id, state, tool_name, provider_call_id,
+            effect, arguments_json,
             canonical_arguments, arguments_sha256, policy_effect,
             matched_rule, policy_facts_json, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.toolCallId,
           input.runId,
           state,
           input.toolName,
+          providerCallId,
           input.effect,
           input.canonicalArguments,
           input.canonicalArguments,
@@ -688,7 +705,7 @@ export class SqliteToolRepository implements ToolStore {
 
   private requireToolCall(toolCallId: ToolCallId): ToolCall {
     const row = this.db.prepare(
-      `SELECT tool_call_id, run_id, state, tool_name, effect,
+      `SELECT tool_call_id, run_id, state, tool_name, provider_call_id, effect,
               arguments_json, canonical_arguments, arguments_sha256,
               policy_effect, matched_rule, policy_facts_json,
               retry_of_tool_call_id, result_json, created_at, updated_at
@@ -744,6 +761,7 @@ function mapToolCall(row: ToolCallRow): ToolCall {
     runId: row.run_id as RunId,
     state: row.state,
     toolName: row.tool_name,
+    providerCallId: row.provider_call_id,
     effect: row.effect,
     arguments: JSON.parse(row.arguments_json) as JsonValue,
     canonicalArguments: row.canonical_arguments,

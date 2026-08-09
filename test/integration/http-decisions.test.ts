@@ -77,7 +77,7 @@ describe("HTTP catalog and session routes", () => {
       available: active.available.map((agent, index) => index === 0
         ? {
             ...agent,
-            revision: { ...agent.revision, revisionId: 42 },
+            definition: { ...agent.definition, definitionRevisionId: 42 },
           }
         : agent),
     } as unknown as CatalogSnapshot;

@@ -1,4 +1,4 @@
-import { cp, mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +7,11 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 
 import { bootstrap } from "../../src/bootstrap.js";
+import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
+import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { migrate } from "../../src/adapters/sqlite/migrator.js";
+import { parseAgentId } from "../../src/domain/ids.js";
+import { seedVerifiedChatAssignments } from "../helpers/verified-chat-model-registry.js";
 
 const VALID_FIXTURE = fileURLToPath(new URL("../fixtures/config/valid", import.meta.url));
 const OPERATOR_SECRET = "operator-secret-seeded";
@@ -28,6 +33,18 @@ describe("Secret containment", () => {
     let service: Awaited<ReturnType<typeof bootstrap>> | undefined;
 
     try {
+      await mkdir(path.dirname(databasePath), { recursive: true });
+      const connection = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+      try {
+        migrate(connection.db);
+        seedVerifiedChatAssignments(
+          new SqliteModelRegistryRepository(connection.db),
+          [parseAgentId("primary")],
+          { providerAuth: { type: "bearer", secret: { fromEnvironment: "MODEL_API_KEY" } } },
+        );
+      } finally {
+        connection.close();
+      }
       service = await bootstrap(configPath, {
         listen: { host: "127.0.0.1", port: 0 },
         signals: false,

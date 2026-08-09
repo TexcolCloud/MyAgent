@@ -109,7 +109,7 @@ describe("HTTP Runs", () => {
         leaseOwner: "http-completed-worker",
         attemptId: "attempt-http-completed" as AttemptId,
         text: "durable terminal output",
-        finishReason: "stop",
+        finishReason: "completed",
         usage: { inputTokens: 4, outputTokens: 3 },
         occurredAt,
       });

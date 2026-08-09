@@ -10,9 +10,14 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
+import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
+import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { bootstrap, type BootstrappedService } from "../../src/bootstrap.js";
+import { parseAgentId } from "../../src/domain/ids.js";
 import type { JsonValue } from "../../src/domain/json.js";
 import type { FaultPoint } from "../../src/runtime/fault-injector.js";
+import { seedVerifiedChatAssignments } from "./verified-chat-model-registry.js";
 
 const EXAMPLES = fileURLToPath(new URL("../../examples", import.meta.url));
 const BEARER_TOKEN = "e2e-operator-secret";
@@ -133,7 +138,12 @@ export interface E2eFixture {
 
 export async function prepareE2eFixture(
   baseUrl: string,
-  options: { allowRunCommand?: boolean; maxInputTokens?: number } = {},
+  options: {
+    allowRunCommand?: boolean;
+    maxInputTokens?: number;
+    modelId?: string;
+    providerApiKeyEnvironment?: string;
+  } = {},
 ): Promise<E2eFixture> {
   const root = await mkdtemp(path.join(os.tmpdir(), "myagent-e2e-"));
   const configRoot = path.join(root, "config");
@@ -145,26 +155,9 @@ export async function prepareE2eFixture(
   await Promise.all([
     mkdir(primaryWorkspace, { recursive: true }),
     mkdir(researcherWorkspace, { recursive: true }),
+    mkdir(path.dirname(databasePath), { recursive: true }),
   ]);
   await writeFile(path.join(primaryWorkspace, "evidence.txt"), "durable evidence\n", "utf8");
-
-  const config = parseYaml(await readFile(configPath, "utf8")) as {
-    models: Record<string, {
-      model: string;
-      baseUrl: string;
-      apiKey: { fromEnvironment: string };
-      maxInputTokens: number;
-    }>;
-  };
-  const model = config.models.default;
-  if (model === undefined) throw new Error("default_model_missing");
-  model.model = "test-model";
-  model.baseUrl = baseUrl;
-  model.apiKey = { fromEnvironment: "E2E_MODEL_API_KEY" };
-  if (options.maxInputTokens !== undefined) {
-    model.maxInputTokens = options.maxInputTokens;
-  }
-  await writeFile(configPath, stringifyYaml(config), "utf8");
 
   const policyPath = path.join(configRoot, "agents", "primary", "policy.yaml");
   const policy = parseYaml(await readFile(policyPath, "utf8")) as {
@@ -179,6 +172,29 @@ export async function prepareE2eFixture(
   const previousModel = process.env.E2E_MODEL_API_KEY;
   process.env.MYAGENT_BEARER_TOKEN = BEARER_TOKEN;
   process.env.E2E_MODEL_API_KEY = MODEL_SECRET;
+  const connection = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+  try {
+    migrate(connection.db);
+    seedVerifiedChatAssignments(
+      new SqliteModelRegistryRepository(connection.db),
+      [parseAgentId("primary"), parseAgentId("researcher")],
+      {
+        baseUrl,
+        providerAuth: {
+          type: "bearer",
+          secret: {
+            fromEnvironment: options.providerApiKeyEnvironment ?? "E2E_MODEL_API_KEY",
+          },
+        },
+        ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
+        ...(options.maxInputTokens === undefined
+          ? {}
+          : { maxInputTokens: options.maxInputTokens }),
+      },
+    );
+  } finally {
+    connection.close();
+  }
 
   return {
     root,
@@ -374,7 +390,7 @@ export class FaultChildController {
   #url: string | undefined;
 
   constructor(
-    private readonly fixture: Pick<E2eFixture, "configPath" | "root">,
+    private readonly fixture: Pick<E2eFixture, "configPath" | "databasePath" | "root">,
     readonly point: FaultPoint | undefined,
     private readonly modelAckMarker?: string,
   ) {
@@ -410,6 +426,7 @@ export class FaultChildController {
             `--require=${userInfoShim}`,
           ].filter(Boolean).join(" "),
           MYAGENT_FAULT_CONFIG: this.fixture.configPath,
+          MYAGENT_FAULT_DATABASE: this.fixture.databasePath,
           MYAGENT_FAULT_ARM: this.armPath,
           MYAGENT_FAULT_HIT: this.hitPath,
           MYAGENT_FAULT_READY: this.readyPath,

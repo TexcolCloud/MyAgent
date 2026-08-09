@@ -11,6 +11,7 @@ import type {
 } from "../domain/ids.js";
 import type { Run } from "../domain/run.js";
 import type { JsonValue } from "../domain/json.js";
+import type { ModelFinishReason, ModelUsage } from "./model.js";
 
 export interface CreateStoredRunInput {
   agentId: AgentId;
@@ -63,8 +64,8 @@ export interface CompleteRunInput {
   leaseOwner: string;
   attemptId: AttemptId;
   text: string;
-  finishReason: string;
-  usage: { inputTokens: number; outputTokens: number };
+  finishReason: ModelFinishReason;
+  usage?: ModelUsage;
   occurredAt: Date;
 }
 

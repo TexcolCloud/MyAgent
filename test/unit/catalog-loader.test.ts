@@ -15,6 +15,20 @@ function fixture(...segments: string[]): string {
 }
 
 describe("loadCatalog", () => {
+  it("publishes model-free Agent definitions from strict version 2 config", async () => {
+    const result = await loadCatalog(fixture("valid", "myagent.yaml"));
+    const primary = result.byId.get(parseAgentId("primary"));
+
+    expect(result.global.version).toBe(2);
+    expect(result.global).not.toHaveProperty("models");
+    expect(primary).toHaveProperty("definition");
+    expect(primary).not.toHaveProperty("revision");
+    expect(primary?.definition).not.toHaveProperty("model");
+    expect(primary?.definition.definitionRevisionId).toBe(
+      `def_${primary?.definition.contentSha256 ?? "missing"}`,
+    );
+  });
+
   it("rejects global listener errors but isolates an invalid Agent", async () => {
     await expect(loadCatalog(fixture("bad-global", "myagent.yaml"))).rejects.toMatchObject({
       code: "invalid_global_config",
@@ -67,11 +81,13 @@ describe("loadCatalog", () => {
         "server:",
         "  bearerToken:",
         "    fromEnvironment: MYAGENT_BEARER_TOKEN",
+        "  adminToken:",
+        "    fromEnvironment: MYAGENT_ADMIN_TOKEN",
         "database:",
         "  path: ./kernel.db",
         "agentRoots:",
         "  - ./missing-agents",
-        "models: {}",
+        "version: 2",
         "",
       ].join("\n"),
     );
@@ -85,48 +101,45 @@ describe("loadCatalog", () => {
     }
   });
 
-  it("builds deterministic revisions with full Skill bodies and unresolved secrets", async () => {
+  it("builds deterministic definitions with full Skill bodies", async () => {
     const first = await loadCatalog(fixture("valid", "myagent.yaml"));
     const second = await loadCatalog(fixture("valid", "myagent.yaml"));
     const primary = first.available.find((agent) => agent.id === "primary");
 
-    expect(primary?.revision.skills).toEqual([
+    expect(primary?.definition.skills).toEqual([
       expect.objectContaining({
         name: "research",
         body: "Use the available local sources and preserve source paths in the answer.\n",
         contentSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
     ]);
-    expect(primary?.revision.model.apiKey).toEqual({
-      fromEnvironment: "MODEL_API_KEY",
-    });
-    expect(primary?.revision.revisionId).toBe(
-      second.available.find((agent) => agent.id === "primary")?.revision.revisionId,
+    expect(primary?.definition.definitionRevisionId).toBe(
+      second.available.find((agent) => agent.id === "primary")?.definition.definitionRevisionId,
     );
-    expect(primary?.revision.revisionId).toBe(
-      `rev_${primary?.revision.contentSha256 ?? "missing"}`,
+    expect(primary?.definition.definitionRevisionId).toBe(
+      `def_${primary?.definition.contentSha256 ?? "missing"}`,
     );
-    expect(Object.isFrozen(primary?.revision)).toBe(true);
+    expect(primary?.definition).not.toHaveProperty("model");
+    expect(Object.isFrozen(primary?.definition)).toBe(true);
   });
 
   it("freezes every nested value in an immutable Agent revision", async () => {
     const catalog = await loadCatalog(fixture("valid", "myagent.yaml"));
-    const revision = catalog.byId.get(parseAgentId("primary"))?.revision;
+    const definition = catalog.byId.get(parseAgentId("primary"))?.definition;
 
     expect(Object.isFrozen(catalog.global)).toBe(true);
     expect(Object.isFrozen(catalog.global.server)).toBe(true);
     expect(Object.isFrozen(catalog.global.server.bearerToken)).toBe(true);
     expect(Object.isFrozen(catalog.global.database)).toBe(true);
-    expect(Object.isFrozen(catalog.global.models)).toBe(true);
-    expect(Object.isFrozen(catalog.global.models.default)).toBe(true);
+    if (catalog.global.version === 2) {
+      expect(Object.isFrozen(catalog.global.modelControl)).toBe(true);
+    }
     expect(Object.isFrozen(catalog.global.toolEnvironmentAllowlist)).toBe(true);
-    expect(Object.isFrozen(revision?.model)).toBe(true);
-    expect(Object.isFrozen(revision?.model.apiKey)).toBe(true);
-    expect(Object.isFrozen(revision?.skills)).toBe(true);
-    expect(Object.isFrozen(revision?.policy)).toBe(true);
-    expect(Object.isFrozen(revision?.policy[0])).toBe(true);
-    expect(Object.isFrozen(revision?.delegates)).toBe(true);
-    expect(Object.isFrozen(revision?.limits)).toBe(true);
+    expect(Object.isFrozen(definition?.skills)).toBe(true);
+    expect(Object.isFrozen(definition?.policy)).toBe(true);
+    expect(Object.isFrozen(definition?.policy[0])).toBe(true);
+    expect(Object.isFrozen(definition?.delegates)).toBe(true);
+    expect(Object.isFrozen(definition?.limits)).toBe(true);
   });
 
   it("isolates duplicate Agent IDs instead of publishing an ambiguous revision", async () => {

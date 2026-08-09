@@ -6,6 +6,10 @@ import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import type { AgentRevisionSnapshot } from "../../src/domain/agent-revision.js";
 import { parseAgentId } from "../../src/domain/ids.js";
 import { tempPath } from "../helpers/temp-dir.js";
+import {
+  TEST_MODEL_PROFILE_REVISION_ID,
+  testModelRuntime,
+} from "../helpers/model-fixtures.js";
 
 describe("SqliteCatalogRepository", () => {
   it("stores complete Skill bodies without resolving model secrets", () => {
@@ -70,16 +74,16 @@ describe("SqliteCatalogRepository", () => {
 function agentRevisionFixture(): AgentRevisionSnapshot {
   return {
     revisionId: "rev_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    definitionRevisionId: "def_catalog_repository",
+    modelProfileRevisionId: TEST_MODEL_PROFILE_REVISION_ID,
     agentId: parseAgentId("primary"),
     displayName: "Primary",
     prompt: "Use the available tools carefully.",
-    model: {
-      provider: "openai",
-      model: "gpt-5",
+    model: testModelRuntime({
       baseUrl: "https://api.example.test/v1",
-      apiKey: { fromEnvironment: "MODEL_API_KEY" },
+      modelId: "gpt-5",
       maxInputTokens: 32_000,
-    },
+    }),
     workspace: "D:/workspace",
     skills: [
       {

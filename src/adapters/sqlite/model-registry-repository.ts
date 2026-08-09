@@ -258,6 +258,30 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
     };
   }
 
+  getConnectionRevision(
+    id: ProviderConnectionRevisionId,
+  ): {
+    providerKind: ProviderConnectionView["providerKind"];
+    revision: ProviderConnectionRevision;
+  } | null {
+    const row = this.db.prepare(
+      `SELECT revision.revision_id, revision.connection_id, revision.state,
+              revision.base_url, revision.auth_json,
+              revision.allow_insecure_http, revision.protocol_preference,
+              revision.preset_version, revision.created_at,
+              connection.provider_kind
+       FROM provider_connection_revisions AS revision
+       JOIN provider_connections AS connection
+         ON connection.connection_id = revision.connection_id
+       WHERE revision.revision_id = ?`,
+    ).get(id) as (ConnectionRevisionRow & {
+      provider_kind: ProviderConnectionView["providerKind"];
+    }) | undefined;
+    return row === undefined
+      ? null
+      : { providerKind: row.provider_kind, revision: mapConnectionRevision(row) };
+  }
+
   listConnections(): readonly ProviderConnectionView[] {
     const rows = this.db.prepare(
       "SELECT connection_id FROM provider_connections ORDER BY connection_id",

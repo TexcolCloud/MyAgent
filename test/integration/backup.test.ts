@@ -51,7 +51,9 @@ describe("HTTP backup", () => {
           "agents/primary/policy.yaml",
           "skills/research/SKILL.md",
         ]),
-        activeRevisionIds: harness.catalog.current().available.map((agent) => agent.revision.revisionId).sort(),
+        activeRevisionIds: harness.catalog.current().available
+          .map((agent) => agent.definition.definitionRevisionId)
+          .sort(),
       });
       expect(Object.keys(manifest.sha256).sort()).toEqual([...manifest.files].sort());
       for (const digest of Object.values(manifest.sha256)) expect(digest).toMatch(/^[a-f0-9]{64}$/);

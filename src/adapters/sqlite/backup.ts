@@ -35,7 +35,9 @@ export class SqliteBackupWriter implements BackupWriter {
       for (const file of files) {
         sha256[file] = createHash("sha256").update(await readFile(resolveBackupFile(partial, file))).digest("hex");
       }
-      const activeRevisionIds = input.catalog.available.map((agent) => agent.revision.revisionId).sort();
+      const activeRevisionIds = input.catalog.available
+        .map((agent) => agent.definition.definitionRevisionId)
+        .sort();
       const manifest: BackupManifest = {
         schemaVersion: 1,
         createdAt: input.occurredAt.toISOString(),

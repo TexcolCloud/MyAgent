@@ -51,7 +51,7 @@ export const runLimitsOverrideSchema = z.strictObject({
   maxRunToolOutputBytes: z.number().int().positive().optional(),
 });
 
-export const agentConfigSchema = z.strictObject({
+export const agentConfigV1Schema = z.strictObject({
   id: z.string().regex(AGENT_ID_PATTERN),
   displayName: z.string().min(1),
   prompt: z.string().min(1),
@@ -62,6 +62,8 @@ export const agentConfigSchema = z.strictObject({
   delegates: uniqueStrings(z.array(z.string().regex(AGENT_ID_PATTERN)).default([])),
   limits: runLimitsOverrideSchema.default({}),
 });
+
+export const agentConfigSchema = agentConfigV1Schema;
 
 const modelControlConfigSchema = z.strictObject({
   discoveryCacheSeconds: z.number().int().positive().default(600),
@@ -165,7 +167,8 @@ export const skillFrontmatterSchema = z.strictObject({
 });
 
 export type GlobalConfig = z.infer<typeof globalConfigSchema>;
-export type AgentConfig = z.infer<typeof agentConfigSchema>;
+export type AgentConfigV1 = z.infer<typeof agentConfigV1Schema>;
+export type AgentConfig = AgentConfigV1;
 export type GlobalConfigV2 = z.infer<typeof globalConfigV2Schema>;
 export type AgentConfigV2 = z.infer<typeof agentConfigV2Schema>;
 export type LegacyGlobalConfigV1 = z.infer<typeof legacyGlobalConfigV1Schema>;

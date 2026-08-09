@@ -14,7 +14,7 @@ function configReloadResponse(snapshot: CatalogSnapshot) {
   return configReloadResponseSchema.parse({
     agents: snapshot.available.map((agent) => ({
       id: agent.id,
-      revisionId: agent.revision.revisionId,
+      revisionId: agent.definition.definitionRevisionId,
     })),
     unavailable: snapshot.unavailable.map((agent) => ({
       label: agent.sourceLabel,

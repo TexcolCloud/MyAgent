@@ -23,6 +23,7 @@ import {
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
+import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { completedText, ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
@@ -40,7 +41,7 @@ describe("lease recovery", () => {
       const tools = new SqliteToolRepository(connection.db);
       const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
       const ids = new FakeIds({ sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000051"), sessionIdFromUuid("00000000-0000-7000-8000-000000000052")], runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000051"), runIdFromUuid("00000000-0000-7000-8000-000000000052")] });
-      const create = new CreateRunService(new CatalogService(snapshot), runs, clock, ids);
+      const create = new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids);
       const side = create.execute({ agentId: "primary", sessionKey: "recover:side", input: { type: "text", text: "x" }, idempotencyKey: "recover-side-0001", source: { kind: "http" } });
       const read = create.execute({ agentId: "primary", sessionKey: "recover:read", input: { type: "text", text: "x" }, idempotencyKey: "recover-read-0001", source: { kind: "http" } });
       clock.advanceBy(1_000);
@@ -86,7 +87,7 @@ describe("lease recovery", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        resolvedAgents(new CatalogService(snapshot)),
         runs,
         clock,
         ids,
@@ -200,7 +201,7 @@ describe("lease recovery", () => {
         runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000071")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        resolvedAgents(new CatalogService(snapshot)),
         runs,
         clock,
         ids,
@@ -227,6 +228,8 @@ describe("lease recovery", () => {
       expect(() => sessions.saveSummaryWithLease({
         runId: created.runId,
         leaseOwner: "provider-worker",
+        attemptId: attemptIdFromUuid("00000000-0000-7000-8000-000000000071"),
+        finishReason: "completed",
         occurredAt: clock.now(),
         summary: {
           summaryId: "summary:lost-lease",

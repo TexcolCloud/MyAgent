@@ -11,8 +11,17 @@ import {
   type CreateRunCommand,
 } from "../../src/application/create-run.js";
 import { loadCatalog, type CatalogSnapshot } from "../../src/config/catalog-loader.js";
-import { CatalogService } from "../../src/config/catalog-service.js";
-import { runIdFromUuid, sessionIdFromUuid } from "../../src/domain/ids.js";
+import type {
+  AgentDefinitionRevision,
+  AgentRevisionSnapshot,
+} from "../../src/domain/agent-revision.js";
+import {
+  modelProfileRevisionIdFromUuid,
+  providerConnectionRevisionIdFromUuid,
+  runIdFromUuid,
+  sessionIdFromUuid,
+  type AgentId,
+} from "../../src/domain/ids.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 
@@ -109,12 +118,48 @@ function createHarness(
   const catalogRepository = new SqliteCatalogRepository(connection.db);
   const runRepository = new SqliteRunRepository(connection.db, catalogRepository);
   const service = new CreateRunService(
-    new CatalogService(snapshot),
+    {
+      resolve(agentId: AgentId) {
+        const definition = snapshot.byId.get(agentId)?.definition;
+        if (definition === undefined) throw new Error("agent_unavailable");
+        return resolvedRevision(definition);
+      },
+    },
     runRepository,
     new FakeClock(new Date("2026-08-07T00:00:00.000Z")),
     new FakeIds(ids),
   );
   return { connection, service };
+}
+
+function resolvedRevision(
+  definition: AgentDefinitionRevision,
+): AgentRevisionSnapshot {
+  return {
+    ...definition,
+    revisionId: `rev_${definition.agentId}`,
+    definitionRevisionId: definition.definitionRevisionId,
+    modelProfileRevisionId: modelProfileRevisionIdFromUuid(
+      "00000000-0000-7000-8000-000000000001",
+    ),
+    model: {
+      providerConnectionRevisionId: providerConnectionRevisionIdFromUuid(
+        "00000000-0000-7000-8000-000000000001",
+      ),
+      providerKind: "openai_compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      providerAuth: {
+        type: "bearer",
+        secret: { fromEnvironment: "MODEL_API_KEY" },
+      },
+      modelId: "test-model",
+      invocationProtocol: "chat_completions",
+      maxInputTokens: 32_768,
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      compatibilityPresetVersion: "test-v1",
+    },
+    contentSha256: definition.contentSha256,
+  };
 }
 
 function command(overrides: Partial<CreateRunCommand> = {}): CreateRunCommand {

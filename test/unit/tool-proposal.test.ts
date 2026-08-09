@@ -3,30 +3,40 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { beforeEach, describe, expect, it } from "vitest";
 
+import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { migrate } from "../../src/adapters/sqlite/migrator.js";
+import { SqliteToolRepository } from "../../src/adapters/sqlite/tool-repository.js";
 import { ToolRegistry } from "../../src/adapters/tools/registry.js";
 import {
   normalizeToolProposal,
   type NormalizeToolProposalInput,
 } from "../../src/application/tool-proposal.js";
+import { completedToolResults } from "../../src/application/prompt-assembler.js";
 import type { AgentRevisionSnapshot } from "../../src/domain/agent-revision.js";
-import { parseAgentId } from "../../src/domain/ids.js";
+import {
+  parseAgentId,
+  runIdFromUuid,
+  sessionIdFromUuid,
+  toolCallIdFromUuid,
+} from "../../src/domain/ids.js";
 import type { JsonValue } from "../../src/domain/json.js";
 import { DEFAULT_RUN_LIMITS } from "../../src/domain/limits.js";
+import type { ToolCall } from "../../src/domain/tool-call.js";
 import type { ToolDefinition } from "../../src/ports/tool.js";
+import {
+  TEST_MODEL_PROFILE_REVISION_ID,
+  testModelRuntime,
+} from "../helpers/model-fixtures.js";
 
 const agentId = parseAgentId("primary");
 const revision: AgentRevisionSnapshot = {
   revisionId: "rev_test",
+  definitionRevisionId: "def_tool_proposal",
+  modelProfileRevisionId: TEST_MODEL_PROFILE_REVISION_ID,
   agentId,
   displayName: "Primary",
   prompt: "You are the primary Agent.",
-  model: {
-    provider: "openai-compatible",
-    model: "test-model",
-    baseUrl: "https://example.invalid/v1",
-    apiKey: { fromEnvironment: "TEST_API_KEY" },
-    maxInputTokens: 8_192,
-  },
+  model: testModelRuntime(),
   workspace: "C:/workspace",
   skills: [],
   policy: [],
@@ -83,6 +93,205 @@ describe("normalizeToolProposal", () => {
     expect(first.argumentsSha256).toBe(
       createHash("sha256").update(canonical, "utf8").digest("hex"),
     );
+  });
+
+  it("preserves only canonical provider call IDs", async () => {
+    const proposal = await normalizeToolProposal(
+      input(registry, { path: ".", maxEntries: 20 }),
+    );
+
+    expect(proposal.providerCallId).toBe("call_provider_7");
+    for (const providerCallId of ["", "has space", "line\nbreak", "x".repeat(201)]) {
+      await expect(normalizeToolProposal({
+        ...input(registry, { path: ".", maxEntries: 20 }),
+        providerCallId,
+      })).rejects.toMatchObject({ code: "model_protocol_error" });
+    }
+  });
+
+  it("persists and recovers a provider call ID for every new proposal", () => {
+    const connection = openDatabase({ path: ":memory:", busyTimeoutMs: 5_000 });
+    try {
+      migrate(connection.db);
+      const runId = runIdFromUuid("00000000-0000-7000-8000-000000000007");
+      const sessionId = sessionIdFromUuid("00000000-0000-7000-8000-000000000007");
+      const toolCallId = toolCallIdFromUuid("00000000-0000-7000-8000-000000000007");
+      seedRunningRun(connection.db, runId, sessionId);
+      const repository = new SqliteToolRepository(connection.db);
+
+      const stored = repository.recordProposal({
+        runId,
+        leaseOwner: "worker-unit",
+        toolCallId,
+        providerCallId: "call_provider_7",
+        toolName: "list_files",
+        effect: "read_only",
+        arguments: { path: ".", maxEntries: 20 },
+        canonicalArguments: '{"maxEntries":20,"path":"."}',
+        argumentsSha256: "7".repeat(64),
+        policyFacts: { pathWithinWorkspace: true },
+        policyEffect: "allow",
+        matchedRule: 0,
+        toolCallLimit: 12,
+        occurredAt: new Date("2026-08-09T00:00:00.000Z"),
+      });
+
+      expect(stored.providerCallId).toBe("call_provider_7");
+      expect(repository.getLatestForRun(runId)?.providerCallId).toBe(
+        "call_provider_7",
+      );
+      expect(connection.db.prepare(
+        "SELECT provider_call_id FROM tool_calls WHERE tool_call_id = ?",
+      ).get(toolCallId)).toEqual({ provider_call_id: "call_provider_7" });
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("lists Tool Calls in durable insertion order", () => {
+    const connection = openDatabase({ path: ":memory:", busyTimeoutMs: 5_000 });
+    try {
+      migrate(connection.db);
+      const runId = runIdFromUuid("00000000-0000-7000-8000-000000000008");
+      const sessionId = sessionIdFromUuid("00000000-0000-7000-8000-000000000008");
+      seedRunningRun(connection.db, runId, sessionId);
+      const repository = new SqliteToolRepository(connection.db);
+      const first = toolCallIdFromUuid("00000000-0000-7000-8000-000000000009");
+      const second = toolCallIdFromUuid("00000000-0000-7000-8000-000000000001");
+      const base = {
+        runId,
+        leaseOwner: "worker-unit",
+        toolName: "list_files",
+        effect: "read_only" as const,
+        arguments: { path: "." },
+        canonicalArguments: '{"path":"."}',
+        argumentsSha256: "8".repeat(64),
+        policyFacts: { pathWithinWorkspace: true } as const,
+        policyEffect: "allow" as const,
+        matchedRule: 0,
+        toolCallLimit: 12,
+        occurredAt: new Date("2026-08-09T00:00:00.000Z"),
+      };
+
+      repository.recordProposal({
+        ...base,
+        toolCallId: first,
+        providerCallId: "call_provider_first",
+      });
+      repository.recordProposal({
+        ...base,
+        toolCallId: second,
+        providerCallId: "call_provider_second",
+      });
+
+      expect(repository.listForRun(runId).map((call) => call.toolCallId)).toEqual([
+        first,
+        second,
+      ]);
+      expect(repository.getLatestForRun(runId)?.toolCallId).toBe(second);
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("reuses only the root provider ID when an internal reconciliation retry completes", () => {
+    const connection = openDatabase({ path: ":memory:", busyTimeoutMs: 5_000 });
+    try {
+      migrate(connection.db);
+      const runId = runIdFromUuid("00000000-0000-7000-8000-000000000012");
+      const sessionId = sessionIdFromUuid("00000000-0000-7000-8000-000000000012");
+      const originalId = toolCallIdFromUuid("00000000-0000-7000-8000-000000000012");
+      const retryId = toolCallIdFromUuid("00000000-0000-7000-8000-000000000013");
+      seedRunningRun(connection.db, runId, sessionId);
+      const repository = new SqliteToolRepository(connection.db);
+      repository.recordProposal({
+        runId,
+        leaseOwner: "worker-unit",
+        toolCallId: originalId,
+        providerCallId: "call_provider_root",
+        toolName: "run_command",
+        effect: "side_effect",
+        arguments: { command: "echo hi" },
+        canonicalArguments: '{"command":"echo hi"}',
+        argumentsSha256: "c".repeat(64),
+        policyFacts: {},
+        policyEffect: "allow",
+        matchedRule: 0,
+        toolCallLimit: 12,
+        occurredAt: new Date("2026-08-09T00:00:00.000Z"),
+      });
+      repository.beginExecution({
+        runId,
+        toolCallId: originalId,
+        leaseOwner: "worker-unit",
+        occurredAt: new Date("2026-08-09T00:00:01.000Z"),
+      });
+      repository.markExecutionUnknown({
+        runId,
+        toolCallId: originalId,
+        leaseOwner: "worker-unit",
+        occurredAt: new Date("2026-08-09T00:00:02.000Z"),
+      });
+      repository.reconcile({
+        toolCallId: originalId,
+        outcome: "retry",
+        note: "safe to retry",
+        retryToolCallId: retryId,
+        policyEffect: "allow",
+        matchedRule: 0,
+        toolCallLimit: 12,
+        occurredAt: new Date("2026-08-09T00:00:03.000Z"),
+      });
+      const retryResult = {
+        ok: true,
+        summary: "executed",
+        content: { stdout: "hi" },
+        capturedBytes: 2,
+        truncated: false,
+      };
+      connection.db.prepare(
+        "UPDATE tool_calls SET state = 'succeeded', result_json = ? WHERE tool_call_id = ?",
+      ).run(JSON.stringify(retryResult), retryId);
+
+      expect(connection.db.prepare(
+        "SELECT provider_call_id FROM tool_calls WHERE tool_call_id = ?",
+      ).get(retryId)).toEqual({ provider_call_id: null });
+      expect(completedToolResults(repository.listForRun(runId))).toEqual([{
+        providerCallId: "call_provider_root",
+        toolName: "run_command",
+        arguments: { command: "echo hi" },
+        content: retryResult,
+      }]);
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("rejects a completed original proposal whose provider call ID is missing or invalid", () => {
+    const baseCall: Omit<ToolCall, "providerCallId"> = {
+      toolCallId: toolCallIdFromUuid("00000000-0000-7000-8000-000000000014"),
+      runId: runIdFromUuid("00000000-0000-7000-8000-000000000014"),
+      state: "succeeded",
+      toolName: "list_files",
+      effect: "read_only",
+      arguments: { path: ".", maxEntries: 20 },
+      canonicalArguments: '{"maxEntries":20,"path":"."}',
+      argumentsSha256: "d".repeat(64),
+      policyEffect: "allow",
+      matchedRule: 0,
+      policyFacts: { pathWithinWorkspace: true },
+      retryOfToolCallId: null,
+      result: { ok: true, content: [] },
+      createdAt: new Date("2026-08-09T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-09T00:00:01.000Z"),
+    };
+
+    for (const providerCallId of [null, "call provider invalid"] as const) {
+      const call = { ...baseCall, providerCallId } satisfies ToolCall;
+      expect(() => completedToolResults([call])).toThrowError(
+        expect.objectContaining({ code: "model_protocol_error" }),
+      );
+    }
   });
 
   it("rejects unknown fields before policy evaluation", async () => {
@@ -222,8 +431,37 @@ function input(
 ): NormalizeToolProposalInput {
   return {
     registry,
+    providerCallId: "call_provider_7",
     toolName: "list_files",
     arguments: argumentsValue,
     context: { agentId, revision },
   };
+}
+
+function seedRunningRun(
+  db: ReturnType<typeof openDatabase>["db"],
+  runId: ReturnType<typeof runIdFromUuid>,
+  sessionId: ReturnType<typeof sessionIdFromUuid>,
+): void {
+  const now = "2026-08-09T00:00:00.000Z";
+  db.prepare(
+    `INSERT INTO agent_revisions (
+       revision_id, agent_id, content_json, content_sha256, created_at
+     ) VALUES ('rev_test', 'primary', '{}', ?, ?)`,
+  ).run("a".repeat(64), now);
+  db.prepare(
+    `INSERT INTO sessions (
+       session_id, agent_id, session_key, agent_revision_id,
+       owner_session_id, current_summary_id, created_at, updated_at
+     ) VALUES (?, 'primary', 'unit:provider-call-id', 'rev_test', NULL, NULL, ?, ?)`,
+  ).run(sessionId, now, now);
+  db.prepare(
+    `INSERT INTO runs (
+       run_id, session_id, agent_revision_id, state, fifo_sequence,
+       parent_run_id, root_run_id, delegation_depth, blocked_by_child_run_id,
+       lease_owner, lease_expires_at, active_started_at, request_digest,
+       input_json, created_at, updated_at
+     ) VALUES (?, ?, 'rev_test', 'running', 0, NULL, ?, 0, NULL,
+       'worker-unit', '2026-08-09T00:01:00.000Z', ?, ?, ?, ?, ?)`,
+  ).run(runId, sessionId, runId, now, "digest", '{"type":"text","text":"hi"}', now, now);
 }

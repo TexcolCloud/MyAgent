@@ -2,11 +2,17 @@ import type { AgentRevisionSnapshot } from "../domain/agent-revision.js";
 import { DomainError } from "../domain/errors.js";
 import type { RunId, SessionId } from "../domain/ids.js";
 import type { JsonValue } from "../domain/json.js";
+import {
+  parseProviderCallId,
+  type ToolCall,
+} from "../domain/tool-call.js";
 import type { ModelRequest } from "../ports/model.js";
 import type { SessionStore } from "../ports/session-store.js";
 
 export interface PromptToolResult {
+  providerCallId: string;
   toolName: string;
+  arguments: JsonValue;
   content: JsonValue;
 }
 
@@ -19,6 +25,61 @@ export interface PromptAssemblerInput {
   activatedSkillNames: readonly string[];
   toolResults: readonly PromptToolResult[];
   tools: ModelRequest["tools"];
+}
+
+export function completedToolResults(
+  calls: readonly ToolCall[],
+): PromptToolResult[] {
+  interface RootLineage {
+    root: ToolCall;
+    providerCallId: string;
+    completed: ToolCall | null;
+  }
+
+  const roots: RootLineage[] = [];
+  const lineageByCallId = new Map<ToolCall["toolCallId"], RootLineage>();
+
+  for (const call of calls) {
+    let lineage: RootLineage;
+    if (call.retryOfToolCallId === null) {
+      if (call.providerCallId === null) {
+        throw new DomainError("model_protocol_error");
+      }
+      lineage = {
+        root: call,
+        providerCallId: parseProviderCallId(call.providerCallId),
+        completed: null,
+      };
+      roots.push(lineage);
+    } else {
+      const parent = lineageByCallId.get(call.retryOfToolCallId);
+      if (parent === undefined) {
+        throw new DomainError("model_protocol_error");
+      }
+      lineage = parent;
+    }
+    lineageByCallId.set(call.toolCallId, lineage);
+
+    if (
+      call.result !== null &&
+      (call.state === "succeeded" ||
+        call.state === "failed" ||
+        call.state === "denied")
+    ) {
+      lineage.completed = call;
+    }
+  }
+
+  return roots.flatMap((lineage) =>
+    lineage.completed === null
+      ? []
+      : [{
+          providerCallId: lineage.providerCallId,
+          toolName: lineage.root.toolName,
+          arguments: lineage.root.arguments,
+          content: lineage.completed.result as JsonValue,
+        }]
+  );
 }
 
 export class PromptAssembler {
@@ -41,18 +102,21 @@ export class PromptAssembler {
           message.runId !== input.runId &&
           (summary === null || message.sequence > summary.sourceMessageTo),
       );
-    const messages: ModelRequest["messages"][number][] = [
+    const requestInput: ModelRequest["input"][number][] = [
       {
+        type: "message",
         role: "system",
         name: "runtime_safety",
         content: runtimeSafety(input.revision),
       },
       {
+        type: "message",
         role: "system",
         name: "agent_instructions",
         content: input.revision.prompt,
       },
       ...activatedSkills.map((skill) => ({
+        type: "message" as const,
         role: "system" as const,
         name: `skill:${skill.name}`,
         content: skill.body,
@@ -60,14 +124,16 @@ export class PromptAssembler {
     ];
 
     if (summary !== null) {
-      messages.push({
+      requestInput.push({
+        type: "message",
         role: "user",
         name: "session_summary",
         content: wrapUntrusted("session-summary", summary.content),
       });
     }
     if (history.length > 0) {
-      messages.push({
+      requestInput.push({
+        type: "message",
         role: "user",
         name: "session_history",
         content: wrapUntrusted(
@@ -80,29 +146,33 @@ export class PromptAssembler {
         ),
       });
     }
-    messages.push({
+    requestInput.push({
+      type: "message",
       role: "user",
       name: "current_operator_input",
       content: wrapUntrusted("operator-input", input.input),
     });
-    if (input.toolResults.length > 0) {
-      messages.push({
-        role: "user",
-        name: "tool_results",
-        content: wrapUntrusted(
-          "tool-result",
-          input.toolResults.map((result) => ({
-            toolName: result.toolName,
-            content: result.content,
-          })),
-        ),
-      });
+    for (const result of input.toolResults) {
+      requestInput.push(
+        {
+          type: "assistant_tool_call",
+          callId: result.providerCallId,
+          name: result.toolName,
+          arguments: result.arguments,
+        },
+        {
+          type: "tool_result",
+          callId: result.providerCallId,
+          name: result.toolName,
+          output: result.content,
+        },
+      );
     }
 
     return {
       purpose: "run",
       model: input.revision.model,
-      messages,
+      input: requestInput,
       tools: [...input.tools],
     };
   }

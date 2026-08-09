@@ -1,7 +1,6 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 
 import { DatabaseSync } from "node:sqlite";
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { describe, expect, it } from "vitest";
 
 import { bootstrap } from "../../src/bootstrap.js";
@@ -19,20 +18,10 @@ describe.skipIf(settings === null)("live provider smoke", () => {
     if (secret === undefined || secret.length === 0) {
       throw new Error("smoke_api_key_missing");
     }
-    const fixture = await prepareE2eFixture(settings.baseUrl);
-    const config = parseYaml(await readFile(fixture.configPath, "utf8")) as {
-      models: Record<string, {
-        model: string;
-        baseUrl: string;
-        apiKey: { fromEnvironment: string };
-      }>;
-    };
-    const model = config.models.default;
-    if (model === undefined) throw new Error("default_model_missing");
-    model.model = settings.model;
-    model.baseUrl = settings.baseUrl;
-    model.apiKey = { fromEnvironment: settings.apiKeyEnvironment };
-    await writeFile(fixture.configPath, stringifyYaml(config), "utf8");
+    const fixture = await prepareE2eFixture(settings.baseUrl, {
+      modelId: settings.model,
+      providerApiKeyEnvironment: settings.apiKeyEnvironment,
+    });
 
     const logs: string[] = [];
     const service = await bootstrap(fixture.configPath, {

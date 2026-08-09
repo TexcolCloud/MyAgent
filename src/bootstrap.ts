@@ -6,7 +6,9 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
 import { EnvironmentSecretResolver } from "./adapters/environment-secret-resolver.js";
+import { CompositeSecretResolver } from "./adapters/composite-secret-resolver.js";
 import { OpenAiChatCompletionsModel } from "./adapters/model/openai-chat-completions.js";
+import { NodeProviderHttpTransport } from "./adapters/provider-http-transport.js";
 import { SqliteApprovalRepository } from "./adapters/sqlite/approval-repository.js";
 import { SqliteBackupWriter } from "./adapters/sqlite/backup.js";
 import { SqliteCatalogRepository } from "./adapters/sqlite/catalog-repository.js";
@@ -15,6 +17,8 @@ import { migrate } from "./adapters/sqlite/migrator.js";
 import { SqliteRunRepository } from "./adapters/sqlite/run-repository.js";
 import { SqliteSessionRepository } from "./adapters/sqlite/session-repository.js";
 import { SqliteToolRepository } from "./adapters/sqlite/tool-repository.js";
+import { SqliteEncryptedSecretStore } from "./adapters/sqlite/encrypted-secret-store.js";
+import { SqliteModelRegistryRepository } from "./adapters/sqlite/model-registry-repository.js";
 import { SystemClock } from "./adapters/system-clock.js";
 import { activateSkillTool } from "./adapters/tools/activate-skill.js";
 import { createDelegateAgentTool } from "./adapters/tools/delegate-agent.js";
@@ -25,6 +29,7 @@ import { createRunCommandTool } from "./adapters/tools/run-command.js";
 import { writeFileTool } from "./adapters/tools/write-file.js";
 import { UuidIdGenerator } from "./adapters/uuid-id-generator.js";
 import { AdvanceRunService } from "./application/advance-run.js";
+import { AgentResolver } from "./application/agent-resolver.js";
 import { CancelRunService } from "./application/cancel-run.js";
 import { CreateBackupService } from "./application/create-backup.js";
 import { CreateRunService } from "./application/create-run.js";
@@ -38,6 +43,7 @@ import { loadCatalog } from "./config/catalog-loader.js";
 import { CatalogService } from "./config/catalog-service.js";
 import { createHttpApp } from "./interfaces/http/app.js";
 import { createStructuredLogger } from "./observability/logger.js";
+import { MutableDynamicRedactionRegistry } from "./observability/redactor.js";
 import type { ModelPort } from "./ports/model.js";
 import { assertSupportedRuntime } from "./platform.js";
 import { ApprovalExpirer } from "./runtime/approval-expirer.js";
@@ -72,14 +78,14 @@ export async function bootstrap(
 ): Promise<BootstrappedService> {
   assertSupportedRuntime();
   const catalog = new CatalogService(await loadCatalog(configPath));
-  const secrets = new EnvironmentSecretResolver();
-  const bearerToken = secrets.resolve(catalog.current().global.server.bearerToken);
-  const resolvedModelSecrets: string[] = [];
-  for (const model of Object.values(catalog.current().global.models)) {
-    resolvedModelSecrets.push(secrets.resolve(model.apiKey));
-  }
+  const redactionRegistry = new MutableDynamicRedactionRegistry();
+  const environmentSecrets = new EnvironmentSecretResolver();
+  const bearerToken = environmentSecrets.resolve(
+    catalog.current().global.server.bearerToken,
+  );
+  redactionRegistry.register(bearerToken);
   const logger = createStructuredLogger({
-    secretValues: [bearerToken, ...resolvedModelSecrets],
+    redactionRegistry,
     ...(options.log?.write === undefined ? {} : { write: options.log.write }),
     ...(options.log?.sensitiveKeys === undefined
       ? {}
@@ -99,6 +105,21 @@ export async function bootstrap(
     const clock = new SystemClock();
     const ids = new UuidIdGenerator();
     const catalogStore = new SqliteCatalogRepository(connection.db);
+    const modelRegistry = new SqliteModelRegistryRepository(connection.db);
+    const managedSecrets = new SqliteEncryptedSecretStore(connection.db, process.env);
+    const secrets = new CompositeSecretResolver(
+      environmentSecrets,
+      managedSecrets,
+      redactionRegistry,
+    );
+    const agents = new AgentResolver({
+      catalog,
+      registry: modelRegistry,
+      secrets,
+    });
+    const providerTransport = new NodeProviderHttpTransport({
+      secretResolver: secrets,
+    });
     const runs = new SqliteRunRepository(connection.db, catalogStore);
     const tools = new SqliteToolRepository(connection.db);
     const approvals = new SqliteApprovalRepository(connection.db);
@@ -106,7 +127,7 @@ export async function bootstrap(
     const executions = new ExecutionRegistry();
     const policy = new PolicyEngine();
     const registry = new ToolRegistry();
-    const delegate = new DelegateAgentService({ catalog, runs, clock, ids });
+    const delegate = new DelegateAgentService({ agents, runs, clock, ids });
     registry.register(activateSkillTool);
     registry.register(listFilesTool);
     registry.register(readFileTool);
@@ -121,13 +142,17 @@ export async function bootstrap(
       tools,
       approvals,
       sessions,
-      model: options.model ?? new OpenAiChatCompletionsModel({ secretResolver: secrets }),
+      model: options.model ?? new OpenAiChatCompletionsModel({
+        transport: providerTransport,
+        connections: modelRegistry,
+      }),
       prompts: new PromptAssembler(sessions),
       registry,
       policy,
       clock,
       ids,
       faults,
+      modelRegistry,
     });
     worker = new RunWorker({
       runs,
@@ -154,7 +179,7 @@ export async function bootstrap(
     app = createHttpApp({
       bearerToken,
       catalog,
-      createRuns: new CreateRunService(catalog, runs, clock, ids),
+      createRuns: new CreateRunService(agents, runs, clock, ids),
       runs,
       cancelRuns: new CancelRunService(runs, executions, clock),
       approvals,

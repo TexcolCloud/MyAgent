@@ -32,14 +32,15 @@ describe("CatalogService", () => {
     try {
       const configPath = path.join(configRoot, "myagent.yaml");
       const service = new CatalogService(await loadCatalog(configPath));
-      const originalRevision = service.resolve(parseAgentId("primary")).revision.revisionId;
+      const originalRevision = service.resolve(parseAgentId("primary"))
+        .definition.definitionRevisionId;
 
       await writeFile(
         path.join(configRoot, "agents", "primary", "AGENT.md"),
         "Updated primary instructions.\n",
       );
       const reloaded = await service.reload();
-      expect(reloaded.byId.get(parseAgentId("primary"))?.revision.revisionId).not.toBe(
+      expect(reloaded.byId.get(parseAgentId("primary"))?.definition.definitionRevisionId).not.toBe(
         originalRevision,
       );
 

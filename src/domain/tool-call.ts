@@ -1,3 +1,4 @@
+import { DomainError } from "./errors.js";
 import type { RunId, ToolCallId } from "./ids.js";
 import type { JsonValue } from "./json.js";
 import type { PolicyEffect, PolicyFacts } from "./policy.js";
@@ -10,6 +11,7 @@ export interface ToolCall {
   runId: RunId;
   state: ToolCallState;
   toolName: string;
+  providerCallId: string | null;
   effect: ToolEffect;
   arguments: JsonValue;
   canonicalArguments: string;
@@ -21,4 +23,11 @@ export interface ToolCall {
   result: JsonValue | null;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export function parseProviderCallId(value: string): string {
+  if (!/^[\x21-\x7E]{1,200}$/.test(value)) {
+    throw new DomainError("model_protocol_error");
+  }
+  return value;
 }

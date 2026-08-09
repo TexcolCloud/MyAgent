@@ -10,16 +10,23 @@ import { bootstrap } from "../../src/bootstrap.js";
 const FIXTURES = fileURLToPath(new URL("../fixtures/config", import.meta.url));
 
 describe("bootstrap", () => {
-  it("fails startup before listening when a configured model secret is locked", async () => {
+  it("starts without resolving an unassigned provider secret", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "myagent-bootstrap-secret-"));
     await cp(path.join(FIXTURES, "valid"), path.join(root, "config"), { recursive: true });
     const previousBearer = process.env.MYAGENT_BEARER_TOKEN;
     const previousModel = process.env.MODEL_API_KEY;
     process.env.MYAGENT_BEARER_TOKEN = "bootstrap-token";
     delete process.env.MODEL_API_KEY;
+    let service: Awaited<ReturnType<typeof bootstrap>> | undefined;
     try {
-      await expect(bootstrap(path.join(root, "config", "myagent.yaml"), { signals: false })).rejects.toMatchObject({ code: "secret_locked" });
+      service = await bootstrap(path.join(root, "config", "myagent.yaml"), {
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        log: { write: () => {} },
+      });
+      expect((await fetch(`${service.url}/healthz`)).status).toBe(200);
     } finally {
+      await service?.shutdown();
       process.env.MYAGENT_BEARER_TOKEN = previousBearer;
       process.env.MODEL_API_KEY = previousModel;
       await rm(root, { recursive: true, force: true });

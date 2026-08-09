@@ -1,13 +1,15 @@
 server:
   bearerToken:
     fromEnvironment: MYAGENT_BEARER_TOKEN
+  adminToken:
+    fromEnvironment: MYAGENT_ADMIN_TOKEN
 database:
   path: ./data/kernel.db
 agentRoots:
   - ./agents
 models:
   default:
-    provider: openai-compatible
+    provider: openai_compatible
     model: test-model
     baseUrl: http://127.0.0.1:11434/v1
     apiKey:

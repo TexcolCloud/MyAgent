@@ -16,19 +16,27 @@ import { PromptAssembler } from "../../src/application/prompt-assembler.js";
 import { ToolRegistry } from "../../src/adapters/tools/registry.js";
 import { readFileTool } from "../../src/adapters/tools/read-file.js";
 import { loadCatalog, type CatalogSnapshot } from "../../src/config/catalog-loader.js";
-import { CatalogService } from "../../src/config/catalog-service.js";
+import type {
+  AgentDefinitionRevision,
+  AgentResolverPort,
+  AgentRevisionSnapshot,
+} from "../../src/domain/agent-revision.js";
 import {
   attemptIdFromUuid,
   approvalIdFromUuid,
+  modelProfileRevisionIdFromUuid,
+  providerConnectionRevisionIdFromUuid,
   runIdFromUuid,
   sessionIdFromUuid,
   toolCallIdFromUuid,
 } from "../../src/domain/ids.js";
 import {
   ModelProviderError,
+  type ModelChunk,
   type ModelPort,
   type ModelRequest,
 } from "../../src/ports/model.js";
+import type { RecordProviderHealthInput } from "../../src/ports/model-registry-store.js";
 import type { ToolStore } from "../../src/ports/tool-store.js";
 import type { FaultInjector, FaultPoint } from "../../src/runtime/fault-injector.js";
 import { FakeClock } from "../helpers/fake-clock.js";
@@ -68,7 +76,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -86,6 +94,7 @@ describe("AdvanceRunService", () => {
         new Date(clock.now().getTime() + 30_000),
       )?.runId).toBe(created.runId);
       const model = new ScriptedModel();
+      const health: RecordProviderHealthInput[] = [];
       model.script(
         transientFailureAfter(
           "discard me",
@@ -108,6 +117,11 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: {
+          recordProviderHealth(input): void {
+            health.push(input);
+          },
+        },
       });
 
       const outcome = await service.advance(
@@ -128,6 +142,28 @@ describe("AdvanceRunService", () => {
           .listMessagesThroughRun(created.sessionId, 0)
           .filter((message) => message.role === "assistant"),
       ).toEqual([expect.objectContaining({ content: "final answer" })]);
+      expect(health).toEqual([
+        expect.objectContaining({
+          connectionRevisionId: providerConnectionRevisionIdFromUuid(
+            "00000000-0000-7000-8000-000000000001",
+          ),
+          profileRevisionId: modelProfileRevisionIdFromUuid(
+            "00000000-0000-7000-8000-000000000001",
+          ),
+          outcome: "failure",
+          code: "provider_overloaded",
+          safeStatus: 503,
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000001",
+          ),
+        }),
+        expect.objectContaining({
+          outcome: "success",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000002",
+          ),
+        }),
+      ]);
     } finally {
       connection.close();
     }
@@ -153,7 +189,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000011")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -183,11 +219,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "./report.md" } },
+            callId: "call_provider_11",
+            name: "read_file",
+            arguments: { path: "./report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 12, outputTokens: 4 },
           },
         ],
@@ -212,6 +250,7 @@ describe("AdvanceRunService", () => {
       )).toEqual({ type: "advanced", runId: created.runId });
       expect(tools.getLatestForRun(created.runId)).toMatchObject({
         state: "allowed",
+        providerCallId: "call_provider_11",
         toolName: "read_file",
         arguments: { path: "report.md" },
       });
@@ -245,7 +284,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -270,11 +309,13 @@ describe("AdvanceRunService", () => {
           chunks: [
             {
               type: "tool_call",
-              call: { name: "read_file", arguments: { path: 42 } },
+              callId: "call_provider_181",
+              name: "read_file",
+              arguments: { path: 42 },
             },
             {
               type: "completed",
-              finishReason: "tool_calls",
+              finishReason: "tool_call",
               usage: { inputTokens: 10, outputTokens: 2 },
             },
           ],
@@ -313,10 +354,12 @@ describe("AdvanceRunService", () => {
         new AbortController().signal,
       )).resolves.toMatchObject({ type: "terminal", state: "completed" });
       expect(
-        model.requests[1]?.messages.find((message) =>
-          message.name === "tool_results"
-        )?.content,
-      ).toContain("invalid_tool_arguments");
+        model.requests[1]?.input.find((entry) => entry.type === "tool_result"),
+      ).toMatchObject({
+        callId: "call_provider_181",
+        name: "read_file",
+        output: { code: "invalid_tool_arguments" },
+      });
     } finally {
       connection.close();
     }
@@ -342,7 +385,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000021")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot), runs, clock, ids,
+        resolvedAgents(catalogSnapshot), runs, clock, ids,
       ).execute({
         agentId: "primary", sessionKey: "unit:allowed-execution",
         input: { type: "text", text: "read the report" },
@@ -358,8 +401,8 @@ describe("AdvanceRunService", () => {
       registry.register(fakeTool);
       const model = new ScriptedModel();
       model.script({ chunks: [
-        { type: "tool_call", call: { name: "read_file", arguments: { path: "report.md" } } },
-        { type: "completed", finishReason: "tool_calls", usage: { inputTokens: 12, outputTokens: 4 } },
+        { type: "tool_call", callId: "call_provider_31", name: "read_file", arguments: { path: "report.md" } },
+        { type: "completed", finishReason: "tool_call", usage: { inputTokens: 12, outputTokens: 4 } },
       ] });
       const service = new AdvanceRunService({
         runs, tools, approvals, sessions, model, prompts: new PromptAssembler(sessions),
@@ -395,7 +438,7 @@ describe("AdvanceRunService", () => {
         approvalIds: [approvalIdFromUuid("00000000-0000-7000-8000-000000000041")],
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000041")],
       });
-      const created = new CreateRunService(new CatalogService(catalogSnapshot), runs, clock, ids).execute({
+      const created = new CreateRunService(resolvedAgents(catalogSnapshot), runs, clock, ids).execute({
         agentId: "primary", sessionKey: "unit:approval", input: { type: "text", text: "run" },
         idempotencyKey: "advance-approval-0001", source: { kind: "http" },
       });
@@ -405,8 +448,8 @@ describe("AdvanceRunService", () => {
       registry.register(new FakeTool({ name: "run_command", effect: "side_effect", normalizedArguments: { command: "echo hi" } }));
       const model = new ScriptedModel();
       model.script({ chunks: [
-        { type: "tool_call", call: { name: "run_command", arguments: { command: "echo hi" } } },
-        { type: "completed", finishReason: "tool_calls", usage: { inputTokens: 10, outputTokens: 2 } },
+        { type: "tool_call", callId: "call_provider_41", name: "run_command", arguments: { command: "echo hi" } },
+        { type: "completed", finishReason: "tool_call", usage: { inputTokens: 10, outputTokens: 2 } },
       ] });
       const service = new AdvanceRunService({
         runs, tools, approvals, sessions, model, prompts: new PromptAssembler(sessions), registry,
@@ -448,7 +491,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -478,14 +521,13 @@ describe("AdvanceRunService", () => {
           chunks: [
             {
               type: "tool_call",
-              call: {
-                name: "delete_everything",
-                arguments: { confirmed: true },
-              },
+              callId: "call_provider_61",
+              name: "delete_everything",
+              arguments: { confirmed: true },
             },
             {
               type: "completed",
-              finishReason: "tool_calls",
+              finishReason: "tool_call",
               usage: { inputTokens: 10, outputTokens: 2 },
             },
           ],
@@ -524,10 +566,12 @@ describe("AdvanceRunService", () => {
         state: "completed",
       });
       expect(
-        model.requests[1]?.messages.find(
-          (message) => message.name === "tool_results",
-        )?.content,
-      ).toContain("tool_denied");
+        model.requests[1]?.input.find((entry) => entry.type === "tool_result"),
+      ).toMatchObject({
+        callId: "call_provider_61",
+        name: "delete_everything",
+        output: { code: "tool_denied" },
+      });
       expect(deniedTool.executions).toBe(0);
     } finally {
       connection.close();
@@ -554,7 +598,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000071")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -623,7 +667,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000081")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -653,11 +697,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_68",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -716,7 +762,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000091")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -750,11 +796,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_76",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -814,7 +862,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000092")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -850,11 +898,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_86",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -921,7 +971,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000093")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -952,11 +1002,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_96",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -1050,7 +1102,7 @@ describe("AdvanceRunService", () => {
           attemptIds: [attemptIdFromUuid(uuid)],
         });
         const created = new CreateRunService(
-          new CatalogService(catalogSnapshot),
+          resolvedAgents(catalogSnapshot),
           runs,
           clock,
           ids,
@@ -1086,11 +1138,13 @@ describe("AdvanceRunService", () => {
           chunks: [
             {
               type: "tool_call",
-              call: { name: "read_file", arguments: { path: "report.md" } },
+              callId: `call_provider_${startState}`,
+              name: "read_file",
+              arguments: { path: "report.md" },
             },
             {
               type: "completed",
-              finishReason: "tool_calls",
+              finishReason: "tool_call",
               usage: { inputTokens: 10, outputTokens: 2 },
             },
           ],
@@ -1151,7 +1205,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000101")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1180,14 +1234,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: {
-              name: "activate_skill",
-              arguments: { skillName: "research" },
-            },
+            callId: "call_provider_119",
+            name: "activate_skill",
+            arguments: { skillName: "research" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -1237,6 +1290,7 @@ describe("AdvanceRunService", () => {
       const durableTools = new SqliteToolRepository(connection.db);
       const tools: ToolStore = {
         getLatestForRun: (runId) => durableTools.getLatestForRun(runId),
+        listForRun: (runId) => durableTools.listForRun(runId),
         recordProposal: (input) => durableTools.recordProposal(input),
         beginExecution: (input) => durableTools.beginExecution(input),
         completeExecution: () => {
@@ -1254,7 +1308,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000111")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1283,14 +1337,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: {
-              name: "activate_skill",
-              arguments: { skillName: "research" },
-            },
+            callId: "call_provider_130",
+            name: "activate_skill",
+            arguments: { skillName: "research" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -1343,7 +1396,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000121")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1422,7 +1475,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const create = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -1556,6 +1609,7 @@ describe("AdvanceRunService", () => {
       });
       const tools: ToolStore = {
         getLatestForRun: (runId) => durableTools.getLatestForRun(runId),
+        listForRun: (runId) => durableTools.listForRun(runId),
         recordProposal: () => {
           throw busyError;
         },
@@ -1572,7 +1626,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000151")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1601,11 +1655,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_161",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -1657,7 +1713,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1747,7 +1803,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000145")],
       });
       const create = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -1836,7 +1892,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000141")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1904,39 +1960,71 @@ describe("AdvanceRunService", () => {
 function withLimits(
   snapshot: CatalogSnapshot,
   revisionId: string,
-  limits: Partial<CatalogSnapshot["available"][number]["revision"]["limits"]>,
-): CatalogSnapshot {
-  const available = snapshot.available.map((agent) => ({
-    ...agent,
-    revision: {
-      ...agent.revision,
+  limits: Partial<AgentRevisionSnapshot["limits"]>,
+): Pick<AgentResolverPort, "resolve"> {
+  return resolvedAgents(snapshot, (revision) => ({
+      ...revision,
       revisionId: `rev_${revisionId}`,
-      limits: { ...agent.revision.limits, ...limits },
-    },
+      limits: { ...revision.limits, ...limits },
   }));
-  return {
-    ...snapshot,
-    available,
-    byId: new Map(available.map((agent) => [agent.id, agent])),
-  };
 }
 
 function withModelInputLimit(
   snapshot: CatalogSnapshot,
   maxInputTokens: number,
-): CatalogSnapshot {
-  const available = snapshot.available.map((agent) => ({
-    ...agent,
-    revision: {
-      ...agent.revision,
+): Pick<AgentResolverPort, "resolve"> {
+  return resolvedAgents(snapshot, (revision) => ({
+      ...revision,
       revisionId: `rev_model_input_${String(maxInputTokens)}`,
-      model: { ...agent.revision.model, maxInputTokens },
-    },
+      model: { ...revision.model, maxInputTokens },
   }));
+}
+
+function resolvedAgents(
+  snapshot: CatalogSnapshot,
+  transform: (revision: AgentRevisionSnapshot) => AgentRevisionSnapshot =
+    (revision) => revision,
+): Pick<AgentResolverPort, "resolve"> {
+  const revisions = new Map(snapshot.available.map(({ id, definition }) => [
+    id,
+    transform(resolvedRevision(definition)),
+  ]));
   return {
-    ...snapshot,
-    available,
-    byId: new Map(available.map((agent) => [agent.id, agent])),
+    resolve(agentId) {
+      const revision = revisions.get(agentId);
+      if (revision === undefined) throw new Error("agent_unavailable");
+      return revision;
+    },
+  };
+}
+
+function resolvedRevision(
+  definition: AgentDefinitionRevision,
+): AgentRevisionSnapshot {
+  return {
+    ...definition,
+    revisionId: `rev_${definition.agentId}`,
+    definitionRevisionId: definition.definitionRevisionId,
+    modelProfileRevisionId: modelProfileRevisionIdFromUuid(
+      "00000000-0000-7000-8000-000000000001",
+    ),
+    model: {
+      providerConnectionRevisionId: providerConnectionRevisionIdFromUuid(
+        "00000000-0000-7000-8000-000000000001",
+      ),
+      providerKind: "openai_compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      providerAuth: {
+        type: "bearer",
+        secret: { fromEnvironment: "MODEL_API_KEY" },
+      },
+      modelId: "test-model",
+      invocationProtocol: "chat_completions",
+      maxInputTokens: 32_768,
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      compatibilityPresetVersion: "test-v1",
+    },
+    contentSha256: definition.contentSha256,
   };
 }
 
@@ -1963,14 +2051,7 @@ class PausedCompletionModel implements ModelPort {
   async *streamAttempt(
     request: ModelRequest,
     signal: AbortSignal,
-  ): AsyncIterable<
-    | { type: "text_delta"; text: string }
-    | {
-        type: "completed";
-        finishReason: string;
-        usage: { inputTokens: number; outputTokens: number };
-      }
-  > {
+  ): AsyncIterable<ModelChunk> {
     signal.throwIfAborted();
     this.requests.push(request);
     yield { type: "text_delta", text: "first chunk" };
@@ -1979,7 +2060,7 @@ class PausedCompletionModel implements ModelPort {
     signal.throwIfAborted();
     yield {
       type: "completed",
-      finishReason: "stop",
+      finishReason: "completed",
       usage: { inputTokens: 10, outputTokens: 2 },
     };
   }

@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
 
+import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { migrate } from "../../src/adapters/sqlite/migrator.js";
+import { SqliteSessionRepository } from "../../src/adapters/sqlite/session-repository.js";
 import { PromptAssembler } from "../../src/application/prompt-assembler.js";
 import { SessionSummarizer } from "../../src/application/session-summarizer.js";
 import type { AgentRevisionSnapshot } from "../../src/domain/agent-revision.js";
 import {
+  attemptIdFromUuid,
+  modelProfileRevisionIdFromUuid,
   parseAgentId,
+  providerConnectionRevisionIdFromUuid,
   runIdFromUuid,
   sessionIdFromUuid,
 } from "../../src/domain/ids.js";
@@ -61,15 +67,51 @@ describe("SessionSummarizer", () => {
       sourceMessageFrom: 0,
       sourceMessageTo: 1,
       content: "short session summary",
-      modelProvider: "openai-compatible",
+      modelProvider: "openai_compatible",
       modelName: "test-model",
     });
     expect(store.messages).toEqual(originalMessages);
-    expect(result.request.messages.find((entry) => entry.name === "session_history"))
+    expect(result.request.input.find(
+      (entry) => entry.type === "message" && entry.name === "session_history",
+    ))
       .toBeUndefined();
-    expect(result.request.messages.find((entry) => entry.name === "session_summary")?.content)
-      .toContain("short session summary");
+    const summaryInput = result.request.input.find(
+      (entry): entry is Extract<typeof entry, { type: "message" }> =>
+        entry.type === "message" && entry.name === "session_summary",
+    );
+    expect(summaryInput?.content).toContain("short session summary");
+    expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 2 });
     expect(clock.now().getTime()).toBe(250);
+  });
+
+  it("persists a completed summary when the provider omits Usage", async () => {
+    const store = new MemorySessionStore([
+      message(0, "oversized context ".repeat(2_000)),
+    ]);
+    const model = new ScriptedModel();
+    model.script({
+      chunks: [
+        { type: "text_delta", text: "summary without usage" },
+        { type: "completed", finishReason: "completed" },
+      ],
+    });
+    const summarizer = new SessionSummarizer({
+      assembler: new PromptAssembler(store),
+      sessionStore: store,
+      model,
+      clock: new FakeClock(),
+    });
+
+    const result = await summarizer.ensureWithinBudget(
+      promptInput(revision(2_000)),
+      new AbortController().signal,
+    );
+
+    expect(result.summarized).toBe(true);
+    expect(result).not.toHaveProperty("usage");
+    expect(store.currentSummary).toMatchObject({
+      content: "summary without usage",
+    });
   });
 
   it("stops after three transient provider attempts", async () => {
@@ -133,12 +175,15 @@ describe("SessionSummarizer", () => {
       new AbortController().signal,
     );
 
-    expect(model.requests[0]?.messages.map((entry) => entry.name)).toEqual([
+    expect(model.requests[0]?.input.map((entry) =>
+      entry.type === "message" ? entry.name : entry.type
+    )).toEqual([
       "summary_instructions",
       "session_summary",
       "session_history",
     ]);
-    expect(model.requests[0]?.messages[1]?.content).toContain(
+    const priorSummary = model.requests[0]?.input[1];
+    expect(priorSummary?.type === "message" ? priorSummary.content : undefined).toContain(
       "prior durable summary",
     );
     expect(store.currentSummary).toMatchObject({
@@ -146,6 +191,58 @@ describe("SessionSummarizer", () => {
       sourceMessageTo: 1,
       content: "replacement summary",
     });
+  });
+});
+
+describe("SqliteSessionRepository summary attempt completion", () => {
+  it.each([
+    {
+      label: "present",
+      usage: { inputTokens: 20, outputTokens: 4 },
+      expectedUsage: { inputTokens: 20, outputTokens: 4 },
+    },
+    { label: "absent", usage: undefined, expectedUsage: undefined },
+  ])("persists Usage only when $label", ({ usage, expectedUsage }) => {
+    const connection = openDatabase({ path: ":memory:", busyTimeoutMs: 5_000 });
+    try {
+      migrate(connection.db);
+      const runId = runIdFromUuid("00000000-0000-7000-8000-000000000201");
+      const sessionId = sessionIdFromUuid("00000000-0000-7000-8000-000000000201");
+      seedLeasedRun(connection.db, runId, sessionId);
+      const repository = new SqliteSessionRepository(connection.db);
+
+      repository.saveSummaryWithLease({
+        runId,
+        leaseOwner: "worker-unit",
+        attemptId: attemptIdFromUuid("00000000-0000-7000-8000-000000000201"),
+        finishReason: "completed",
+        ...(usage === undefined ? {} : { usage }),
+        occurredAt: new Date("2026-08-09T00:00:01.000Z"),
+        summary: {
+          summaryId: "summary:usage",
+          sessionId,
+          sourceMessageFrom: 0,
+          sourceMessageTo: 1,
+          content: "durable summary",
+          modelProvider: "openai_compatible",
+          modelName: "test-model",
+          createdAt: new Date("2026-08-09T00:00:01.000Z"),
+        },
+      });
+
+      const row = connection.db.prepare(
+        "SELECT payload_json FROM run_events WHERE event_type = 'message.completed'",
+      ).get() as { payload_json: string };
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      expect(payload).toMatchObject({
+        purpose: "session_summary",
+        finishReason: "completed",
+      });
+      expect(payload.usage).toEqual(expectedUsage);
+      expect(Object.hasOwn(payload, "usage")).toBe(usage !== undefined);
+    } finally {
+      connection.close();
+    }
   });
 });
 
@@ -214,15 +311,25 @@ function promptInput(revisionSnapshot: AgentRevisionSnapshot) {
 function revision(maxInputTokens: number): AgentRevisionSnapshot {
   return {
     revisionId: "rev_summary",
+    definitionRevisionId: "definition:primary:summary",
     agentId: parseAgentId("primary"),
     displayName: "Primary",
     prompt: "trusted agent instructions",
+    modelProfileRevisionId: modelProfileRevisionIdFromUuid("summary-profile"),
     model: {
-      provider: "openai-compatible",
-      model: "test-model",
+      providerConnectionRevisionId:
+        providerConnectionRevisionIdFromUuid("summary-connection"),
+      providerKind: "openai_compatible",
       baseUrl: "https://example.invalid/v1",
-      apiKey: { fromEnvironment: "TEST_API_KEY" },
+      providerAuth: {
+        type: "bearer",
+        secret: { fromEnvironment: "TEST_API_KEY" },
+      },
+      modelId: "test-model",
+      invocationProtocol: "chat_completions",
       maxInputTokens,
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      compatibilityPresetVersion: "openai-chat-v1",
     },
     workspace: ".",
     skills: [],
@@ -231,4 +338,30 @@ function revision(maxInputTokens: number): AgentRevisionSnapshot {
     limits: DEFAULT_RUN_LIMITS,
     contentSha256: "0".repeat(64),
   };
+}
+
+function seedLeasedRun(
+  db: ReturnType<typeof openDatabase>["db"],
+  runId: ReturnType<typeof runIdFromUuid>,
+  sessionId: ReturnType<typeof sessionIdFromUuid>,
+): void {
+  const now = "2026-08-09T00:00:00.000Z";
+  db.prepare(
+    `INSERT INTO agent_revisions (
+       revision_id, agent_id, content_json, content_sha256, created_at
+     ) VALUES ('rev-summary-usage', 'primary', '{}', ?, ?)`,
+  ).run("a".repeat(64), now);
+  db.prepare(
+    `INSERT INTO sessions (
+       session_id, agent_id, session_key, agent_revision_id, created_at, updated_at
+     ) VALUES (?, 'primary', 'summary:usage', 'rev-summary-usage', ?, ?)`,
+  ).run(sessionId, now, now);
+  db.prepare(
+    `INSERT INTO runs (
+       run_id, session_id, agent_revision_id, state, fifo_sequence,
+       delegation_depth, lease_owner, lease_expires_at, active_started_at,
+       request_digest, input_json, created_at, updated_at
+     ) VALUES (?, ?, 'rev-summary-usage', 'running', 0, 0, 'worker-unit',
+       '2026-08-09T00:01:00.000Z', ?, ?, '{"type":"text","text":"summarize"}', ?, ?)`,
+  ).run(runId, sessionId, now, "b".repeat(64), now, now);
 }

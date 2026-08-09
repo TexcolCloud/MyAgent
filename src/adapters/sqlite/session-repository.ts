@@ -1,3 +1,4 @@
+import canonicalizeModule from "canonicalize";
 import type { DatabaseSync } from "node:sqlite";
 
 import { DomainError } from "../../domain/errors.js";
@@ -11,6 +12,10 @@ import type {
   SessionStore,
   SessionSummary,
 } from "../../ports/session-store.js";
+
+const canonicalizeJson = canonicalizeModule as unknown as (
+  input: unknown,
+) => string | undefined;
 
 interface MessageRow {
   message_id: string;
@@ -153,6 +158,7 @@ export class SqliteSessionRepository implements SessionStore, SessionLookupStore
         throw new DomainError("run_lease_lost");
       }
       this.saveSummaryInTransaction(input.summary);
+      this.appendSummaryCompletionEvent(input, occurredAt);
       this.db.exec("COMMIT");
       return { ...input.summary };
     } catch (error) {
@@ -200,6 +206,37 @@ export class SqliteSessionRepository implements SessionStore, SessionLookupStore
     if (updated.changes !== 1) {
       throw new DomainError("session_not_found");
     }
+  }
+
+  private appendSummaryCompletionEvent(
+    input: SaveLeasedSessionSummaryInput,
+    occurredAt: string,
+  ): void {
+    const next = this.db.prepare(
+      `SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+       FROM run_events WHERE run_id = ?`,
+    ).get(input.runId) as { sequence: number };
+    const payload = canonicalizeJson({
+      attemptId: input.attemptId,
+      purpose: "session_summary",
+      content: input.summary.content,
+      finishReason: input.finishReason,
+      ...(input.usage === undefined ? {} : { usage: input.usage }),
+    });
+    if (payload === undefined) {
+      throw new DomainError("value_not_canonicalizable");
+    }
+    this.db.prepare(
+      `INSERT INTO run_events (
+         event_id, run_id, sequence, event_type, payload_json, created_at
+       ) VALUES (?, ?, ?, 'message.completed', ?, ?)`,
+    ).run(
+      `event:${input.runId}:${String(next.sequence)}`,
+      input.runId,
+      next.sequence,
+      payload,
+      occurredAt,
+    );
   }
 }
 

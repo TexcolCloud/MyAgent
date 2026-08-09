@@ -6,24 +6,36 @@ import type {
 } from "openai/resources/chat/completions/completions.js";
 
 import type { JsonValue } from "../../domain/json.js";
+import type { EffectiveModelRuntime } from "../../domain/agent-revision.js";
 import {
   ModelProviderError,
   type ModelChunk,
+  type ModelFinishReason,
+  type ModelInput,
   type ModelPort,
   type ModelRequest,
   type ModelUsage,
 } from "../../ports/model.js";
-import type { SecretResolver } from "../../ports/secret-resolver.js";
+import type {
+  ExactProviderConnectionRevision,
+  ModelRegistryStore,
+} from "../../ports/model-registry-store.js";
+import type { ProviderHttpTransport } from "../../ports/provider-http-transport.js";
 
 export interface OpenAiChatCompletionsModelOptions {
-  secretResolver: SecretResolver;
+  transport: ProviderHttpTransport;
+  connections: Pick<ModelRegistryStore, "getConnectionRevision">;
 }
 
 interface ToolCallFragments {
   index: number;
+  callId: string;
   name: string;
   arguments: string;
 }
+
+const REQUEST_TIMEOUT_MS = 120_000;
+const MAX_RESPONSE_BYTES = 16 * 1_024 * 1_024;
 
 export class OpenAiChatCompletionsModel implements ModelPort {
   constructor(private readonly options: OpenAiChatCompletionsModelOptions) {}
@@ -33,10 +45,22 @@ export class OpenAiChatCompletionsModel implements ModelPort {
     signal: AbortSignal,
   ): AsyncIterable<ModelChunk> {
     signal.throwIfAborted();
+    if (request.model.invocationProtocol !== "chat_completions") {
+      throw new ModelProviderError({
+        transient: false,
+        code: "invocation_protocol_unsupported",
+      });
+    }
+    const connection = exactConnection(request.model, this.options.connections);
     const client = new OpenAI({
-      apiKey: this.options.secretResolver.resolve(request.model.apiKey),
+      apiKey: "transport-owned-authentication",
       baseURL: request.model.baseUrl,
       maxRetries: 0,
+      fetch: this.options.transport.createFetch({
+        connection: connection.revision,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+        maxResponseBytes: MAX_RESPONSE_BYTES,
+      }),
     });
     const tools = request.tools.map((tool) => ({
       type: "function" as const,
@@ -53,16 +77,19 @@ export class OpenAiChatCompletionsModel implements ModelPort {
     try {
       const stream = await client.chat.completions.create(
         {
-          model: request.model.model,
-          messages: request.messages.map((message) => ({
-            role: message.role,
-            content: message.content,
-          })) as ChatCompletionMessageParam[],
+          model: request.model.modelId,
+          messages: chatMessages(request.input),
           stream: true,
           stream_options: { include_usage: true },
           ...(tools.length === 0
             ? {}
-            : { tools, parallel_tool_calls: false }),
+            : {
+                tools,
+                parallel_tool_calls: false,
+                ...(request.toolChoice === undefined
+                  ? {}
+                  : { tool_choice: request.toolChoice }),
+              }),
         },
         { signal },
       );
@@ -86,13 +113,24 @@ export class OpenAiChatCompletionsModel implements ModelPort {
       throw toModelProviderError(error, signal);
     }
 
-    if (finishReason === undefined || usage === undefined) {
+    if (finishReason === undefined) {
+      throw protocolError();
+    }
+    const normalizedFinishReason = normalizeFinishReason(finishReason);
+    if (
+      (toolCall === undefined && normalizedFinishReason === "tool_call") ||
+      (toolCall !== undefined && normalizedFinishReason !== "tool_call")
+    ) {
       throw protocolError();
     }
     if (toolCall !== undefined) {
-      yield { type: "tool_call", call: parseToolCall(toolCall) };
+      yield { type: "tool_call", ...parseToolCall(toolCall) };
     }
-    yield { type: "completed", finishReason, usage };
+    yield {
+      type: "completed",
+      finishReason: normalizedFinishReason,
+      ...(usage === undefined ? {} : { usage }),
+    };
   }
 }
 
@@ -104,15 +142,23 @@ function appendToolCall(
     if (current !== undefined && current.index !== delta.index) {
       throw protocolError();
     }
-    current ??= { index: delta.index, name: "", arguments: "" };
+    current ??= { index: delta.index, callId: "", name: "", arguments: "" };
+    if (delta.id !== undefined) {
+      if (current.callId.length > 0 && current.callId !== delta.id) {
+        throw protocolError();
+      }
+      current.callId = delta.id;
+    }
     current.name += delta.function?.name ?? "";
     current.arguments += delta.function?.arguments ?? "";
   }
   return current;
 }
 
-function parseToolCall(call: ToolCallFragments): { name: string; arguments: JsonValue } {
-  if (call.name.length === 0) {
+function parseToolCall(
+  call: ToolCallFragments,
+): { callId: string; name: string; arguments: JsonValue } {
+  if (call.callId.length === 0 || call.name.length === 0) {
     throw protocolError();
   }
   try {
@@ -120,7 +166,11 @@ function parseToolCall(call: ToolCallFragments): { name: string; arguments: Json
     if (!isJsonValue(argumentsValue)) {
       throw protocolError();
     }
-    return { name: call.name, arguments: argumentsValue };
+    return {
+      callId: call.callId,
+      name: call.name,
+      arguments: argumentsValue,
+    };
   } catch (error) {
     if (error instanceof ModelProviderError) {
       throw error;
@@ -145,9 +195,8 @@ function toModelProviderError(error: unknown, signal: AbortSignal): Error {
       ? signal.reason
       : new DOMException("The operation was aborted", "AbortError");
   }
-  if (error instanceof ModelProviderError) {
-    return error;
-  }
+  const providerError = findProviderError(error);
+  if (providerError !== undefined) return providerError;
   if (error instanceof OpenAI.APIError) {
     const status = error.status;
     return new ModelProviderError({
@@ -158,6 +207,98 @@ function toModelProviderError(error: unknown, signal: AbortSignal): Error {
     });
   }
   return new ModelProviderError({ transient: true, code: "provider_unavailable" });
+}
+
+function findProviderError(error: unknown): ModelProviderError | undefined {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    if (current instanceof ModelProviderError) return current;
+    seen.add(current);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+function exactConnection(
+  model: EffectiveModelRuntime,
+  connections: Pick<ModelRegistryStore, "getConnectionRevision">,
+): ExactProviderConnectionRevision {
+  const target = connections.getConnectionRevision(
+    model.providerConnectionRevisionId,
+  );
+  if (
+    target === null ||
+    target.providerKind !== model.providerKind ||
+    target.revision.baseUrl !== model.baseUrl ||
+    target.revision.presetVersion !== model.compatibilityPresetVersion ||
+    !sameAuth(target.revision.auth, model.providerAuth)
+  ) {
+    throw protocolError();
+  }
+  return target;
+}
+
+function sameAuth(
+  left: ExactProviderConnectionRevision["revision"]["auth"],
+  right: EffectiveModelRuntime["providerAuth"],
+): boolean {
+  if (left.type !== right.type) return false;
+  if (left.type === "none" || right.type === "none") return true;
+  const leftSecret = left.secret;
+  const rightSecret = right.secret;
+  if ("fromEnvironment" in leftSecret) {
+    return "fromEnvironment" in rightSecret &&
+      leftSecret.fromEnvironment === rightSecret.fromEnvironment;
+  }
+  return "managedSecretVersionId" in rightSecret &&
+    leftSecret.managedSecretVersionId === rightSecret.managedSecretVersionId;
+}
+
+function chatMessages(input: readonly ModelInput[]): ChatCompletionMessageParam[] {
+  return input.map((entry): ChatCompletionMessageParam => {
+    if (entry.type === "message") {
+      return {
+        role: entry.role,
+        content: entry.content,
+        ...(entry.name === undefined ? {} : { name: entry.name }),
+      } as ChatCompletionMessageParam;
+    }
+    if (entry.type === "assistant_tool_call") {
+      return {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: entry.callId,
+          type: "function",
+          function: {
+            name: entry.name,
+            arguments: JSON.stringify(entry.arguments),
+          },
+        }],
+      };
+    }
+    return {
+      role: "tool",
+      tool_call_id: entry.callId,
+      content: JSON.stringify(entry.output),
+    };
+  });
+}
+
+function normalizeFinishReason(value: string): ModelFinishReason {
+  switch (value) {
+    case "stop":
+      return "completed";
+    case "tool_calls":
+    case "function_call":
+      return "tool_call";
+    case "length":
+    case "content_filter":
+      return value;
+    default:
+      return "unknown";
+  }
 }
 
 function protocolError(): ModelProviderError {

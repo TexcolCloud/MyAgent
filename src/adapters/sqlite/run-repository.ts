@@ -587,7 +587,7 @@ export class SqliteRunRepository implements RunStore {
           attemptId: input.attemptId,
           content: input.text,
           finishReason: input.finishReason,
-          usage: input.usage,
+          ...(input.usage === undefined ? {} : { usage: input.usage }),
         }),
         occurredAt,
       );

@@ -26,6 +26,7 @@ import {
 } from "../../src/domain/ids.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
+import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 import { ApprovalExpirer } from "../../src/runtime/approval-expirer.js";
@@ -60,7 +61,7 @@ describe("Approval and reconciliation resume", () => {
         sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000401")],
         runIds: [runId],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: `reconcile:${outcome}`,
         input: { type: "text", text: "check the side effect" },
@@ -164,7 +165,7 @@ describe("Approval and reconciliation resume", () => {
           approvalIdFromUuid("00000000-0000-7000-8000-000000000403"),
         ],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "reconcile:retry",
         input: { type: "text", text: "retry only after I approve" },
@@ -267,7 +268,7 @@ describe("Approval and reconciliation resume", () => {
         approvalIds: [approvalId],
         attemptIds: ["att_00000000-0000-7000-8000-000000000405" as never],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "approval:restart",
         input: { type: "text", text: "run the approved command" },
@@ -284,11 +285,13 @@ describe("Approval and reconciliation resume", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "run_command", arguments: { command: "ignored raw form" } },
+            callId: "provider_approval_restart",
+            name: "run_command",
+            arguments: { command: "ignored raw form" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -423,7 +426,7 @@ describe("Approval and reconciliation resume", () => {
         sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000406")],
         runIds: [runId],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "approval:expiry",
         input: { type: "text", text: "let the Approval expire" },

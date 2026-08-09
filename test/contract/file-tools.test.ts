@@ -33,6 +33,10 @@ import {
   toolCallIdFromUuid,
 } from "../../src/domain/ids.js";
 import { DEFAULT_RUN_LIMITS } from "../../src/domain/limits.js";
+import {
+  TEST_MODEL_PROFILE_REVISION_ID,
+  testModelRuntime,
+} from "../helpers/model-fixtures.js";
 import type {
   ToolExecutionContext,
   ToolNormalizeContext,
@@ -415,16 +419,12 @@ function revisionFor(workspace: string): AgentRevisionSnapshot {
   const agentId = parseAgentId("primary");
   return {
     revisionId: "rev_file_tools",
+    definitionRevisionId: "def_file_tools",
+    modelProfileRevisionId: TEST_MODEL_PROFILE_REVISION_ID,
     agentId,
     displayName: "Primary",
     prompt: "Primary Agent",
-    model: {
-      provider: "openai-compatible",
-      model: "test-model",
-      baseUrl: "https://example.invalid/v1",
-      apiKey: { fromEnvironment: "TEST_API_KEY" },
-      maxInputTokens: 8_192,
-    },
+    model: testModelRuntime(),
     workspace,
     skills: [],
     policy: [],

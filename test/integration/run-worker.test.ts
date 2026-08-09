@@ -37,6 +37,7 @@ import { RunWorker } from "../../src/runtime/run-worker.js";
 import { SystemClock } from "../../src/adapters/system-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
+import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { completedText, ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
@@ -60,7 +61,7 @@ describe("RunWorker", () => {
         runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000031")],
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000031")],
       });
-      const created = new CreateRunService(new CatalogService(catalogSnapshot), runs, clock, ids).execute({
+      const created = new CreateRunService(resolvedAgents(new CatalogService(catalogSnapshot)), runs, clock, ids).execute({
         agentId: "primary", sessionKey: "integration:worker", input: { type: "text", text: "hello" },
         idempotencyKey: "run-worker-0001", source: { kind: "http" },
       });
@@ -101,7 +102,7 @@ describe("RunWorker", () => {
           attemptIdFromUuid("00000000-0000-7000-8000-000000000033"),
         ],
       });
-      const created = new CreateRunService(new CatalogService(catalogSnapshot), runs, clock, ids).execute({
+      const created = new CreateRunService(resolvedAgents(new CatalogService(catalogSnapshot)), runs, clock, ids).execute({
         agentId: "primary", sessionKey: "integration:tool-loop", input: { type: "text", text: "read" },
         idempotencyKey: "run-worker-0002", source: { kind: "http" },
       });
@@ -114,8 +115,13 @@ describe("RunWorker", () => {
       }));
       const model = new ScriptedModel();
       model.script({ chunks: [
-        { type: "tool_call", call: { name: "read_file", arguments: { path: "report.md" } } },
-        { type: "completed", finishReason: "tool_calls", usage: { inputTokens: 10, outputTokens: 2 } },
+        {
+          type: "tool_call",
+          callId: "provider_tool_loop",
+          name: "read_file",
+          arguments: { path: "report.md" },
+        },
+        { type: "completed", finishReason: "tool_call", usage: { inputTokens: 10, outputTokens: 2 } },
       ] }, completedText("final after tool"));
       const advance = new AdvanceRunService({
         runs, tools: new SqliteToolRepository(connection.db), approvals: new SqliteApprovalRepository(connection.db),
@@ -128,8 +134,18 @@ describe("RunWorker", () => {
       await waitFor(() => runs.getRun(created.runId).state === "completed");
       await worker.stop();
 
-      expect(model.requests[1]?.messages.find((message) => message.name === "tool_results")?.content)
-        .toContain("report body");
+      expect(model.requests[1]?.input).toContainEqual({
+        type: "assistant_tool_call",
+        callId: "provider_tool_loop",
+        name: "read_file",
+        arguments: { path: "report.md" },
+      });
+      expect(model.requests[1]?.input).toContainEqual({
+        type: "tool_result",
+        callId: "provider_tool_loop",
+        name: "read_file",
+        output: expect.objectContaining({ content: { contents: "report body" } }),
+      });
     } finally {
       connection.close();
     }
@@ -161,7 +177,7 @@ describe("RunWorker", () => {
         ],
       });
       const create = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         runs,
         clock,
         ids,
@@ -319,7 +335,7 @@ describe("RunWorker", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000034")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         runs,
         clock,
         ids,
@@ -338,11 +354,13 @@ describe("RunWorker", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "provider_side_effect_stop",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -404,7 +422,7 @@ describe("RunWorker", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000035")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         runs,
         clock,
         ids,
@@ -423,11 +441,13 @@ describe("RunWorker", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "provider_read_only_stop",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -637,7 +657,7 @@ describe("RunWorker", () => {
         ],
       });
       const create = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         runs,
         clock,
         ids,
@@ -724,9 +744,7 @@ class RoutingModel implements ModelPort {
     signal: AbortSignal,
   ): AsyncIterable<ModelChunk> {
     signal.throwIfAborted();
-    const input = request.messages.find(
-      (message) => message.name === "current_operator_input",
-    )?.content ?? "";
+    const input = currentOperatorInput(request);
     const text = input.includes("approval request")
       ? "approval request"
       : input.includes("must stay queued")
@@ -736,14 +754,13 @@ class RoutingModel implements ModelPort {
     if (text === "approval request") {
       yield {
         type: "tool_call",
-        call: {
-          name: "run_command",
-          arguments: { program: "node", args: [] },
-        },
+        callId: "provider_approval_request",
+        name: "run_command",
+        arguments: { program: "node", args: [] },
       };
       yield {
         type: "completed",
-        finishReason: "tool_calls",
+        finishReason: "tool_call",
         usage: { inputTokens: 10, outputTokens: 2 },
       };
       return;
@@ -751,7 +768,7 @@ class RoutingModel implements ModelPort {
     yield { type: "text_delta", text: "independent answer" };
     yield {
       type: "completed",
-      finishReason: "stop",
+      finishReason: "completed",
       usage: { inputTokens: 10, outputTokens: 2 },
     };
   }
@@ -765,17 +782,17 @@ class UnknownToolRoutingModel implements ModelPort {
     signal: AbortSignal,
   ): AsyncIterable<ModelChunk> {
     signal.throwIfAborted();
-    const input = request.messages.find(
-      (message) => message.name === "current_operator_input",
-    )?.content ?? "";
+    const input = currentOperatorInput(request);
     if (input.includes("propose the unknown Tool")) {
       yield {
         type: "tool_call",
-        call: { name: "not_registered", arguments: {} },
+        callId: "provider_unknown_tool",
+        name: "not_registered",
+        arguments: {},
       };
       yield {
         type: "completed",
-        finishReason: "tool_calls",
+        finishReason: "tool_call",
         usage: { inputTokens: 10, outputTokens: 2 },
       };
       return;
@@ -784,10 +801,19 @@ class UnknownToolRoutingModel implements ModelPort {
     yield { type: "text_delta", text: "later answer" };
     yield {
       type: "completed",
-      finishReason: "stop",
+      finishReason: "completed",
       usage: { inputTokens: 10, outputTokens: 2 },
     };
   }
+}
+
+function currentOperatorInput(request: ModelRequest): string {
+  for (const entry of request.input) {
+    if (entry.type === "message" && entry.name === "current_operator_input") {
+      return entry.content;
+    }
+  }
+  return "";
 }
 
 class PausingTool implements ToolDefinition {

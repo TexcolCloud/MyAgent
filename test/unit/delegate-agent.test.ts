@@ -9,7 +9,7 @@ describe("delegate_agent", () => {
   it("rejects undeclared, recursive, and excessive delegation", async () => {
     let delegationDepth = 0;
     const delegate = new DelegateAgentService({
-      catalog: { resolve: () => ({ id: parseAgentId("researcher"), revision: {} as never }) },
+      agents: { resolve: () => ({} as never) },
       runs: {
         getExecutionContext: () => ({
           run: {
@@ -49,14 +49,16 @@ describe("delegate_agent", () => {
 
   it("passes only task and context to a child Run", async () => {
     let input: unknown;
+    let targetRevision: unknown;
+    const childRevision = { revisionId: "rev_child" } as never;
     const delegate = new DelegateAgentService({
-      catalog: { resolve: () => ({ id: parseAgentId("researcher"), revision: { revisionId: "rev_child" } as never }) },
+      agents: { resolve: () => childRevision },
       runs: {
         getExecutionContext: () => ({
           run: { runId: runIdFromUuid("00000000-0000-7000-8000-000000000001"), rootRunId: runIdFromUuid("00000000-0000-7000-8000-000000000001"), delegationDepth: 0 },
           revision: { delegates: [parseAgentId("researcher")], limits: { childRuns: 4, delegationDepth: 1 } },
         }),
-        startDelegation: (value) => { input = value.input; return { childRunId: runIdFromUuid("00000000-0000-7000-8000-000000000002"), childSessionId: sessionIdFromUuid("00000000-0000-7000-8000-000000000002") }; },
+        startDelegation: (value) => { input = value.input; targetRevision = value.targetRevision; return { childRunId: runIdFromUuid("00000000-0000-7000-8000-000000000002"), childSessionId: sessionIdFromUuid("00000000-0000-7000-8000-000000000002") }; },
       },
       clock: { now: () => new Date("2026-08-07T00:00:00.000Z") },
       ids: { sessionId: () => sessionIdFromUuid("00000000-0000-7000-8000-000000000002"), runId: () => runIdFromUuid("00000000-0000-7000-8000-000000000002") },
@@ -67,6 +69,7 @@ describe("delegate_agent", () => {
     });
 
     expect(input).toEqual({ type: "text", text: JSON.stringify({ task: "research only this", context: { subject: "delegation" } }) });
+    expect(targetRevision).toBe(childRevision);
   });
 });
 

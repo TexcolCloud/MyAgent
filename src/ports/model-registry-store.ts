@@ -172,6 +172,11 @@ export interface RecordProviderHealthInput {
   readonly observedAt: Date;
 }
 
+export interface ExactProviderConnectionRevision {
+  readonly providerKind: ProviderKind;
+  readonly revision: ProviderConnectionRevision;
+}
+
 export interface LegacyModelSeed {
   readonly alias: string;
   readonly providerKind: ProviderKind;
@@ -209,6 +214,9 @@ export interface ModelRegistryStore {
   createConnection(input: CreateConnectionRecord): ProviderConnectionView;
   createConnectionRevision(input: CreateConnectionRevisionRecord): ProviderConnectionView;
   getConnection(id: ProviderConnectionId): ProviderConnectionView;
+  getConnectionRevision(
+    id: ProviderConnectionRevisionId,
+  ): ExactProviderConnectionRevision | null;
   listConnections(): readonly ProviderConnectionView[];
   recordDiscovery(input: RecordDiscoveryInput): DiscoveryView;
   getDiscoveredModels(revisionId: ProviderConnectionRevisionId, now: Date): DiscoveryView;
@@ -244,6 +252,7 @@ export type CoreModelRegistryStore = Pick<
   | "createConnection"
   | "createConnectionRevision"
   | "getConnection"
+  | "getConnectionRevision"
   | "listConnections"
   | "createProfile"
   | "createProfileRevision"

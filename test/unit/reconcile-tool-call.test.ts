@@ -6,6 +6,10 @@ import {
   sessionIdFromUuid,
   toolCallIdFromUuid,
 } from "../../src/domain/ids.js";
+import {
+  TEST_MODEL_PROFILE_REVISION_ID,
+  testModelRuntime,
+} from "../helpers/model-fixtures.js";
 
 describe("ReconcileToolCallService", () => {
   it("creates one linked retry without rewriting the unknown call", () => {
@@ -76,16 +80,12 @@ function createService(
         },
         revision: {
           revisionId: "revision:test",
+          definitionRevisionId: "definition:test",
+          modelProfileRevisionId: TEST_MODEL_PROFILE_REVISION_ID,
           agentId: "primary" as never,
           displayName: "Primary",
           prompt: "test",
-          model: {
-            provider: "test",
-            model: "test",
-            baseUrl: "http://localhost",
-            apiKey: { fromEnvironment: "TEST_KEY" },
-            maxInputTokens: 1_000,
-          },
+          model: testModelRuntime({ maxInputTokens: 1_000 }),
           workspace: ".",
           skills: [],
           policy: [{ tool: "run_command", effect: "allow" }],
@@ -131,6 +131,7 @@ class FakeReconciliationStore {
       toolCallId: this.original,
       runId: runIdFromUuid("00000000-0000-7000-8000-000000000201"),
       state: "unknown" as const,
+      providerCallId: "provider_reconcile_original",
       toolName: "run_command",
       effect: "side_effect" as const,
       arguments: {},

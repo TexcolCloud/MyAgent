@@ -9,6 +9,10 @@ import {
 } from "../../src/domain/ids.js";
 import { DEFAULT_RUN_LIMITS } from "../../src/domain/limits.js";
 import type { ToolExecutionContext } from "../../src/ports/tool.js";
+import {
+  TEST_MODEL_PROFILE_REVISION_ID,
+  testModelRuntime,
+} from "../helpers/model-fixtures.js";
 
 describe("activate_skill Tool", () => {
   it("activates only a Skill snapshotted in the Run revision", async () => {
@@ -72,16 +76,12 @@ function revisionFixture(): AgentRevisionSnapshot {
   const agentId = parseAgentId("primary");
   return {
     revisionId: "rev_activate_skill",
+    definitionRevisionId: "def_activate_skill",
+    modelProfileRevisionId: TEST_MODEL_PROFILE_REVISION_ID,
     agentId,
     displayName: "Primary",
     prompt: "Primary Agent",
-    model: {
-      provider: "openai-compatible",
-      model: "test-model",
-      baseUrl: "https://example.invalid/v1",
-      apiKey: { fromEnvironment: "TEST_API_KEY" },
-      maxInputTokens: 8_192,
-    },
+    model: testModelRuntime(),
     workspace: "C:/workspace",
     skills: [
       {

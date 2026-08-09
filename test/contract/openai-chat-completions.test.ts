@@ -5,6 +5,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
 import { OpenAiChatCompletionsModel } from "../../src/adapters/model/openai-chat-completions.js";
+import { NodeProviderHttpTransport } from "../../src/adapters/provider-http-transport.js";
+import {
+  parseProviderConnectionId,
+  providerConnectionRevisionIdFromUuid,
+} from "../../src/domain/ids.js";
 import type { JsonValue } from "../../src/domain/json.js";
 import type { ModelChunk, ModelRequest } from "../../src/ports/model.js";
 
@@ -30,7 +35,7 @@ describe("OpenAiChatCompletionsModel", () => {
       usageFrame(11, 3),
     ]);
     servers.push(fake.server);
-    const model = adapter();
+    const model = adapter(fake.baseUrl);
 
     const chunks = await collect(
       model.streamAttempt(request(fake.baseUrl), new AbortController().signal),
@@ -41,7 +46,7 @@ describe("OpenAiChatCompletionsModel", () => {
       { type: "text_delta", text: "lo" },
       {
         type: "completed",
-        finishReason: "stop",
+        finishReason: "completed",
         usage: { inputTokens: 11, outputTokens: 3 },
       },
     ]);
@@ -57,22 +62,38 @@ describe("OpenAiChatCompletionsModel", () => {
       name: "finish reason",
       events: [frame({ content: "incomplete" }), usageFrame(3, 1)],
     },
-    {
-      name: "usage",
-      events: [frame({ content: "incomplete" }), frame({}, "stop")],
-    },
   ])("rejects a stream missing final $name", async ({ events }) => {
     const fake = await startServer(events);
     servers.push(fake.server);
 
     await expect(
       collect(
-        adapter().streamAttempt(
+        adapter(fake.baseUrl).streamAttempt(
           request(fake.baseUrl),
           new AbortController().signal,
         ),
       ),
     ).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("completes without Usage when the provider omits it", async () => {
+    const fake = await startServer([
+      frame({ content: "complete" }),
+      frame({}, "stop"),
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(
+      adapter(fake.baseUrl).streamAttempt(
+        request(fake.baseUrl),
+        new AbortController().signal,
+      ),
+    );
+
+    expect(chunks.at(-1)).toEqual({
+      type: "completed",
+      finishReason: "completed",
+    });
   });
 
   it("omits Tool-only request fields when no Tools are available", async () => {
@@ -84,7 +105,7 @@ describe("OpenAiChatCompletionsModel", () => {
     servers.push(fake.server);
 
     await collect(
-      adapter().streamAttempt(
+      adapter(fake.baseUrl).streamAttempt(
         { ...request(fake.baseUrl), purpose: "session_summary", tools: [] },
         new AbortController().signal,
       ),
@@ -120,7 +141,7 @@ describe("OpenAiChatCompletionsModel", () => {
     servers.push(fake.server);
 
     const chunks = await collect(
-      adapter().streamAttempt(
+      adapter(fake.baseUrl).streamAttempt(
         request(fake.baseUrl),
         new AbortController().signal,
       ),
@@ -128,7 +149,9 @@ describe("OpenAiChatCompletionsModel", () => {
 
     expect(chunks).toContainEqual({
       type: "tool_call",
-      call: { name: "read_file", arguments: { path: "report.md" } },
+      callId: "call_1",
+      name: "read_file",
+      arguments: { path: "report.md" },
     });
   });
 
@@ -165,7 +188,7 @@ describe("OpenAiChatCompletionsModel", () => {
 
     await expect(
       collect(
-        adapter().streamAttempt(
+        adapter(fake.baseUrl).streamAttempt(
           request(fake.baseUrl),
           new AbortController().signal,
         ),
@@ -188,14 +211,14 @@ describe("OpenAiChatCompletionsModel", () => {
     servers.push(fake.server);
 
     const error = await collect(
-      adapter().streamAttempt(
+      adapter(fake.baseUrl).streamAttempt(
         request(fake.baseUrl),
         new AbortController().signal,
       ),
     ).catch((cause: unknown) => cause);
 
     expect(error).toMatchObject({
-      code: "rate_limit_exceeded",
+      code: "provider_rate_limited",
       transient: true,
       status: 429,
       retryAfterMs: 2_000,
@@ -212,13 +235,13 @@ describe("OpenAiChatCompletionsModel", () => {
     servers.push(fake.server);
 
     const error = await collect(
-      adapter().streamAttempt(
+      adapter(fake.baseUrl).streamAttempt(
         request(fake.baseUrl),
         new AbortController().signal,
       ),
     ).catch((cause: unknown) => cause);
 
-    expect(error).toMatchObject({ code: "server_error", transient: true });
+    expect(error).toMatchObject({ code: "provider_unavailable", transient: true });
     expect(error).toMatchObject({ retryAfterMs: expect.any(Number) });
     expect((error as { retryAfterMs: number }).retryAfterMs).toBeGreaterThan(0);
   });
@@ -229,18 +252,92 @@ describe("OpenAiChatCompletionsModel", () => {
 
     await expect(
       collect(
-        adapter().streamAttempt(
+        adapter("http://127.0.0.1:1/v1").streamAttempt(
           request("http://127.0.0.1:1/v1"),
           controller.signal,
         ),
       ),
     ).rejects.toMatchObject({ name: "AbortError" });
   });
+
+  it("rejects a non-Chat snapshot before transport", async () => {
+    const baseUrl = "http://127.0.0.1:1/v1";
+    const canonical = request(baseUrl);
+
+    await expect(collect(adapter(baseUrl).streamAttempt({
+      ...canonical,
+      model: { ...canonical.model, invocationProtocol: "responses" },
+    }, new AbortController().signal))).rejects.toMatchObject({
+      code: "invocation_protocol_unsupported",
+      transient: false,
+    });
+  });
+
+  it("accepts a Chat request when the stored Connection prefers Responses", async () => {
+    const fake = await startServer([
+      frame({ content: "accepted" }),
+      frame({}, "stop"),
+      usageFrame(3, 1),
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(
+      adapter(fake.baseUrl, "responses").streamAttempt(
+        request(fake.baseUrl),
+        new AbortController().signal,
+      ),
+    );
+
+    expect(chunks.at(-1)).toEqual({
+      type: "completed",
+      finishReason: "completed",
+      usage: { inputTokens: 3, outputTokens: 1 },
+    });
+    expect(fake.requests).toHaveLength(1);
+  });
+
+  it("rejects a snapshot that does not match its exact stored Connection revision", async () => {
+    const baseUrl = "http://127.0.0.1:1/v1";
+
+    await expect(collect(adapter("http://127.0.0.1:2/v1").streamAttempt(
+      request(baseUrl),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
 });
 
-function adapter(): OpenAiChatCompletionsModel {
+function adapter(
+  storedBaseUrl: string,
+  protocolPreference: "chat_completions" | "responses" = "chat_completions",
+): OpenAiChatCompletionsModel {
+  const secretResolver = new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" });
+  const revisionId = providerConnectionRevisionIdFromUuid(
+    "00000000-0000-7000-8000-000000000301",
+  );
   return new OpenAiChatCompletionsModel({
-    secretResolver: new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" }),
+    transport: new NodeProviderHttpTransport({ secretResolver }),
+    connections: {
+      getConnectionRevision(requestedRevisionId) {
+        if (requestedRevisionId !== revisionId) return null;
+        return {
+          providerKind: "openai_compatible",
+          revision: {
+            revisionId,
+            connectionId: parseProviderConnectionId("openai-test"),
+            state: "active",
+            baseUrl: storedBaseUrl,
+            auth: {
+              type: "bearer",
+              secret: { fromEnvironment: "TEST_API_KEY" },
+            },
+            allowInsecureHttp: true,
+            protocolPreference,
+            presetVersion: "openai-chat-v1",
+            createdAt: new Date("2026-08-09T00:00:00.000Z"),
+          },
+        };
+      },
+    },
   });
 }
 
@@ -248,15 +345,24 @@ function request(baseUrl: string): ModelRequest {
   return {
     purpose: "run",
     model: {
-      provider: "openai-compatible",
-      model: "test-model",
+      providerConnectionRevisionId: providerConnectionRevisionIdFromUuid(
+        "00000000-0000-7000-8000-000000000301",
+      ),
+      providerKind: "openai_compatible",
       baseUrl,
-      apiKey: { fromEnvironment: "TEST_API_KEY" },
+      providerAuth: {
+        type: "bearer",
+        secret: { fromEnvironment: "TEST_API_KEY" },
+      },
+      modelId: "test-model",
+      invocationProtocol: "chat_completions",
       maxInputTokens: 8_192,
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      compatibilityPresetVersion: "openai-chat-v1",
     },
-    messages: [
-      { role: "system", name: "runtime_safety", content: "Follow policy." },
-      { role: "user", name: "operator", content: "Read the report." },
+    input: [
+      { type: "message", role: "system", name: "runtime_safety", content: "Follow policy." },
+      { type: "message", role: "user", name: "operator", content: "Read the report." },
     ],
     tools: [
       {
