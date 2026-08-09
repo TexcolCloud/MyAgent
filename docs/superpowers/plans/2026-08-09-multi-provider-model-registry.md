@@ -577,8 +577,15 @@ export type VerificationRetryDecision =
   | { shouldRetry: false }
   | { shouldRetry: true; delayMs: number };
 
+export interface VerificationProviderError {
+  readonly code: ProviderRuntimeErrorCode;
+  readonly transient: boolean;
+  readonly retryAfterMs?: number;
+  readonly status?: number;
+}
+
 export function classifyVerificationRetry(
-  error: Pick<ModelProviderError, "code" | "transient" | "retryAfterMs">,
+  error: Pick<VerificationProviderError, "code" | "transient" | "retryAfterMs">,
   attemptNumber: number,
 ): VerificationRetryDecision {
   const retryableCode = error.code === "provider_unavailable" || error.code === "provider_rate_limited";
@@ -589,12 +596,32 @@ export function classifyVerificationRetry(
   };
 }
 
-export function canTryFallback(error: Pick<ModelProviderError, "status" | "code">): boolean {
+const validatedUnsupportedEndpointBrand: unique symbol = Symbol("validated_unsupported_endpoint");
+export interface ValidatedUnsupportedEndpointEvidence {
+  readonly code: "unsupported_endpoint";
+  readonly [validatedUnsupportedEndpointBrand]: true;
+}
+
+export function validateUnsupportedEndpointCode(
+  code: string,
+): ValidatedUnsupportedEndpointEvidence | null {
+  return code === "unsupported_endpoint"
+    ? { code, [validatedUnsupportedEndpointBrand]: true }
+    : null;
+}
+
+export function canTryFallback(
+  error:
+    | Pick<VerificationProviderError, "status" | "code">
+    | ValidatedUnsupportedEndpointEvidence,
+): boolean {
   if (error.code === "unsupported_endpoint") return true;
   return error.code === "invocation_protocol_unsupported"
     && (error.status === 404 || error.status === 405 || error.status === 501);
 }
 ```
+
+`unsupported_endpoint` is not a `ProviderRuntimeErrorCode` and never enters a public failure record. Only the branded evidence returned by `validateUnsupportedEndpointCode` can carry it into fallback classification.
 
 Keep content immutable even when lifecycle state changes. A Legacy-Trusted revision is usable only by its imported assignment and is never defaultable, copyable, promotable, or newly assignable.
 
