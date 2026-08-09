@@ -186,6 +186,8 @@ modelControl:
 
 `MYAGENT_MASTER_KEY` is boot material rather than a Secret stored by MyAgent. It is a Base64-encoded 32-byte key. `MYAGENT_PREVIOUS_MASTER_KEY` may hold the prior key during controlled master-key rotation.
 
+Each configured generation has a non-secret deterministic ID serialized as `mk_` plus the unpadded Base64URL encoding of the full SHA-256 digest of its 32 decoded key bytes. The database never stores key bytes or key fragments. Invalid or missing material is retained as an unavailable generation during initialization so local startup is not blocked; Secret operations map it to `secret_locked`.
+
 Startup order is:
 
 1. Parse and validate static configuration.
@@ -217,6 +219,8 @@ This optimistic-concurrency rule governs Operator/control-plane mutations and st
 Queueing a Verification is a mutation of the owning Model Profile. Its request therefore supplies that Profile's `expectedRevision`, even though the route identifies the exact immutable Profile Revision being verified.
 
 Master-key rotation supplies the singleton Managed Secret Keyring's `expectedRevision`. The transaction increments that record only after all active Secret Versions have been re-encrypted successfully.
+
+The first successful Secret Version creation initializes an absent Keyring at record revision `0`. Startup never changes the stored Keyring. If configured current material differs from the Keyring, existing rows may resolve through matching previous material, but new Secret creation is `secret_locked` until explicit rotation succeeds. Rotation requires the stored Keyring to match the configured previous generation, re-encrypts to the configured current generation, and then increments the Keyring revision. A missing Keyring cannot be rotated.
 
 Appending an immutable Model Profile Revision is an optimistic mutation of its stable Model Profile. The application/store command requires the Profile's `expectedRevision`, rejects retired Profiles, appends one revision, and emits one audit event without changing the active head.
 

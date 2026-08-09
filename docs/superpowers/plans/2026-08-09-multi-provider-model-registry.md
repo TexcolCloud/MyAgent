@@ -796,6 +796,9 @@ git commit -m "feat: persist discovery and model verification jobs"
 **Interfaces:**
 - Consumes: external current/previous master-key material, Task 2 Secret reference inspection, and existing environment Secret resolution.
 - Produces: canonical `SecretRef`, `ManagedSecretStore`, `CompositeSecretResolver`, and `DynamicRedactionRegistry.register(value): void`.
+- Exact adapter constructor: `new SqliteEncryptedSecretStore(db, environment)`, where `environment` is `Readonly<{ MYAGENT_MASTER_KEY?: string; MYAGENT_PREVIOUS_MASTER_KEY?: string }>` and defaults to `process.env` only at the composition root.
+- Exact application constructor: `new ManageSecretsService(store, registry, clock, ids)`, with `registry: Pick<ModelRegistryStore, "inspectSecretReferences">`, `clock: Clock`, and `ids: Pick<IdGenerator, "managedSecretVersionId">`.
+- Exact application methods are `createProviderApiKey({ secretId, plaintext })`, `destroyVersion({ versionId, expectedRevision })`, and `rotateMasterKey({ expectedRevision })`; the service supplies generated IDs and `clock.now()` to the Store.
 
 - [ ] **Step 1: Write failing crypto and leak tests**
 
@@ -836,9 +839,15 @@ const tag = cipher.getAuthTag();
 
 Initialize the adapter even when no key is configured. Store only ciphertext/nonce/tag/current non-secret key ID/lifecycle/timestamps. On create/resolve, map missing, wrong, tampered, or destroyed keys to `secret_locked` without revealing which check failed. Never resolve legacy environment references during import.
 
+Derive each non-secret Key ID exactly as `mk_${base64url(sha256(decoded32ByteKey))}` using the full unpadded Base64URL digest. Parse configured material without throwing during construction; invalid or absent generations become unavailable and fail only Secret operations.
+
+The first successful `createVersion` inserts the absent Keyring singleton with the configured current Key ID and `recordRevision = 0` in the same transaction. Later creation requires the stored Keyring ID to equal the configured current Key ID. Construction/restart never rewrites the Keyring: when a new current plus matching old previous generation are configured, old rows remain resolvable but creation stays `secret_locked` until explicit rotation. A missing Keyring cannot be rotated.
+
 - [ ] **Step 4: Implement two-key rotation and destruction**
 
-Rotation requires both configured generations and the singleton Keyring's exact `expectedRevision`, decrypts every non-destroyed old-key row, re-encrypts under fresh nonces/current key in one `BEGIN IMMEDIATE` transaction, verifies no old Key ID remains, increments the Keyring `recordRevision`, and rolls back all rows plus the Keyring on any error. Destruction requires `inspectSecretReferences(versionId)` to return empty and an exact `expectedRevision`; it overwrites ciphertext/nonce/tag with empty blobs and marks `destroyed` without deleting audit metadata.
+Rotation requires both valid, distinct configured generations, a stored Keyring whose current ID equals the configured previous generation, and the singleton Keyring's exact `expectedRevision`. It decrypts every non-destroyed old-key row, re-encrypts under fresh nonces/current key in one `BEGIN IMMEDIATE` transaction, verifies no old Key ID remains, increments the Keyring `recordRevision`, and rolls back all rows plus the Keyring on any error. Destruction requires `inspectSecretReferences(versionId)` to return empty and an exact `expectedRevision`; it overwrites ciphertext/nonce/tag with empty blobs and marks `destroyed` without deleting audit metadata.
+
+Missing, malformed, mismatched, tampered, destroyed, absent-Keyring, and invalid rotation-key conditions throw `DomainError("secret_locked")`. Store/Keyring optimistic mismatches throw `ApplicationError("revision_conflict", 409)`. `ManageSecretsService.destroyVersion` calls `assertPurgeAllowed(references.length)` before Store destruction, producing `DomainError("resource_in_use")` for referenced versions.
 
 - [ ] **Step 5: Make redaction registration dynamic**
 
