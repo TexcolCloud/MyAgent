@@ -103,7 +103,7 @@ describe("Model Registry lifecycle invariants", () => {
       auth: { type: "bearer", secret: { fromEnvironment: "OPENAI_API_KEY" } },
     });
 
-    if (revision.auth.type === "bearer") {
+    if (revision.auth.type === "bearer" && "fromEnvironment" in revision.auth.secret) {
       // @ts-expect-error Nested credential content must not be mutated in place.
       revision.auth.secret.fromEnvironment = "OPENAI_API_KEY";
       expect(revision.auth.secret.fromEnvironment).toBe("OPENAI_API_KEY");

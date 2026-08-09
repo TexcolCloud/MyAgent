@@ -27,11 +27,13 @@ const canonicalizeJson = canonicalizeModule as unknown as (
   input: unknown,
 ) => string | undefined;
 
-type DeepReadonly<T> = T extends readonly (infer Item)[]
-  ? readonly DeepReadonly<Item>[]
-  : T extends object
-    ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
-    : T;
+type DeepReadonly<T> = T extends string | number | boolean | bigint | symbol | null | undefined
+  ? T
+  : T extends readonly (infer Item)[]
+    ? readonly DeepReadonly<Item>[]
+    : T extends object
+      ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
+      : T;
 
 export type ResolvedGlobalConfig = DeepReadonly<
   Omit<GlobalConfig, "agentRoots" | "skillRoots"> & {

@@ -26,6 +26,27 @@ export interface RedactionOptions {
   maxStringLength?: number;
 }
 
+export interface DynamicRedactionRegistry {
+  register(value: string): void;
+  values(): readonly string[];
+}
+
+export class MutableDynamicRedactionRegistry implements DynamicRedactionRegistry {
+  private readonly registered = new Set<string>();
+
+  constructor(initialValues: readonly string[] = []) {
+    for (const value of initialValues) this.register(value);
+  }
+
+  register(value: string): void {
+    if (value.length > 0) this.registered.add(value);
+  }
+
+  values(): readonly string[] {
+    return Object.freeze([...this.registered]);
+  }
+}
+
 export function secrets(
   values: readonly string[],
   options: RedactionOptions = {},
