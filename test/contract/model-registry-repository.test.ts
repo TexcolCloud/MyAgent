@@ -100,6 +100,58 @@ describe("SqliteModelRegistryRepository", () => {
     });
   });
 
+  it("uses durable insertion order for equal-timestamp success and failed refreshes", () => {
+    usingFixture("discovery-equal-timestamp", ({ repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.recordDiscovery({
+        ...context("event-discovery-z", NOW),
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        generationId: discoveryGenerationId("dgn-z"),
+        expectedRevision: 0,
+        state: "fresh",
+        models: [{ id: "model-old" }],
+        expiresAt: LATER,
+      });
+
+      expect(repository.recordDiscovery({
+        ...context("event-discovery-m", NOW),
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        generationId: discoveryGenerationId("dgn-m"),
+        expectedRevision: 1,
+        state: "fresh",
+        models: [{ id: "model-new" }],
+        expiresAt: LATER,
+      })).toEqual({
+        connectionRevisionId: "pcr-a",
+        state: "fresh",
+        models: [{ id: "model-new" }],
+        fetchedAt: NOW,
+        expiresAt: LATER,
+      });
+
+      expect(repository.recordDiscovery({
+        ...context("event-discovery-a", NOW),
+        connectionRevisionId: connectionRevisionId("pcr-a"),
+        generationId: discoveryGenerationId("dgn-a"),
+        expectedRevision: 2,
+        state: "failed",
+        models: [],
+        error: { code: "provider_unavailable", status: 503 },
+      })).toEqual({
+        connectionRevisionId: "pcr-a",
+        state: "stale",
+        models: [{ id: "model-new" }],
+        fetchedAt: NOW,
+        expiresAt: LATER,
+        refreshError: {
+          code: "provider_unavailable",
+          status: 503,
+          traceId: "trace-test",
+        },
+      });
+    });
+  });
+
   it.each(["fresh", "empty"] as const)(
     "makes only the exact Connection revision verified after %s discovery",
     (state) => {
@@ -450,7 +502,7 @@ describe("SqliteModelRegistryRepository", () => {
     });
   });
 
-  it("rolls back terminal completion when atomic fallback enqueue conflicts", () => {
+  it("rolls back every completion write when the final audit insert conflicts", () => {
     usingFixture("verification-fallback", ({ db, repository }) => {
       repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
       repository.createProfile({
@@ -477,6 +529,22 @@ describe("SqliteModelRegistryRepository", () => {
         verifiedCapabilities: [],
         createdAt: LATER,
       });
+      db.prepare(
+        `INSERT INTO model_registry_events (
+           event_id, resource_type, resource_id, action,
+           payload_json, trace_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "event-complete-conflict",
+        "test_fixture",
+        "seed",
+        "seeded.conflict",
+        '{"seeded":true}',
+        "trace-seed",
+        LATER.toISOString(),
+      );
+      const verificationBefore = repository.getVerification(verificationId("ver-a"));
+      const auditCountBefore = count(db, "model_registry_events");
 
       expect(() => repository.completeVerification({
         ...context("event-complete-conflict", LATER),
@@ -493,14 +561,39 @@ describe("SqliteModelRegistryRepository", () => {
             "mpr-fallback",
             "event-fallback",
             LATER,
-            99,
+            1,
           ),
         },
-      })).toThrowError(expect.objectContaining({ code: "revision_conflict", status: 409 }));
-      expect(repository.getVerification(verificationId("ver-a")).state).toBe("running");
+      })).toThrowError(/UNIQUE constraint failed/);
+      expect(repository.getVerification(verificationId("ver-a"))).toEqual(verificationBefore);
+      expect(repository.getVerification(verificationId("ver-a"))).toMatchObject({
+        state: "running",
+        leaseOwner: "worker-a",
+        leaseExpiresAt: new Date("2026-08-09T00:02:00.000Z"),
+        fallbackVerificationId: null,
+        recordRevision: 2,
+      });
+      expect(repository.getProfile(profileId("profile-a"))).toMatchObject({
+        recordRevision: 1,
+        revisions: [expect.objectContaining({
+          revisionId: "mpr-a",
+          state: "verifying",
+        })],
+      });
+      expect(db.prepare(
+        `SELECT health_id FROM provider_health
+         WHERE connection_revision_id = ? AND profile_revision_id = ?`,
+      ).get("pcr-a", "mpr-a")).toBeUndefined();
       expect(db.prepare(
         "SELECT revision_id FROM model_profile_revisions WHERE revision_id = ?",
       ).get("mpr-fallback")).toBeUndefined();
+      expect(db.prepare(
+        "SELECT verification_id FROM model_verifications WHERE verification_id = ?",
+      ).get("ver-fallback")).toBeUndefined();
+      expect(db.prepare(
+        "SELECT event_id FROM model_registry_events WHERE event_id = ?",
+      ).get("event-fallback")).toBeUndefined();
+      expect(count(db, "model_registry_events")).toBe(auditCountBefore);
 
       const completed = repository.completeVerification({
         ...context("event-complete", LATER),

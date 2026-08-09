@@ -349,7 +349,7 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
               error_code, safe_status, trace_id
        FROM discovery_generations
        WHERE connection_revision_id = ?
-       ORDER BY created_at DESC, generation_id DESC
+       ORDER BY rowid DESC
        LIMIT 1`,
     ).get(revisionId) as unknown as DiscoveryGenerationRow | undefined;
     if (latest === undefined) {
@@ -1068,7 +1068,7 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
               error_code, safe_status, trace_id
        FROM discovery_generations
        WHERE connection_revision_id = ? AND state IN ('fresh', 'empty')
-       ORDER BY created_at DESC, generation_id DESC
+       ORDER BY rowid DESC
        LIMIT 1`,
     ).get(revisionId) as unknown as DiscoveryGenerationRow | undefined;
   }
