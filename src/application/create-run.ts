@@ -38,14 +38,13 @@ export class CreateRunService {
     const agentId = parseAgentId(command.agentId);
     const sessionKey = parseSessionKey(command.sessionKey);
     const idempotencyKey = parseIdempotencyKey(command.idempotencyKey);
-    const revision = this.agents.resolve(agentId);
     const result = this.runs.create({
       agentId,
       sessionKey,
       idempotencyKey,
       input: command.input,
       source: command.source,
-      revision,
+      resolveRevision: () => this.agents.resolve(agentId),
       occurredAt: this.clock.now(),
       allocateSessionId: () => this.ids.sessionId(),
       allocateRunId: () => this.ids.runId(),

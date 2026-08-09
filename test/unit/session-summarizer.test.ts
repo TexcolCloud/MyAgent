@@ -192,6 +192,67 @@ describe("SessionSummarizer", () => {
       content: "replacement summary",
     });
   });
+
+  it("does not advance a summary watermark across the current queued input", async () => {
+    const input = promptInput(revision(2_000));
+    const earlierRunId = runIdFromUuid(
+      "00000000-0000-7000-8000-000000000010",
+    );
+    const store = new MemorySessionStore([
+      message(0, "old context ".repeat(2_000), {
+        runId: earlierRunId,
+        runFifoSequence: 0,
+      }),
+      message(1, "current queued input must survive", {
+        runId: input.runId,
+        runFifoSequence: input.runFifoSequence,
+      }),
+      message(2, "late assistant output must survive", {
+        runId: earlierRunId,
+        runFifoSequence: 0,
+        role: "assistant",
+      }),
+    ]);
+    const model = new ScriptedModel();
+    model.script(completedText("prefix summary"));
+    const assembler = new PromptAssembler(store);
+    const summarizer = new SessionSummarizer({
+      assembler,
+      sessionStore: store,
+      model,
+      clock: new FakeClock(),
+    });
+
+    await summarizer.ensureWithinBudget(
+      input,
+      new AbortController().signal,
+    );
+
+    expect(store.currentSummary).toMatchObject({
+      sourceMessageFrom: 0,
+      sourceMessageTo: 0,
+    });
+    const summarizedHistory = model.requests[0]?.input.find(
+      (entry): entry is Extract<typeof entry, { type: "message" }> =>
+        entry.type === "message" && entry.name === "session_history",
+    );
+    expect(summarizedHistory?.content).not.toContain(
+      "late assistant output must survive",
+    );
+
+    const futureRequest = await assembler.build({
+      ...input,
+      runId: runIdFromUuid("00000000-0000-7000-8000-000000000100"),
+      runFifoSequence: 100,
+      input: { type: "text", text: "future input" },
+    });
+    const futureHistory = futureRequest.input.find(
+      (entry): entry is Extract<typeof entry, { type: "message" }> =>
+        entry.type === "message" && entry.name === "session_history",
+    );
+    expect(futureHistory?.content).toContain("current queued input must survive");
+    expect(futureHistory?.content).toContain("late assistant output must survive");
+  });
 });
 
 describe("SqliteSessionRepository summary attempt completion", () => {
@@ -280,7 +341,11 @@ class MemorySessionStore implements SessionStore {
   }
 }
 
-function message(sequence: number, text: string): SessionMessage {
+function message(
+  sequence: number,
+  text: string,
+  overrides: Partial<SessionMessage> = {},
+): SessionMessage {
   return {
     messageId: `message:${String(sequence)}`,
     sessionId: sessionIdFromUuid("00000000-0000-7000-8000-000000000001"),
@@ -292,6 +357,7 @@ function message(sequence: number, text: string): SessionMessage {
     role: "user",
     content: { type: "text", text },
     createdAt: new Date(sequence),
+    ...overrides,
   };
 }
 

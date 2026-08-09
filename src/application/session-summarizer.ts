@@ -73,14 +73,19 @@ export class SessionSummarizer {
     const currentSummary = this.options.sessionStore.getCurrentSummary(
       input.sessionId,
     );
-    const messages = this.options.sessionStore
+    const unsummarizedMessages = this.options.sessionStore
       .listMessagesThroughRun(input.sessionId, input.runFifoSequence)
       .filter(
         (message) =>
-          message.runId !== input.runId &&
-          (currentSummary === null ||
-            message.sequence > currentSummary.sourceMessageTo),
+          currentSummary === null ||
+          message.sequence > currentSummary.sourceMessageTo,
       );
+    const firstCurrentInput = unsummarizedMessages.findIndex(
+      (message) => message.runId === input.runId,
+    );
+    const messages = firstCurrentInput === -1
+      ? unsummarizedMessages
+      : unsummarizedMessages.slice(0, firstCurrentInput);
     if (messages.length === 0) {
       throw new DomainError("context_budget_exceeded");
     }

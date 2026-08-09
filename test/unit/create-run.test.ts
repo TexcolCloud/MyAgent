@@ -54,6 +54,48 @@ describe("CreateRunService", () => {
     }
   });
 
+  it("replays an existing Run without resolving its Agent again", () => {
+    const connection = openDatabase({ path: ":memory:", busyTimeoutMs: 5_000 });
+    try {
+      migrate(connection.db);
+      const runs = new SqliteRunRepository(
+        connection.db,
+        new SqliteCatalogRepository(connection.db),
+      );
+      const definition = catalogSnapshot.byId.get("primary" as AgentId)?.definition;
+      if (definition === undefined) throw new Error("missing_primary_fixture");
+      let resolutionAvailable = true;
+      let resolutionCount = 0;
+      const service = new CreateRunService(
+        {
+          resolve() {
+            resolutionCount += 1;
+            if (!resolutionAvailable) throw new Error("assignment_removed");
+            return resolvedRevision(definition);
+          },
+        },
+        runs,
+        new FakeClock(new Date("2026-08-07T00:00:00.000Z")),
+        new FakeIds({
+          sessionIds: [
+            sessionIdFromUuid("00000000-0000-7000-8000-000000000010"),
+          ],
+          runIds: [
+            runIdFromUuid("00000000-0000-7000-8000-000000000010"),
+          ],
+        }),
+      );
+
+      const first = service.execute(command());
+      resolutionAvailable = false;
+
+      expect(service.execute(command())).toEqual({ ...first, created: false });
+      expect(resolutionCount).toBe(1);
+    } finally {
+      connection.close();
+    }
+  });
+
   it("allows two Agents to reuse one Session Key without sharing a Session", () => {
     const harness = createHarness(catalogSnapshot, {
       sessionIds: [

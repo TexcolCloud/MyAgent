@@ -29,6 +29,7 @@ import type { FaultPoint } from "../../src/runtime/fault-injector.js";
 import type { ModelChunk, ModelPort, ModelRequest } from "../../src/ports/model.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
+import { noOpProviderHealthSink } from "../helpers/provider-health.js";
 import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { completedText, ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
@@ -95,6 +96,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             hookPoints.push(point);
@@ -174,6 +176,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
@@ -250,6 +253,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
@@ -318,6 +322,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock: workerClock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       worker = new RunWorker({
         runs,
@@ -414,6 +419,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock: workerClock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       worker = new RunWorker({
         runs,
@@ -489,10 +495,10 @@ describe("Run cancellation", () => {
       const occurredAt = clock.now().toISOString();
       connection.db.prepare(
         `INSERT INTO tool_calls (
-           tool_call_id, run_id, state, tool_name, effect, arguments_json,
+           tool_call_id, run_id, state, tool_name, provider_call_id, effect, arguments_json,
            canonical_arguments, arguments_sha256, policy_effect,
            policy_facts_json, created_at, updated_at
-         ) VALUES (?, ?, 'allowed', 'run_command', 'side_effect', '{}', '{}',
+         ) VALUES (?, ?, 'allowed', 'run_command', 'provider_cancel_505', 'side_effect', '{}', '{}',
            'cancel-digest', 'allow', '{}', ?, ?)`,
       ).run(toolCallId, runId, occurredAt, occurredAt);
       let startedResolve!: () => void;
@@ -529,6 +535,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
       });
       const executions = new ExecutionRegistry();
       const controller = new AbortController();
@@ -603,6 +610,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.advance(
@@ -665,6 +673,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             faultSnapshots.push({
@@ -786,6 +795,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.advance(

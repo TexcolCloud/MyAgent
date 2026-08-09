@@ -136,11 +136,27 @@ describe("delegation", () => {
       runs.claimNextEligible("parent-worker", clock.now(), new Date(clock.now().getTime() + 30_000));
       const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), providerCallId: "provider_delegate_idempotency", toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "e".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
       tools.beginExecution({ runId: parent.runId, toolCallId: call.toolCallId, leaseOwner: "parent-worker", occurredAt: clock.now() });
-      const service = new DelegateAgentService({ agents: resolvedAgents(new CatalogService(snapshot)), runs, clock, ids });
+      const availableAgents = resolvedAgents(new CatalogService(snapshot));
+      let resolutionAvailable = true;
+      let resolutionCount = 0;
+      const service = new DelegateAgentService({
+        agents: {
+          resolve(agentId) {
+            resolutionCount += 1;
+            if (!resolutionAvailable) throw new Error("model_provider_locked");
+            return availableAgents.resolve(agentId);
+          },
+        },
+        runs,
+        clock,
+        ids,
+      });
       const command = { parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "once", context: {}, leaseOwner: "parent-worker" } as const;
 
       const first = service.execute(command);
+      resolutionAvailable = false;
       expect(service.execute(command)).toEqual(first);
+      expect(resolutionCount).toBe(1);
       expect(connection.db.prepare("SELECT child_run_count FROM runs WHERE run_id = ?").get(parent.runId)).toEqual({ child_run_count: 1 });
     } finally { connection.close(); }
 

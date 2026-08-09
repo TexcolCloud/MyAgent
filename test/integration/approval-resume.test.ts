@@ -26,6 +26,7 @@ import {
 } from "../../src/domain/ids.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
+import { noOpProviderHealthSink } from "../helpers/provider-health.js";
 import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
@@ -318,6 +319,7 @@ describe("Approval and reconciliation resume", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.advance(
@@ -386,6 +388,7 @@ describe("Approval and reconciliation resume", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.advance(

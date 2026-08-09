@@ -19,7 +19,7 @@ export interface CreateStoredRunInput {
   idempotencyKey: IdempotencyKey;
   input: { type: "text"; text: string };
   source: { kind: "http"; externalId?: string };
-  revision: AgentRevisionSnapshot;
+  resolveRevision(): AgentRevisionSnapshot;
   occurredAt: Date;
   allocateSessionId(): SessionId;
   allocateRunId(): RunId;
@@ -78,10 +78,10 @@ export interface StartDelegationInput {
   parentChildRunLimit: number;
   parentDelegationDepthLimit: number;
   targetAgentId: AgentId;
-  targetRevision: AgentRevisionSnapshot;
+  resolveTargetRevision(): AgentRevisionSnapshot;
   childSessionKey: SessionKey;
-  childSessionId: SessionId;
-  childRunId: RunId;
+  allocateChildSessionId(): SessionId;
+  allocateChildRunId(): RunId;
   input: { type: "text"; text: string };
   occurredAt: Date;
 }

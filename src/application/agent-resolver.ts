@@ -59,11 +59,11 @@ export class AgentResolver implements AgentResolverPort {
     if (connectionView === undefined || connectionRevision === undefined) {
       throw new ApplicationError("verification_required", 422);
     }
-    const connectionUsable = assignment.source === "legacy_import"
-      ? connectionRevision.state === "legacy_trusted"
-      : connectionRevision.state === "active" ||
-        connectionRevision.state === "superseded" ||
-        connectionRevision.state === "retired";
+    const connectionUsable = connectionRevision.state === "active" ||
+      connectionRevision.state === "superseded" ||
+      connectionRevision.state === "retired" ||
+      (assignment.source === "legacy_import" &&
+        connectionRevision.state === "legacy_trusted");
     if (!connectionUsable) {
       throw new ApplicationError("verification_required", 422);
     }

@@ -37,6 +37,7 @@ import { RunWorker } from "../../src/runtime/run-worker.js";
 import { SystemClock } from "../../src/adapters/system-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
+import { noOpProviderHealthSink } from "../helpers/provider-health.js";
 import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { completedText, ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
@@ -70,7 +71,7 @@ describe("RunWorker", () => {
       const advance = new AdvanceRunService({
         runs, tools: new SqliteToolRepository(connection.db), approvals: new SqliteApprovalRepository(connection.db),
         sessions, model, prompts: new PromptAssembler(sessions), registry: new ToolRegistry(),
-        policy: new PolicyEngine(), clock, ids,
+        policy: new PolicyEngine(), clock, ids, modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({ runs, advance, clock, workerId: "worker-integration", concurrency: 1, leaseDurationMs: 1_000, idleDelayMs: 5 });
 
@@ -126,7 +127,7 @@ describe("RunWorker", () => {
       const advance = new AdvanceRunService({
         runs, tools: new SqliteToolRepository(connection.db), approvals: new SqliteApprovalRepository(connection.db),
         sessions, model, prompts: new PromptAssembler(sessions), registry,
-        policy: new PolicyEngine(), clock, ids,
+        policy: new PolicyEngine(), clock, ids, modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({ runs, advance, clock, workerId: "worker-tool", concurrency: 1, leaseDurationMs: 1_000, idleDelayMs: 5 });
 
@@ -208,6 +209,7 @@ describe("RunWorker", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({
         runs,
@@ -377,6 +379,7 @@ describe("RunWorker", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({
         runs,
@@ -464,6 +467,7 @@ describe("RunWorker", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({
         runs,
@@ -701,6 +705,7 @@ describe("RunWorker", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({
         runs,

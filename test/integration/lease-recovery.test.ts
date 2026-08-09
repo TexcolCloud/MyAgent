@@ -23,6 +23,7 @@ import {
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
+import { noOpProviderHealthSink } from "../helpers/provider-health.js";
 import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { completedText, ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
@@ -47,12 +48,12 @@ describe("lease recovery", () => {
       clock.advanceBy(1_000);
       for (const [run, call, effect, name] of [[side, "call-side", "side_effect", "run_command"], [read, "call-read", "read_only", "read_file"]] as const) {
         runs.claimNextEligible("old", clock.now(), new Date(clock.now().getTime() + 1));
-        connection.db.prepare(`INSERT INTO tool_calls (tool_call_id, run_id, state, tool_name, effect, arguments_json, canonical_arguments, arguments_sha256, policy_effect, policy_facts_json, created_at, updated_at) VALUES (?, ?, 'executing', ?, ?, '{}', '{}', 'digest', 'allow', '{}', ?, ?)`).run(call, run.runId, name, effect, clock.now().toISOString(), clock.now().toISOString());
+        connection.db.prepare(`INSERT INTO tool_calls (tool_call_id, run_id, state, tool_name, provider_call_id, effect, arguments_json, canonical_arguments, arguments_sha256, policy_effect, policy_facts_json, created_at, updated_at) VALUES (?, ?, 'executing', ?, ?, ?, '{}', '{}', 'digest', 'allow', '{}', ?, ?)`).run(call, run.runId, name, `provider-${call}`, effect, clock.now().toISOString(), clock.now().toISOString());
       }
       clock.advanceBy(2_000);
       const registry = new ToolRegistry();
       const fake = new FakeTool({ name: "read_file", effect: "read_only", normalizedArguments: {} }); registry.register(fake);
-      const service = new AdvanceRunService({ runs, tools, approvals: new SqliteApprovalRepository(connection.db), sessions, model: new ScriptedModel(), prompts: new PromptAssembler(sessions), registry, policy: new PolicyEngine(), clock, ids });
+      const service = new AdvanceRunService({ runs, tools, approvals: new SqliteApprovalRepository(connection.db), sessions, model: new ScriptedModel(), prompts: new PromptAssembler(sessions), registry, policy: new PolicyEngine(), clock, ids, modelRegistry: noOpProviderHealthSink });
       runs.claimNextEligible("recovery", clock.now(), new Date(clock.now().getTime() + 30_000));
       runs.claimNextEligible("recovery", clock.now(), new Date(clock.now().getTime() + 30_000));
 
@@ -136,6 +137,7 @@ describe("lease recovery", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             faultSnapshots.push({

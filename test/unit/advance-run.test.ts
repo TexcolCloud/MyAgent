@@ -9,7 +9,10 @@ import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { SqliteRunRepository } from "../../src/adapters/sqlite/run-repository.js";
 import { SqliteSessionRepository } from "../../src/adapters/sqlite/session-repository.js";
 import { SqliteToolRepository } from "../../src/adapters/sqlite/tool-repository.js";
-import { AdvanceRunService } from "../../src/application/advance-run.js";
+import {
+  AdvanceRunService,
+  type AdvanceRunServiceOptions,
+} from "../../src/application/advance-run.js";
 import { CreateRunService } from "../../src/application/create-run.js";
 import { PolicyEngine } from "../../src/application/policy-engine.js";
 import { PromptAssembler } from "../../src/application/prompt-assembler.js";
@@ -42,6 +45,7 @@ import type { FaultInjector, FaultPoint } from "../../src/runtime/fault-injector
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
+import { noOpProviderHealthSink } from "../helpers/provider-health.js";
 import { completedText, ScriptedModel, transientFailureAfter } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
@@ -51,6 +55,14 @@ describe("AdvanceRunService", () => {
   beforeAll(async () => {
     catalogSnapshot = await loadCatalog(
       path.resolve("test/fixtures/config/valid/myagent.yaml"),
+    );
+  });
+
+  it("requires a Provider Health sink at composition", () => {
+    expect(() => new AdvanceRunService({
+      modelRegistry: undefined,
+    } as unknown as AdvanceRunServiceOptions)).toThrow(
+      "provider_health_sink_required",
     );
   });
 
@@ -241,6 +253,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await service.advance(
@@ -257,6 +270,110 @@ describe("AdvanceRunService", () => {
       expect(fakeTool.executions).toBe(0);
       expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
         .toEqual(expect.arrayContaining(["tool.proposed", "tool.policy_decided"]));
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("fails the provider attempt before recording health for a malformed call ID", async () => {
+    const connection = openDatabase({
+      path: tempPath("advance-malformed-provider-call-id.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const runs = new SqliteRunRepository(
+        connection.db,
+        new SqliteCatalogRepository(connection.db),
+      );
+      const sessions = new SqliteSessionRepository(connection.db);
+      const tools = new SqliteToolRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const attemptId = attemptIdFromUuid(
+        "00000000-0000-7000-8000-000000000012",
+      );
+      const ids = new FakeIds({
+        sessionIds: [
+          sessionIdFromUuid("00000000-0000-7000-8000-000000000012"),
+        ],
+        runIds: [
+          runIdFromUuid("00000000-0000-7000-8000-000000000012"),
+        ],
+        attemptIds: [attemptId],
+      });
+      const created = new CreateRunService(
+        resolvedAgents(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:malformed-provider-call-id",
+        input: { type: "text", text: "propose a Tool" },
+        idempotencyKey: "advance-malformed-call-id-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const registry = new ToolRegistry();
+      registry.register(new FakeTool({
+        name: "read_file",
+        effect: "read_only",
+        normalizedArguments: { path: "report.md" },
+      }));
+      const model = new ScriptedModel();
+      model.script({
+        chunks: [
+          {
+            type: "tool_call",
+            callId: "call provider invalid",
+            name: "read_file",
+            arguments: { path: "report.md" },
+          },
+          { type: "completed", finishReason: "tool_call" },
+        ],
+      });
+      const health: RecordProviderHealthInput[] = [];
+      const service = new AdvanceRunService({
+        runs,
+        tools,
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        modelRegistry: {
+          recordProviderHealth(input): void {
+            health.push(input);
+          },
+        },
+      });
+
+      expect(await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).toEqual({ type: "terminal", runId: created.runId, state: "failed" });
+      expect(runs.getRun(created.runId)).toMatchObject({
+        state: "failed",
+        failure: { code: "model_protocol_error" },
+      });
+      expect(runs.getUnmatchedModelAttempt(created.runId)).toBeNull();
+      expect(tools.listForRun(created.runId)).toEqual([]);
+      expect(health).toEqual([
+        expect.objectContaining({
+          outcome: "failure",
+          code: "model_protocol_error",
+          traceId: attemptId,
+        }),
+      ]);
     } finally {
       connection.close();
     }
@@ -333,6 +450,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await expect(service.advance(
@@ -407,6 +525,7 @@ describe("AdvanceRunService", () => {
       const service = new AdvanceRunService({
         runs, tools, approvals, sessions, model, prompts: new PromptAssembler(sessions),
         registry, policy: new PolicyEngine(), clock, ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(created.runId, "worker-unit", new AbortController().signal);
@@ -418,6 +537,119 @@ describe("AdvanceRunService", () => {
         .toEqual(expect.arrayContaining(["tool.started", "tool.completed"]));
     } finally {
       connection.close();
+    }
+  });
+
+  it("fails a pre-migration null root call ID before side effects and across restart", async () => {
+    const databasePath = tempPath("advance-null-root-preflight.db");
+    const runId = runIdFromUuid("00000000-0000-7000-8000-000000000031");
+    const fakeTool = new FakeTool({
+      name: "write_file",
+      effect: "side_effect",
+      normalizedArguments: { path: "report.md", content: "unsafe" },
+    });
+    const firstConnection = openDatabase({
+      path: databasePath,
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(firstConnection.db);
+      const catalog = new SqliteCatalogRepository(firstConnection.db);
+      const runs = new SqliteRunRepository(firstConnection.db, catalog);
+      const sessions = new SqliteSessionRepository(firstConnection.db);
+      const tools = new SqliteToolRepository(firstConnection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [
+          sessionIdFromUuid("00000000-0000-7000-8000-000000000031"),
+        ],
+        runIds: [runId],
+        toolCallIds: [
+          toolCallIdFromUuid("00000000-0000-7000-8000-000000000031"),
+        ],
+      });
+      const created = new CreateRunService(
+        resolvedAgents(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:null-root-preflight",
+        input: { type: "text", text: "must not execute" },
+        idempotencyKey: "advance-null-root-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const toolCallId = ids.toolCallId();
+      firstConnection.db.prepare(
+        `INSERT INTO tool_calls (
+           tool_call_id, run_id, state, tool_name, provider_call_id, effect,
+           arguments_json, canonical_arguments, arguments_sha256,
+           policy_effect, matched_rule, policy_facts_json, created_at, updated_at
+         ) VALUES (?, ?, 'allowed', 'write_file', NULL, 'side_effect',
+           ?, ?, ?, 'allow', 0, '{}', ?, ?)`,
+      ).run(
+        toolCallId,
+        created.runId,
+        "{\"content\":\"unsafe\",\"path\":\"report.md\"}",
+        "{\"content\":\"unsafe\",\"path\":\"report.md\"}",
+        "3".repeat(64),
+        clock.now().toISOString(),
+        clock.now().toISOString(),
+      );
+      firstConnection.db.prepare(
+        "UPDATE runs SET tool_call_count = 1 WHERE run_id = ?",
+      ).run(created.runId);
+      const registry = new ToolRegistry();
+      registry.register(fakeTool);
+      const service = new AdvanceRunService({
+        runs,
+        tools,
+        approvals: new SqliteApprovalRepository(firstConnection.db),
+        sessions,
+        model: new ScriptedModel(),
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        modelRegistry: { recordProviderHealth(): void {} },
+      });
+
+      expect(await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).toEqual({ type: "terminal", runId: created.runId, state: "failed" });
+      expect(fakeTool.executions).toBe(0);
+      expect(runs.getRun(created.runId)).toMatchObject({
+        state: "failed",
+        failure: { code: "model_protocol_error" },
+      });
+    } finally {
+      firstConnection.close();
+    }
+
+    const restarted = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    try {
+      migrate(restarted.db);
+      const runs = new SqliteRunRepository(
+        restarted.db,
+        new SqliteCatalogRepository(restarted.db),
+      );
+      expect(runs.getRun(runId)).toMatchObject({
+        state: "failed",
+        failure: { code: "model_protocol_error" },
+      });
+      expect(fakeTool.executions).toBe(0);
+    } finally {
+      restarted.close();
     }
   });
 
@@ -454,6 +686,7 @@ describe("AdvanceRunService", () => {
       const service = new AdvanceRunService({
         runs, tools, approvals, sessions, model, prompts: new PromptAssembler(sessions), registry,
         policy: new PolicyEngine(), clock, ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await service.advance(created.runId, "worker-unit", new AbortController().signal))
@@ -545,6 +778,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(
@@ -629,6 +863,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await service.advance(
@@ -719,6 +954,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       await service.advance(
         created.runId,
@@ -818,6 +1054,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             if (point === "after_model_attempt_commit") throw crash;
@@ -920,6 +1157,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(
@@ -1024,6 +1262,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(
@@ -1160,6 +1399,7 @@ describe("AdvanceRunService", () => {
           policy: new PolicyEngine(),
           clock,
           ids,
+          modelRegistry: noOpProviderHealthSink,
         });
 
         await service.advance(
@@ -1256,6 +1496,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(
@@ -1359,6 +1600,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       await service.advance(
         created.runId,
@@ -1425,6 +1667,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       const advancing = service.advance(
@@ -1504,6 +1747,7 @@ describe("AdvanceRunService", () => {
         new Date(clock.now().getTime() + 30_000),
       );
       const model = new ScriptedModel();
+      const health: RecordProviderHealthInput[] = [];
       model.script(
         {
           chunks: [],
@@ -1543,6 +1787,11 @@ describe("AdvanceRunService", () => {
         clock,
         ids,
         faults,
+        modelRegistry: {
+          recordProviderHealth(input): void {
+            health.push(input);
+          },
+        },
       });
 
       expect(await service.advance(
@@ -1588,6 +1837,31 @@ describe("AdvanceRunService", () => {
         .toHaveLength(3);
       expect(eventTypes.filter((type) => type === "model.attempt.failed"))
         .toHaveLength(1);
+      expect(health.map(({ outcome, code, traceId }) => ({
+        outcome,
+        ...(code === undefined ? {} : { code }),
+        traceId,
+      }))).toEqual([
+        {
+          outcome: "failure",
+          code: "provider_overloaded",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000131",
+          ),
+        },
+        {
+          outcome: "success",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000132",
+          ),
+        },
+        {
+          outcome: "success",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000133",
+          ),
+        },
+      ]);
     } finally {
       connection.close();
     }
@@ -1677,6 +1951,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await expect(service.advance(
@@ -1754,6 +2029,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             if (point !== "after_model_attempt_commit") return;
@@ -1832,6 +2108,7 @@ describe("AdvanceRunService", () => {
         new Date(clock.now().getTime() + 30_000),
       );
       const model = new ScriptedModel();
+      const health: RecordProviderHealthInput[] = [];
       model.script({
         chunks: [],
         error: new ModelProviderError({
@@ -1852,6 +2129,11 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: {
+          recordProviderHealth(input): void {
+            health.push(input);
+          },
+        },
         faults: {
           async hit(point): Promise<void> {
             if (point === "after_model_attempt_commit") throw crash;
@@ -1870,6 +2152,15 @@ describe("AdvanceRunService", () => {
       expect(sessions.getCurrentSummary(created.sessionId)).toBeNull();
       expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
         .toEqual(expect.arrayContaining(["model.attempt.failed", "run.failed"]));
+      expect(health).toEqual([
+        expect.objectContaining({
+          outcome: "failure",
+          code: "provider_request_invalid",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000145",
+          ),
+        }),
+      ]);
     } finally {
       connection.close();
     }
@@ -1930,6 +2221,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             if (point === "after_model_attempt_commit") throw crash;

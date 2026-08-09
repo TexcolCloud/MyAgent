@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import canonicalizeModule from "canonicalize";
 import type { DatabaseSync } from "node:sqlite";
 
+import type { AgentRevisionSnapshot } from "../../domain/agent-revision.js";
 import type { RunEvent, RunEventType } from "../../domain/events.js";
 import type { AttemptId, RunId, SessionId } from "../../domain/ids.js";
 import type { JsonValue } from "../../domain/json.js";
@@ -89,7 +90,6 @@ export class SqliteRunRepository implements RunStore {
 
   create(input: CreateStoredRunInput): CreateStoredRunResult {
     return this.inImmediateTransaction(() => {
-      this.catalog.save(input.revision);
       const requestJson = canonicalize({
         agentId: input.agentId,
         sessionKey: input.sessionKey,
@@ -109,15 +109,17 @@ export class SqliteRunRepository implements RunStore {
         return { run, created: false };
       }
 
+      const revision = input.resolveRevision();
+      this.catalog.save(revision);
       const occurredAt = input.occurredAt.toISOString();
-      const sessionId = this.findOrCreateSession(input, occurredAt);
+      const sessionId = this.findOrCreateSession(input, revision, occurredAt);
       const runId = input.allocateRunId();
       const fifoSequence = this.nextRunSequence(sessionId);
       const inputJson = canonicalize(input.input);
       this.insertRun({
         runId,
         sessionId,
-        revisionId: input.revision.revisionId,
+        revisionId: revision.revisionId,
         fifoSequence,
         requestDigest,
         inputJson,
@@ -188,15 +190,18 @@ export class SqliteRunRepository implements RunStore {
       if (childCapacity.changes !== 1) {
         throw new DomainError("delegation_count_exceeded");
       }
-      this.catalog.save(input.targetRevision);
+      const targetRevision = input.resolveTargetRevision();
+      const childSessionId = input.allocateChildSessionId();
+      const childRunId = input.allocateChildRunId();
+      this.catalog.save(targetRevision);
       this.db.prepare(
         `INSERT INTO sessions (
           session_id, agent_id, session_key, agent_revision_id, owner_session_id,
           created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       ).run(
-        input.childSessionId, input.targetAgentId, input.childSessionKey,
-        input.targetRevision.revisionId, parent.run.sessionId, occurredAt, occurredAt,
+        childSessionId, input.targetAgentId, input.childSessionKey,
+        targetRevision.revisionId, parent.run.sessionId, occurredAt, occurredAt,
       );
       const inputJson = canonicalize(input.input);
       const requestDigest = createHash("sha256").update(canonicalize({
@@ -212,7 +217,7 @@ export class SqliteRunRepository implements RunStore {
           input_json, created_at, updated_at
         ) VALUES (?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
-        input.childRunId, input.childSessionId, input.targetRevision.revisionId,
+        childRunId, childSessionId, targetRevision.revisionId,
         input.parentRunId, input.rootRunId, input.parentDelegationDepth + 1,
         requestDigest, inputJson, occurredAt, occurredAt,
       );
@@ -221,8 +226,8 @@ export class SqliteRunRepository implements RunStore {
           message_id, session_id, run_id, sequence, run_fifo_sequence,
           role, content_json, created_at
         ) VALUES (?, ?, ?, 0, 0, 'user', ?, ?)`,
-      ).run(`message:${input.childRunId}`, input.childSessionId, input.childRunId, inputJson, occurredAt);
-      this.insertQueuedEvent(input.childRunId, occurredAt);
+      ).run(`message:${childRunId}`, childSessionId, childRunId, inputJson, occurredAt);
+      this.insertQueuedEvent(childRunId, occurredAt);
       const parentBlocked = this.db.prepare(
         `UPDATE runs
          SET blocked_by_child_run_id = ?, lease_owner = NULL, lease_expires_at = NULL,
@@ -230,15 +235,15 @@ export class SqliteRunRepository implements RunStore {
              updated_at = ?
          WHERE run_id = ? AND state = 'running' AND lease_owner = ?`,
       ).run(
-        input.childRunId, elapsedActiveSeconds(parent, input.occurredAt), occurredAt,
+        childRunId, elapsedActiveSeconds(parent, input.occurredAt), occurredAt,
         input.parentRunId, input.leaseOwner,
       );
       if (parentBlocked.changes !== 1) throw new DomainError("run_lease_lost");
       this.appendEventInTransaction(input.parentRunId, "delegation.started", canonicalize({
-        toolCallId: input.parentToolCallId, childRunId: input.childRunId,
+        toolCallId: input.parentToolCallId, childRunId,
         targetAgentId: input.targetAgentId,
       }), occurredAt);
-      return { childRunId: input.childRunId, childSessionId: input.childSessionId };
+      return { childRunId, childSessionId };
     });
   }
 
@@ -967,6 +972,7 @@ export class SqliteRunRepository implements RunStore {
 
   private findOrCreateSession(
     input: CreateStoredRunInput,
+    revision: AgentRevisionSnapshot,
     occurredAt: string,
   ): SessionId {
     const existing = this.db
@@ -987,7 +993,7 @@ export class SqliteRunRepository implements RunStore {
         sessionId,
         input.agentId,
         input.sessionKey,
-        input.revision.revisionId,
+        revision.revisionId,
         occurredAt,
         occurredAt,
       );

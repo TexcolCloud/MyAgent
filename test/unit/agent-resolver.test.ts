@@ -138,6 +138,26 @@ describe("AgentResolver", () => {
       .toThrowError(expect.objectContaining({ code: "verification_required", status: 422 }));
   });
 
+  it.each(["active", "superseded", "retired"] as const)(
+    "keeps an imported legacy assignment usable with a %s exact Connection",
+    (connectionState) => {
+      const fixture = registryFixture({
+        assignmentSource: "legacy_import",
+        profileState: "legacy_trusted",
+        connectionState,
+      });
+
+      expect(new AgentResolver({
+        catalog: { resolve: () => ({ id: agentId, definition }) },
+        registry: fixture.registry,
+        secrets: { resolve: () => "resolved-secret" },
+      }).resolve(agentId)).toMatchObject({
+        modelProfileRevisionId: oldProfileRevisionId,
+        model: { providerConnectionRevisionId: connectionRevisionId },
+      });
+    },
+  );
+
   it("uses a provider credential only as a lock check", () => {
     const plaintext = "provider-plaintext-must-not-persist";
     const fixture = registryFixture();

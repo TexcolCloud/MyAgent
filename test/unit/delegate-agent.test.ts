@@ -58,7 +58,7 @@ describe("delegate_agent", () => {
           run: { runId: runIdFromUuid("00000000-0000-7000-8000-000000000001"), rootRunId: runIdFromUuid("00000000-0000-7000-8000-000000000001"), delegationDepth: 0 },
           revision: { delegates: [parseAgentId("researcher")], limits: { childRuns: 4, delegationDepth: 1 } },
         }),
-        startDelegation: (value) => { input = value.input; targetRevision = value.targetRevision; return { childRunId: runIdFromUuid("00000000-0000-7000-8000-000000000002"), childSessionId: sessionIdFromUuid("00000000-0000-7000-8000-000000000002") }; },
+        startDelegation: (value) => { input = value.input; targetRevision = value.resolveTargetRevision(); return { childRunId: runIdFromUuid("00000000-0000-7000-8000-000000000002"), childSessionId: sessionIdFromUuid("00000000-0000-7000-8000-000000000002") }; },
       },
       clock: { now: () => new Date("2026-08-07T00:00:00.000Z") },
       ids: { sessionId: () => sessionIdFromUuid("00000000-0000-7000-8000-000000000002"), runId: () => runIdFromUuid("00000000-0000-7000-8000-000000000002") },

@@ -3,6 +3,7 @@ import { DomainError } from "../domain/errors.js";
 import type { AgentRevisionSnapshot } from "../domain/agent-revision.js";
 import type { JsonValue } from "../domain/json.js";
 import type { RunState } from "../domain/states.js";
+import { parseProviderCallId } from "../domain/tool-call.js";
 import type { ApprovalStore } from "../ports/approval-store.js";
 import type { Clock } from "../ports/clock.js";
 import type { IdGenerator } from "../ports/id-generator.js";
@@ -65,7 +66,7 @@ export interface AdvanceRunServiceOptions {
   policy: PolicyEngine;
   clock: Clock;
   ids: IdGenerator;
-  modelRegistry?: Pick<ModelRegistryStore, "recordProviderHealth">;
+  modelRegistry: Pick<ModelRegistryStore, "recordProviderHealth">;
   faults?: FaultInjector;
 }
 
@@ -81,6 +82,9 @@ export class AdvanceRunService {
   private readonly faults: FaultInjector;
 
   constructor(private readonly options: AdvanceRunServiceOptions) {
+    if (options.modelRegistry === undefined) {
+      throw new Error("provider_health_sink_required");
+    }
     this.faults = options.faults ?? noFaults;
   }
 
@@ -122,9 +126,6 @@ export class AdvanceRunService {
       if (cancellation === null) throw new DomainError("run_cancellation_not_requested");
       return cancellation;
     }
-    if (this.options.approvals.getPendingForRun(runId) !== null) {
-      return { type: "waiting", runId, state: "waiting_approval" };
-    }
     if (this.options.runs.getUnmatchedModelAttempt(runId) !== null) {
       const recovered = await this.commitModelAttempt(() =>
         this.options.runs.recoverUnmatchedModelAttempt({
@@ -136,6 +137,24 @@ export class AdvanceRunService {
       if (recovered !== null) return { type: "advanced", runId };
     }
     const toolCalls = this.options.tools.listForRun(runId);
+    let toolResults: ReturnType<typeof completedToolResults>;
+    try {
+      toolResults = completedToolResults(toolCalls);
+    } catch (error) {
+      if (!(error instanceof DomainError) || error.code !== "model_protocol_error") {
+        throw error;
+      }
+      this.options.runs.failRun({
+        runId,
+        leaseOwner,
+        code: error.code,
+        occurredAt: this.options.clock.now(),
+      });
+      return { type: "terminal", runId, state: "failed" };
+    }
+    if (this.options.approvals.getPendingForRun(runId) !== null) {
+      return { type: "waiting", runId, state: "waiting_approval" };
+    }
     const latestTool = toolCalls.at(-1) ?? null;
     if (latestTool?.state === "executing") {
       const recovered = this.options.tools.recoverExecuting({
@@ -257,7 +276,7 @@ export class AdvanceRunService {
       runFifoSequence: context.run.fifoSequence,
       input: context.input,
       activatedSkillNames: this.options.runs.listActivatedSkillNames(runId),
-      toolResults: completedToolResults(toolCalls),
+      toolResults,
       tools: modelToolDefinitions(this.options.registry),
     };
     const summaryAttemptIds = new Map<number, Parameters<RunStore["appendModelDelta"]>[2]>();
@@ -598,7 +617,7 @@ export class AdvanceRunService {
     attemptId: Parameters<RunStore["appendModelDelta"]>[2],
     error?: ModelProviderError,
   ): void {
-    this.options.modelRegistry?.recordProviderHealth({
+    this.options.modelRegistry.recordProviderHealth({
       connectionRevisionId: revision.model.providerConnectionRevisionId,
       profileRevisionId: revision.modelProfileRevisionId,
       outcome: error === undefined ? "success" : "failure",
@@ -696,7 +715,11 @@ export class AdvanceRunService {
           if (toolCall !== undefined) {
             throw protocolError();
           }
-          toolCall = chunk;
+          try {
+            toolCall = { ...chunk, callId: parseProviderCallId(chunk.callId) };
+          } catch {
+            throw protocolError();
+          }
         } else if (completed === undefined) {
           completed = chunk;
         } else {
