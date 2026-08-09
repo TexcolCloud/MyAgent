@@ -421,6 +421,43 @@ describe("OpenAiChatCompletionsModel", () => {
     }]);
   });
 
+  it("accepts a consistent function type marker on a Tool Call continuation", async () => {
+    const fake = await startServer([
+      frame({
+        tool_calls: [{
+          index: 0,
+          id: "call_",
+          type: "function",
+          function: { name: "read_", arguments: '{"pa' },
+        }],
+      }),
+      frame({
+        tool_calls: [{
+          index: 0,
+          id: "8",
+          type: "function",
+          function: { name: "file", arguments: 'th":"b"}' },
+        }],
+      }),
+      frame({}, "tool_calls"),
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(
+      adapter(fake.baseUrl).streamAttempt(
+        request(fake.baseUrl),
+        new AbortController().signal,
+      ),
+    );
+
+    expect(chunks).toContainEqual({
+      type: "tool_call",
+      callId: "call_8",
+      name: "read_file",
+      arguments: { path: "b" },
+    });
+  });
+
   it.each([
     ["stop", "completed"],
     ["length", "length"],
@@ -602,10 +639,30 @@ describe("OpenAiChatCompletionsModel", () => {
       ],
     },
     {
-      name: "a restarted full Tool Call ID and name",
+      name: "a repeated full Tool Call ID without a type marker",
       events: [
-        toolDelta({ id: "call_1", name: "read_file", arguments: "{}" }),
-        toolDelta({ id: "call_1", name: "read_file", arguments: "" }),
+        toolDelta({ id: "call_1", name: "read_", arguments: '{"path":' }),
+        frame({
+          tool_calls: [{
+            index: 0,
+            id: "call_1",
+            function: { name: "file", arguments: '"b"}' },
+          }],
+        }),
+        frame({}, "tool_calls"),
+      ],
+    },
+    {
+      name: "a repeated full Tool Call name without a type marker",
+      events: [
+        toolDelta({ id: "call_", name: "read_file", arguments: '{"path":' }),
+        frame({
+          tool_calls: [{
+            index: 0,
+            id: "1",
+            function: { name: "read_file", arguments: '"b"}' },
+          }],
+        }),
         frame({}, "tool_calls"),
       ],
     },
