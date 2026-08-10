@@ -206,3 +206,106 @@ GREEN evidence and covering tests:
   published by the new failure paths.
 - No migrations, worker lifecycle, test runner settings, timeouts, or unrelated
   routes changed.
+
+## Formal Fix Round 2/5
+
+### Status and Commits
+
+The remaining Important finding from the Round 1 review is resolved without
+changing the already-addressed Managed Secret transaction work.
+
+- Implementation commit: `ce11bee08e357c86f684aed4e10ab17ae4d4dbdd`.
+- Report commit: this report's final commit SHA is recorded in the Task 14 status
+  contract because a Git commit cannot contain its own final SHA.
+
+### Important: HTTP-Public Problem Authority Was Too Broad
+
+Finding: `CONTROL_PLANE_PROBLEM_CODES` existed but was not used as HTTP authority.
+`PUBLIC_PROBLEM_CODES` instead spread every `DomainErrorCode` and
+`ApplicationErrorCode`, so known internal diagnostics such as `file_changed` were
+still serialized as public 422 Problems.
+
+Resolution:
+
+- Added the explicit `M1_HTTP_PROBLEM_CODES` vocabulary for the established Run,
+  Approval, backup, reconciliation, config-reload, and Session boundary errors.
+- Defined `PublicProblemCode` from only `M1_HTTP_PROBLEM_CODES` plus the existing
+  `CONTROL_PLANE_PROBLEM_CODES`. The control-plane vocabulary is now the authority
+  for Task 13/14 lifecycle/resource Problems rather than dead metadata.
+- Kept `DomainErrorCode` and `ApplicationErrorCode` closed for internal construction,
+  while removing their broad spread into HTTP authority.
+- Kept provider runtime and the narrower Verification result vocabulary unchanged.
+- Internal known and unknown Domain errors now both reach the existing generic
+  `500 internal_error` projection without echoing their code, message, or details.
+
+The reviewed M1 public set preserves `agent_unavailable`, Approval resolution and
+lookup conflicts, backup conflicts/path validation, idempotency conflicts,
+reconciliation validation/conflicts, `restart_required`, Run lookup, Session
+lifecycle errors, and Tool Call reconciliation lookup/conflicts. The Task 13/14 set
+continues to preserve provider/profile/Verification lookup, URL validation,
+revision/resource conflicts, ownership/lifecycle validation, Secret locking, and
+Verification/assignment readiness codes.
+
+### RED/GREEN Evidence
+
+RED:
+
+- Command:
+  `npx vitest run test/unit/model-control-schemas.test.ts test/integration/http-model-control.test.ts test/integration/http-runs.test.ts --maxWorkers=1`
+  produced 1 failure and 42 passes. The known internal `file_changed` error returned
+  422 instead of the required generic 500; the unknown diagnostic case and allowed
+  Run behavior already passed.
+- `npm run typecheck` failed with an unused `@ts-expect-error`, proving
+  `file_changed` was still assignable to `PublicProblemCode`.
+
+GREEN:
+
+- The same focused command passed 3 files and 43 tests.
+- `test/integration/http-model-control.test.ts` proves both `file_changed` and an
+  unknown Domain code become generic 500 Problems with no code/message/details
+  echo. It also asserts the exact allowed `resource_in_use` status, title, detail,
+  trace ID, and safe owner categories.
+- `test/integration/http-runs.test.ts` asserts the exact existing
+  `422 agent_unavailable` Problem including its public detail.
+- `test/unit/model-control-schemas.test.ts` proves at compile time that
+  `file_changed` remains a valid internal `DomainErrorCode` but is not a
+  `PublicProblemCode`; provider, Verification, control-plane, and public types remain
+  distinct.
+- Compatibility command:
+  `npx vitest run test/integration/http-decisions.test.ts test/integration/backup.test.ts test/integration/http-auth.test.ts --maxWorkers=1`
+  passed 3 files and 22 tests, covering existing Approval, reconciliation, Session,
+  backup, authentication, malformed-request, and internal-error HTTP behavior.
+
+### Verification
+
+- Exact Task 14 command:
+  `npm run test:integration -- test/integration/http-model-control.test.ts test/integration/model-verification-worker.test.ts test/integration/model-assignments.test.ts test/integration/model-secret-leak.test.ts`
+  passed 23 files and 150 tests.
+- `npm run lint`: passed after the final test assertions.
+- `npm run typecheck`: passed after the final test assertions.
+- `npm run build`: passed, including migration-copy postbuild.
+- `git diff --check`: passed.
+- Serialized full-suite command, run exactly once:
+  `npm test -- --maxWorkers=1`.
+  It reached 72 passing files, 690 passing tests, and 5 skipped tests. The sole
+  failure was an unrelated timing failure in the unchanged
+  `test/integration/model-verification-worker.test.ts` case `aborts on shutdown and
+  reclaims the expired lease after restart`: `timed_out_waiting_for_condition` at
+  its existing 2-second polling deadline. That same file passed in the exact Task 14
+  command immediately before the full suite, and all 17 unchanged fault-boundary
+  E2E tests passed in the full run. Per instruction, the full suite was not retried
+  and no runner settings or timeouts were changed.
+
+### Self-Review
+
+- `PUBLIC_PROBLEM_CODES` contains no spread of `DOMAIN_ERROR_CODES` or
+  `APPLICATION_ERROR_CODES`.
+- Every current `ApplicationErrorCode` intentionally exposed by Run/Admin routes is
+  present through either the reviewed M1 or control-plane vocabulary.
+- Repository/worker/tool invariants such as file changes, lease loss, invalid state
+  transitions, provider protocol failures, and canonicalization failures are not
+  HTTP-authoritative.
+- Unknown and known-internal error codes, messages, and details are absent from the
+  Problem body.
+- Existing M1 and Task 13/14 public status/code/detail behavior is covered by focused
+  route tests and the complete integration suite.
