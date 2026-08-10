@@ -84,6 +84,8 @@ Task 16: review found 6 Important issues across runner argument routing, live-sm
 Task 16: fix rounds resolved all findings — focused regressions pass, cross-origin redirect proves the source was contacted and target was not, live Verification uses a configurable deadline, and final independent follow-up reports no remaining findings.
 Task 16: complete (release gates pass, review clean, no production `src` changes)
 Task 16: formal review reopened — Critical whole-system leakage proof is incomplete; Important gaps remain in Agent-specific Tool isolation, exact committed SSE replay, two-key rotation documentation, and startup-failure cleanup.
+Task 16: formal fix round 1/5 (5 addressed, 0 open — composed whole-system containment, dual Tool isolation, exact SSE replay, approved two-key semantics, and immediate partial-start cleanup; commits d3bcee3..d5e4bd9)
+Task 16: final complete (commits bad462d..d5e4bd9, formal review clean; release gates pass)
 Task 16: supersession — the earlier completion line predates formal review and is superseded by Formal Fix Round 1 evidence below.
 Task 16: Formal Fix Round 1 Critical resolved — composed containment proves raw provider fields entered the boundary and scans managed plaintext, raw reasoning/body, actual ciphertext encodings, and the actual Key ID across every required public, observable, durable, raw SQLite, and backup surface.
 Task 16: Formal Fix Round 1 Important resolved — Chat and Responses use distinct real Tools, call IDs, arguments, results, and Approval/execution histories under the same Session key, with positive-own and negative-other assertions.
