@@ -1097,37 +1097,65 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
 
   synchronizeAgents(input: SynchronizeAgentsInput): readonly ModelAssignment[] {
     return this.immediate(() => {
-      const unassigned: AgentId[] = [];
-      const seen = new Set<string>();
-      for (const agentId of input.agentIds) {
-        if (seen.has(agentId)) continue;
-        seen.add(agentId);
-        if (this.assignmentRow(agentId) === undefined) unassigned.push(agentId);
+      const firstSeen: Array<SynchronizeAgentsInput["agents"][number]> = [];
+      const inputAgentIds = new Set<AgentId>();
+      for (const agent of input.agents) {
+        if (inputAgentIds.has(agent.agentId)) continue;
+        inputAgentIds.add(agent.agentId);
+        if (!this.agentWasSynchronized(agent.agentId)) firstSeen.push(agent);
       }
-      if (unassigned.length === 0) return [];
-      const defaultProfile = this.getDefaultProfile();
-      if (defaultProfile === null) return [];
-      const profile = this.getProfile(defaultProfile.profileId);
-      if (profile.activeRevisionId === null) {
-        throw new DomainError("model_assignment_required");
+      if (firstSeen.length === 0) return [];
+
+      const needsAssignment = firstSeen.some(
+        ({ agentId }) => this.assignmentRow(agentId) === undefined,
+      );
+      let defaultRevisionId: ModelProfileRevisionId | undefined;
+      if (needsAssignment) {
+        const defaultProfile = this.getDefaultProfile();
+        if (defaultProfile !== null) {
+          const profile = this.getProfile(defaultProfile.profileId);
+          if (profile.activeRevisionId === null) {
+            throw new DomainError("model_assignment_required");
+          }
+          this.assertAssignmentEligible(profile.activeRevisionId);
+          defaultRevisionId = profile.activeRevisionId;
+        }
       }
-      this.assertAssignmentEligible(profile.activeRevisionId);
+
       const created: ModelAssignment[] = [];
-      for (const agentId of unassigned) {
-        const result = this.db.prepare(
-          `INSERT INTO model_assignments (
-             agent_id, model_profile_revision_id, source,
-             record_revision, updated_at
-           ) VALUES (?, ?, 'default', 0, ?)
-           ON CONFLICT(agent_id) DO NOTHING`,
-        ).run(agentId, profile.activeRevisionId, input.now.toISOString());
-        if (result.changes === 1) created.push(this.getRequiredAssignment(agentId));
+      for (const agent of firstSeen) {
+        let assignment = this.assignmentRow(agent.agentId);
+        if (assignment === undefined && defaultRevisionId !== undefined) {
+          this.db.prepare(
+            `INSERT INTO model_assignments (
+               agent_id, model_profile_revision_id, source,
+               record_revision, updated_at
+             ) VALUES (?, ?, 'default', 0, ?)`,
+          ).run(agent.agentId, defaultRevisionId, input.now.toISOString());
+          const createdAssignment = this.getRequiredAssignment(agent.agentId);
+          created.push(createdAssignment);
+          assignment = this.assignmentRow(agent.agentId);
+        }
+        this.appendAudit(
+          {
+            eventId: agent.eventId,
+            traceId: input.traceId,
+            now: input.now,
+          },
+          "agent",
+          agent.agentId,
+          "agent.synchronized",
+          {
+            assignment: assignment === undefined
+              ? null
+              : {
+                  profileRevisionId: assignment.model_profile_revision_id,
+                  recordRevision: assignment.record_revision,
+                  source: assignment.source,
+                },
+          },
+        );
       }
-      this.appendAudit(input, "model_assignment", "synchronize", "assignment.synchronized", {
-        resourceIds: created.map(({ agentId }) => agentId),
-        previousRecordRevision: null,
-        newRecordRevision: 0,
-      });
       return created;
     });
   }
@@ -1681,6 +1709,17 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
               record_revision, updated_at
        FROM model_assignments WHERE agent_id = ?`,
     ).get(agentId) as unknown as AssignmentRow | undefined;
+  }
+
+  private agentWasSynchronized(agentId: AgentId): boolean {
+    return this.db.prepare(
+      `SELECT 1
+       FROM model_registry_events INDEXED BY model_registry_events_by_resource
+       WHERE resource_type = 'agent'
+         AND resource_id = ?
+         AND action = 'agent.synchronized'
+       LIMIT 1`,
+    ).get(agentId) !== undefined;
   }
 
   private getRequiredAssignment(agentId: AgentId): ModelAssignment {

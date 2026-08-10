@@ -1270,8 +1270,18 @@ describe("SqliteModelRegistryRepository", () => {
       })).toEqual({ profileId: "assistant", recordRevision: 0 });
 
       expect(repository.synchronizeAgents({
-        ...context("event-sync", LATER),
-        agentIds: [agentId("primary"), agentId("researcher")],
+        agents: [
+          {
+            agentId: agentId("primary"),
+            eventId: "event-sync-primary" as ModelRegistryEventId,
+          },
+          {
+            agentId: agentId("researcher"),
+            eventId: "event-sync-researcher" as ModelRegistryEventId,
+          },
+        ],
+        traceId: "trace-test",
+        now: LATER,
       })).toEqual([
         expect.objectContaining({
           agentId: "researcher",

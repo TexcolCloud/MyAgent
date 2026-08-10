@@ -147,8 +147,15 @@ export interface SetModelAssignmentInput extends MutationContext {
   readonly expectedRevision: number;
 }
 
-export interface SynchronizeAgentsInput extends MutationContext {
-  readonly agentIds: readonly AgentId[];
+export interface SynchronizeAgentInput {
+  readonly agentId: AgentId;
+  readonly eventId: ModelRegistryEventId;
+}
+
+export interface SynchronizeAgentsInput {
+  readonly agents: readonly SynchronizeAgentInput[];
+  readonly traceId: string;
+  readonly now: Date;
 }
 
 export interface RetireConnectionInput extends MutationContext {

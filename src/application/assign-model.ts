@@ -81,9 +81,18 @@ export class AssignModelService {
   }
 
   synchronizeAgents(agentIds: readonly AgentId[]): readonly ModelAssignment[] {
+    const seen = new Set<AgentId>();
+    const agents = [];
+    for (const agentId of agentIds) {
+      if (seen.has(agentId)) continue;
+      seen.add(agentId);
+      agents.push({
+        agentId,
+        eventId: this.ids.modelRegistryEventId(),
+      });
+    }
     return this.registry.synchronizeAgents({
-      agentIds,
-      eventId: this.ids.modelRegistryEventId(),
+      agents,
       traceId: "catalog.synchronize_agents",
       now: this.clock.now(),
     });
