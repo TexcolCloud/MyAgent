@@ -1,12 +1,32 @@
 export interface CliClientOptions {
   baseUrl: string;
-  bearerToken: string;
+  bearerToken?: string;
+  adminToken?: string;
   fetcher?: typeof fetch;
 }
 
 export class CliHttpError extends Error {
-  constructor(readonly status: number, readonly code: string, readonly detail: string) {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    readonly detail: string,
+    readonly traceId: string,
+  ) {
     super(`${code}: ${detail}`);
+  }
+}
+
+export class CliCredentialError extends Error {
+  readonly code: string;
+  readonly detail: string;
+  readonly traceId = "cli";
+
+  constructor(authority: "run" | "admin") {
+    super(`${authority}_token_required`);
+    this.code = `${authority}_token_required`;
+    this.detail = authority === "admin"
+      ? "Admin authentication is required."
+      : "Run authentication is required.";
   }
 }
 
@@ -19,11 +39,19 @@ export class CliClient {
     this.baseUrl = options.baseUrl.replace(/\/$/u, "");
   }
 
-  async request<T>(path: string, init: { method?: string; body?: unknown; idempotencyKey?: string } = {}): Promise<T> {
+  async request<T>(path: string, init: {
+    method?: string;
+    body?: unknown;
+    idempotencyKey?: string;
+    authority?: "run" | "admin";
+  } = {}): Promise<T> {
+    const authority = init.authority ?? "run";
+    const token = authority === "admin" ? this.options.adminToken : this.options.bearerToken;
+    if (token === undefined || token.length === 0) throw new CliCredentialError(authority);
     const response = await this.fetcher(`${this.baseUrl}${path}`, {
       method: init.method ?? "GET",
       headers: {
-        authorization: `Bearer ${this.options.bearerToken}`,
+        authorization: `Bearer ${token}`,
         ...(init.idempotencyKey === undefined ? {} : { "idempotency-key": init.idempotencyKey }),
         ...(init.body === undefined ? {} : { "content-type": "application/json" }),
       },
@@ -35,9 +63,13 @@ export class CliClient {
   }
 
   stream(path: string, lastEventId?: string): Promise<Response> {
+    const token = this.options.bearerToken;
+    if (token === undefined || token.length === 0) {
+      return Promise.reject(new CliCredentialError("run"));
+    }
     return this.fetcher(`${this.baseUrl}${path}`, {
       headers: {
-        authorization: `Bearer ${this.options.bearerToken}`,
+        authorization: `Bearer ${token}`,
         ...(lastEventId === undefined ? {} : { "last-event-id": lastEventId }),
       },
     });
@@ -46,9 +78,14 @@ export class CliClient {
 
 async function problem(response: Response): Promise<CliHttpError> {
   try {
-    const value = await response.json() as { code?: unknown; detail?: unknown };
-    return new CliHttpError(response.status, typeof value.code === "string" ? value.code : "http_error", typeof value.detail === "string" ? value.detail : "The request failed.");
+    const value = await response.json() as { code?: unknown; detail?: unknown; traceId?: unknown };
+    return new CliHttpError(
+      response.status,
+      typeof value.code === "string" ? value.code : "http_error",
+      typeof value.detail === "string" ? value.detail : "The request failed.",
+      typeof value.traceId === "string" ? value.traceId : "unknown",
+    );
   } catch {
-    return new CliHttpError(response.status, "http_error", "The request failed.");
+    return new CliHttpError(response.status, "http_error", "The request failed.", "unknown");
   }
 }

@@ -112,7 +112,7 @@ describe("CLI HTTP boundary", () => {
       },
       fetcher,
       write,
-    })).resolves.toBeUndefined();
+    })).resolves.toBe(0);
 
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(write).toHaveBeenCalledWith('{"type":"run.completed"}');
@@ -155,6 +155,7 @@ describe("CLI HTTP boundary", () => {
   it("parses Problem Details when explicit connection options are rejected", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
     const harness = await startTestApp();
+    const output: string[] = [];
     try {
       await expect(executeCli([
         "agents",
@@ -166,12 +167,11 @@ describe("CLI HTTP boundary", () => {
       ], {
         environment: {},
         fetcher: injectFetcher(harness.app),
-        write: vi.fn(),
-      })).rejects.toMatchObject({
-        status: 401,
-        code: "unauthorized",
-        detail: "Authentication is required.",
-      });
+        write: (line) => output.push(line),
+        writeError: (line) => output.push(line),
+      })).resolves.toBe(3);
+      expect(output).toHaveLength(1);
+      expect(output[0]).toMatch(/^unauthorized: Authentication is required\. \(traceId: .+\)$/u);
     } finally {
       await harness.close();
     }

@@ -1,0 +1,333 @@
+import { Writable } from "node:stream";
+import { createInterface } from "node:readline/promises";
+
+import type { CliClient } from "../client.js";
+import { writeJson, writeProblem, type CliWrite } from "../formatters.js";
+import { pollVerification, type VerificationView } from "./models.js";
+
+export interface CliPrompt {
+  select<T extends string>(message: string, choices: readonly T[]): Promise<T>;
+  input(message: string, initial?: string): Promise<string>;
+  secret(message: string): Promise<string>;
+  confirm(message: string): Promise<boolean>;
+}
+
+interface ProviderResponse {
+  readonly connectionId: string;
+  readonly recordRevision: number;
+  readonly revisions: readonly [{
+    readonly revisionId: string;
+    readonly baseUrl: string;
+    readonly protocolPreference: "chat_completions" | "responses";
+  }];
+}
+
+interface DiscoveryResponse {
+  readonly recordRevision: number;
+  readonly state: "fresh" | "stale" | "empty" | "unsupported" | "failed";
+  readonly models: readonly { readonly id: string }[];
+  readonly error: { readonly code: string; readonly traceId: string } | null;
+}
+
+interface ProfileResponse {
+  readonly profileId: string;
+  readonly recordRevision: number;
+  readonly revisions: readonly [{
+    readonly revisionId: string;
+    readonly invocationProtocol: "chat_completions" | "responses";
+    readonly maxInputTokens: number;
+    readonly contextWindowSource: "preset" | "operator" | "assumed_32768";
+  }];
+}
+
+export async function setupModel(
+  client: CliClient,
+  prompt: CliPrompt,
+  sleep: (milliseconds: number) => Promise<void>,
+  write: CliWrite,
+  json: boolean,
+): Promise<number> {
+  // 1. Select provider preset.
+  const selectedKind = await prompt.select("Provider", ["openai", "deepseek", "custom"] as const);
+  const kind = selectedKind === "custom" ? "openai_compatible" : selectedKind;
+  const preset = presets[selectedKind];
+
+  // 2. Collect the immutable connection destination and credential reference.
+  const slug = requiredAnswer(await prompt.input("Provider slug", selectedKind));
+  const displayName = requiredAnswer(await prompt.input("Provider display name", title(selectedKind)));
+  const baseUrl = requiredAnswer(await prompt.input("Base URL", preset.baseUrl));
+  const authChoices = selectedKind === "custom"
+    ? ["environment", "managed_secret", "none"] as const
+    : ["environment", "managed_secret"] as const;
+  const authMode = await prompt.select("Provider auth", authChoices);
+  const credential = authMode === "environment"
+    ? { auth: { type: "environment" as const, fromEnvironment: requiredAnswer(await prompt.input("API key environment variable")) } }
+    : authMode === "managed_secret"
+      ? { auth: { type: "api_key" as const }, apiKey: requiredAnswer(await prompt.secret("API key")) }
+      : { auth: { type: "none" as const } };
+
+  // 3. Persist the connection draft and optional managed Secret version.
+  const connection = await client.request<ProviderResponse>("/v1/admin/provider-connections", {
+    authority: "admin",
+    method: "POST",
+    body: {
+      slug,
+      displayName,
+      kind,
+      baseUrl,
+      ...credential,
+      protocolPreference: preset.protocol,
+    },
+  });
+  const connectionRevision = connection.revisions.at(-1);
+  if (connectionRevision === undefined) throw new Error("invalid_control_plane_response");
+
+  // 4. Discover models; manual entry is offered only for safe terminal discovery states.
+  const discovery = await client.request<DiscoveryResponse>(`/v1/admin/provider-connection-revisions/${encodeURIComponent(connectionRevision.revisionId)}/discover`, {
+    authority: "admin",
+    method: "POST",
+    body: { expectedRevision: connection.recordRevision },
+  });
+  if (discovery.state === "failed") {
+    writeProblem(write, {
+      code: discovery.error?.code ?? "provider_unavailable",
+      detail: "Provider model discovery failed.",
+      traceId: discovery.error?.traceId ?? "unknown",
+    }, json);
+    return 5;
+  }
+  const manual = discovery.state === "empty" || discovery.state === "unsupported";
+  if (!manual && discovery.models.length === 0) throw new Error("invalid_control_plane_response");
+
+  // 5. Select the model and resolve an explicit context source.
+  const modelId = manual
+    ? requiredAnswer(await prompt.input("Model ID"))
+    : await prompt.select("Model", discovery.models.map((model) => model.id));
+  const profileSlug = requiredAnswer(await prompt.input("Model profile slug", slugFor(modelId)));
+  const profileName = requiredAnswer(await prompt.input("Model profile display name", modelId));
+  const contextSource = await prompt.select("Context source", ["preset", "operator", "assumed_32768"] as const);
+  const context = contextSource === "operator"
+    ? { maxInputTokens: positiveInteger(await prompt.input("Maximum input tokens")), contextWindowSource: contextSource }
+    : contextSource === "assumed_32768"
+      ? { maxInputTokens: 32_768, contextWindowSource: contextSource }
+      : {};
+  const profile = await client.request<ProfileResponse>("/v1/admin/model-profiles", {
+    authority: "admin",
+    method: "POST",
+    body: {
+      slug: profileSlug,
+      displayName: profileName,
+      connectionRevisionId: connectionRevision.revisionId,
+      modelId,
+      protocol: connectionRevision.protocolPreference,
+      ...context,
+      ...(manual ? { manualEntryAcknowledged: true } : {}),
+    },
+  });
+  const profileRevision = profile.revisions.at(-1);
+  if (profileRevision === undefined) throw new Error("invalid_control_plane_response");
+  if (!await prompt.confirm(`Use resolved context limit of ${profileRevision.maxInputTokens} tokens from ${profileRevision.contextWindowSource}?`)) {
+    writeSetupResult(write, json, { status: "cancelled", traceId: "cli" });
+    return 0;
+  }
+
+  // 6. Queue and poll Verification through the control-plane operation URL.
+  const queued = await client.request<{ readonly operationUrl: string }>(`/v1/admin/model-profile-revisions/${encodeURIComponent(profileRevision.revisionId)}/verifications`, {
+    authority: "admin",
+    method: "POST",
+    body: { expectedRevision: profile.recordRevision, capabilityBaseline: "text_and_single_tool_call_v1" },
+  });
+  const verification = await pollVerification(client, queued.operationUrl, sleep);
+
+  // 7. Resolve the optional post-promotion intent and visibly review every safety field.
+  const makeDefault = await prompt.confirm("Make this model profile the default after Promotion?");
+  const affectedAgents = parseAgents(await prompt.input("Agent IDs to bind after Promotion (comma-separated, blank for none)"));
+  let currentProfile: ProfileResponse | undefined;
+  let defaultExpectedRevision: number | undefined;
+  const assignmentExpectedRevisions = new Map<string, number>();
+  if (verification.status === "passed") {
+    currentProfile = await client.request<ProfileResponse>(`/v1/admin/model-profiles/${encodeURIComponent(profileSlug)}`, { authority: "admin" });
+    if (makeDefault) {
+      const currentDefault = await client.request<{ readonly recordRevision: number | null }>("/v1/admin/default-model-profile", { authority: "admin" });
+      defaultExpectedRevision = currentDefault.recordRevision ?? 0;
+    }
+    for (const agentId of affectedAgents) {
+      const assignment = await client.request<{ readonly recordRevision: number | null }>(`/v1/admin/agents/${encodeURIComponent(agentId)}/model-assignment`, { authority: "admin" });
+      assignmentExpectedRevisions.set(agentId, assignment.recordRevision ?? 0);
+    }
+  }
+  const review = reviewValue(baseUrl, authMode, modelId, profileRevision, verification, affectedAgents);
+  writeReview(write, json, review);
+  if (verification.status === "cancelled") {
+    writeSetupResult(write, json, { status: "cancelled", traceId: verification.traceId });
+    return 0;
+  }
+  if (verification.status !== "passed") {
+    writeProblem(write, {
+      code: verification.resultCode ?? "verification_failed",
+      detail: "Model verification failed.",
+      traceId: verification.traceId,
+    }, json);
+    return 5;
+  }
+
+  // 8. Promotion is the first point at which active state may change.
+  const promote = await prompt.confirm("Promote the verified connection and model profile?");
+  if (!promote) {
+    writeSetupResult(write, json, { status: "cancelled", traceId: verification.traceId });
+    return 0;
+  }
+  if (currentProfile === undefined) throw new Error("invalid_control_plane_response");
+  await client.request(`/v1/admin/provider-connections/${encodeURIComponent(slug)}/promotions`, {
+    authority: "admin",
+    method: "POST",
+    body: { connectionRevisionId: connectionRevision.revisionId, expectedRevision: discovery.recordRevision },
+  });
+  await client.request(`/v1/admin/model-profiles/${encodeURIComponent(profileSlug)}/promotions`, {
+    authority: "admin",
+    method: "POST",
+    body: { profileRevisionId: profileRevision.revisionId, expectedRevision: currentProfile.recordRevision },
+  });
+
+  // 9. Default and Agent assignment mutations are separate and explicitly optional.
+  if (makeDefault) {
+    if (defaultExpectedRevision === undefined) throw new Error("invalid_control_plane_response");
+    await client.request("/v1/admin/default-model-profile", {
+      authority: "admin",
+      method: "PUT",
+      body: { profileId: profileSlug, expectedRevision: defaultExpectedRevision },
+    });
+  }
+  for (const agentId of affectedAgents) {
+    const expectedRevision = assignmentExpectedRevisions.get(agentId);
+    if (expectedRevision === undefined) throw new Error("invalid_control_plane_response");
+    await client.request(`/v1/admin/agents/${encodeURIComponent(agentId)}/model-assignment`, {
+      authority: "admin",
+      method: "PUT",
+      body: { modelProfileRevisionId: profileRevision.revisionId, expectedRevision },
+    });
+  }
+  writeSetupResult(write, json, { status: "configured", profileId: profileSlug, traceId: verification.traceId });
+  return 0;
+}
+
+export function createConsolePrompt(): CliPrompt {
+  return {
+    async select<T extends string>(message: string, choices: readonly T[]): Promise<T> {
+      for (;;) {
+        const answer = await visibleQuestion(`${message} (${choices.join("/")})`);
+        const numeric = Number(answer);
+        const selected = Number.isInteger(numeric) && numeric >= 1 ? choices[numeric - 1] : undefined;
+        if (selected !== undefined) return selected;
+        if (choices.includes(answer as T)) return answer as T;
+      }
+    },
+    async input(message: string, initial?: string): Promise<string> {
+      const answer = await visibleQuestion(initial === undefined ? message : `${message} [${initial}]`);
+      return answer.length === 0 && initial !== undefined ? initial : answer;
+    },
+    async secret(message: string): Promise<string> {
+      process.stderr.write(`${message}: `);
+      const sink = new Writable({ write: (_chunk, _encoding, callback) => callback() });
+      const reader = createInterface({ input: process.stdin, output: sink, terminal: true });
+      try {
+        return await reader.question("");
+      } finally {
+        reader.close();
+        process.stderr.write("\n");
+      }
+    },
+    async confirm(message: string): Promise<boolean> {
+      const answer = (await visibleQuestion(`${message} [y/N]`)).toLowerCase();
+      return answer === "y" || answer === "yes";
+    },
+  };
+}
+
+const presets = {
+  openai: { baseUrl: "https://api.openai.com/v1", protocol: "responses" as const },
+  deepseek: { baseUrl: "https://api.deepseek.com", protocol: "responses" as const },
+  custom: { baseUrl: "", protocol: "chat_completions" as const },
+};
+
+async function visibleQuestion(message: string): Promise<string> {
+  const reader = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return await reader.question(`${message}: `);
+  } finally {
+    reader.close();
+  }
+}
+
+function reviewValue(
+  destination: string,
+  auth: string,
+  model: string,
+  profile: ProfileResponse["revisions"][number],
+  verification: VerificationView,
+  affectedAgents: readonly string[],
+) {
+  const warnings = [
+    ...(verification.resultCode === null
+      ? []
+      : [`${verification.resultCode}${verification.safeStatus == null ? "" : ` (HTTP ${verification.safeStatus})`}`]),
+    ...(verification.fallbackProfileRevisionId == null
+      ? []
+      : [`Fallback candidate: ${verification.fallbackProfileRevisionId}`]),
+  ];
+  return {
+    destination,
+    auth,
+    model,
+    protocol: profile.invocationProtocol,
+    capabilities: verification.capabilities,
+    usage: verification.usage ?? null,
+    contextSource: profile.contextWindowSource,
+    affectedAgents,
+    warnings,
+  };
+}
+
+function writeReview(write: CliWrite, json: boolean, review: ReturnType<typeof reviewValue>): void {
+  if (json) {
+    writeJson(write, { status: "review", ...review });
+    return;
+  }
+  write(`Destination: ${review.destination}`);
+  write(`Auth: ${review.auth}`);
+  write(`Model: ${review.model}`);
+  write(`Protocol: ${review.protocol}`);
+  write(`Capabilities: ${review.capabilities.length === 0 ? "none" : review.capabilities.join(", ")}`);
+  write(`Usage: ${review.usage === null ? "unavailable" : `${review.usage.inputTokens} input, ${review.usage.outputTokens} output`}`);
+  write(`Context source: ${review.contextSource}`);
+  write(`Affected Agents: ${review.affectedAgents.length === 0 ? "none" : review.affectedAgents.join(", ")}`);
+  write(`Warnings: ${review.warnings.length === 0 ? "none" : review.warnings.join(", ")}`);
+}
+
+function writeSetupResult(write: CliWrite, json: boolean, value: Record<string, unknown>): void {
+  if (json) writeJson(write, value);
+  else write(value.status === "cancelled" ? "Setup cancelled." : JSON.stringify(value));
+}
+
+function requiredAnswer(value: string): string {
+  if (value.trim().length === 0) throw new Error("missing_interactive_value");
+  return value.trim();
+}
+
+function positiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("invalid_positive_integer");
+  return parsed;
+}
+
+function parseAgents(value: string): string[] {
+  return [...new Set(value.split(",").map((agent) => agent.trim()).filter((agent) => agent.length > 0))];
+}
+
+function slugFor(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9_-]+/gu, "-").replace(/^-|-$/gu, "") || "model";
+}
+
+function title(value: string): string {
+  return value === "openai" ? "OpenAI" : value === "deepseek" ? "DeepSeek" : "Custom";
+}
