@@ -90,17 +90,29 @@ describe("HTTP model control plane", () => {
     }
   });
 
-  it("maps unapproved internal Domain errors to a generic Problem without echo", async () => {
+  it.each([
+    {
+      code: "file_changed" as const,
+      message: "private changed-file path",
+      detailNeedle: "workspace/private.txt",
+    },
+    {
+      code: "private_registry_diagnostic" as never,
+      message: "private owner and revision detail",
+      detailNeedle: "owner-secret-id",
+    },
+  ])("maps unapproved Domain error $code to a generic Problem without echo", async ({
+    code,
+    message,
+    detailNeedle,
+  }) => {
     const harness = await startTestApp();
     const registry = harness.modelRegistry as unknown as {
       getProfile: () => never;
     };
     const original = registry.getProfile;
     registry.getProfile = () => {
-      throw new DomainError(
-        "private_registry_diagnostic" as never,
-        "private owner and revision detail",
-      );
+      throw new DomainError(code, message, { diagnostic: detailNeedle });
     };
     try {
       const response = await harness.app.inject({
@@ -111,8 +123,9 @@ describe("HTTP model control plane", () => {
       });
       expect(response.statusCode).toBe(500);
       expect(response.json()).toMatchObject({ code: "internal_error" });
-      expect(response.payload).not.toContain("private_registry_diagnostic");
-      expect(response.payload).not.toContain("private owner and revision detail");
+      expect(response.payload).not.toContain(code);
+      expect(response.payload).not.toContain(message);
+      expect(response.payload).not.toContain(detailNeedle);
     } finally {
       registry.getProfile = original;
       await harness.close();
@@ -1099,8 +1112,13 @@ describe("HTTP model control plane", () => {
         payload: { expectedRevision: 2, confirm: true },
       });
       expect(response.statusCode).toBe(409);
-      expect(response.json()).toMatchObject({
+      expect(response.json()).toEqual({
+        type: "about:blank",
+        title: "Conflict",
+        status: 409,
         code: "resource_in_use",
+        detail: "The request could not be completed.",
+        traceId: expect.any(String),
         ownerCategories: ["model_assignment"],
       });
       expect(response.payload).not.toContain("primary");

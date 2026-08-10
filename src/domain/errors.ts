@@ -181,9 +181,31 @@ export const CONTROL_PLANE_PROBLEM_CODES = [
 export type ControlPlaneProblemCode =
   (typeof CONTROL_PLANE_PROBLEM_CODES)[number];
 
+export const M1_HTTP_PROBLEM_CODES = [
+  "agent_unavailable",
+  "approval_already_resolved",
+  "approval_not_found",
+  "backup_destination_exists",
+  "idempotency_conflict",
+  "invalid_backup_partial_path",
+  "invalid_backup_source_path",
+  "reconciliation_result_too_large",
+  "reconciliation_retry_cancelled_run",
+  "reconciliation_retry_result_forbidden",
+  "restart_required",
+  "run_not_found",
+  "session_has_running_run",
+  "session_not_found",
+  "synthetic_session_owned",
+  "tool_call_already_reconciled",
+  "tool_call_not_found",
+] as const satisfies readonly (DomainErrorCode | ApplicationErrorCode)[];
+
+export type M1HttpProblemCode = (typeof M1_HTTP_PROBLEM_CODES)[number];
+
 export const PUBLIC_PROBLEM_CODES = [
-  ...DOMAIN_ERROR_CODES,
-  ...APPLICATION_ERROR_CODES,
+  ...M1_HTTP_PROBLEM_CODES,
+  ...CONTROL_PLANE_PROBLEM_CODES,
 ] as const;
 
 export type PublicProblemCode = (typeof PUBLIC_PROBLEM_CODES)[number];

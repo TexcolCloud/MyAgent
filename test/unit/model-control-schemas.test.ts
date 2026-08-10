@@ -2,17 +2,26 @@ import { describe, expect, it } from "vitest";
 
 import type {
   ControlPlaneProblemCode,
+  DomainErrorCode,
+  PublicProblemCode,
   VerificationResultCode,
 } from "../../src/domain/errors.js";
 import { modelVerificationResponseSchema } from "../../src/interfaces/http/model-control-schemas.js";
 
 const controlPlaneProblemCode: ControlPlaneProblemCode = "revision_conflict";
+const publicRunProblemCode: PublicProblemCode = "agent_unavailable";
+const internalDomainErrorCode: DomainErrorCode = "file_changed";
 const verificationResultCode: VerificationResultCode = "provider_unavailable";
 // @ts-expect-error Lifecycle Problems are not Verification results.
 const lifecycleResultCode: VerificationResultCode = "revision_conflict";
+// @ts-expect-error Internal Domain errors are not public HTTP Problems.
+const internalPublicProblemCode: PublicProblemCode = "file_changed";
 void controlPlaneProblemCode;
+void publicRunProblemCode;
+void internalDomainErrorCode;
 void verificationResultCode;
 void lifecycleResultCode;
+void internalPublicProblemCode;
 
 const verificationResponse = {
   verificationId: "ver_contract",
