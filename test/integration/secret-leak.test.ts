@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,7 +93,8 @@ describe("Secret containment", () => {
       } finally {
         database.close();
       }
-      const captured = [...logs, ...responses, persisted].join("\n");
+      const rawDatabase = (await readFile(databasePath)).toString("latin1");
+      const captured = [...logs, ...responses, persisted, rawDatabase].join("\n");
       expect(logs.map((line) => JSON.parse(line) as Record<string, unknown>)).toEqual(
         expect.arrayContaining([expect.objectContaining({ code: "internal_error", traceId: expect.any(String) })]),
       );

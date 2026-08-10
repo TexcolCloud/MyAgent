@@ -453,7 +453,7 @@ export class FaultChildController {
     child.stderr?.on("data", (chunk: string) => stderr.push(chunk));
     this.#completed = new Promise<void>((resolve, reject) => {
       child.once("error", reject);
-      child.once("exit", (code, signal) => {
+      child.once("close", (code, signal) => {
         this.#child = undefined;
         if (code === 0 || signal !== null) resolve();
         else reject(new Error(`fault_child_exited:${String(code)}:${stderr.join("")}`));

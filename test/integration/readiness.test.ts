@@ -74,6 +74,11 @@ describe("readiness", () => {
       expect(await readReady(service.url)).toEqual({ status: 200, body: { ready: true } });
       blocker.exec("DELETE FROM schema_migrations");
       expect(await readReady(service.url)).toEqual({ status: 503, body: { ready: false } });
+      const health = await fetch(`${service.url}/healthz`);
+      expect({ status: health.status, body: await health.json() }).toEqual({
+        status: 200,
+        body: { ok: true },
+      });
     } finally {
       if (locked) blocker?.exec("ROLLBACK");
       blocker?.close();

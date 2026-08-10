@@ -1,5 +1,6 @@
 version: 2
 server:
+  # Keep Run and Admin credentials separate and the control plane on loopback.
   host: 127.0.0.1
   port: 8787
   bearerToken:
