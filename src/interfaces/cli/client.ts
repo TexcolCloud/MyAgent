@@ -30,6 +30,14 @@ export class CliCredentialError extends Error {
   }
 }
 
+export class CliValidationError extends Error {
+  readonly traceId = "cli";
+
+  constructor(readonly code: string, readonly detail: string) {
+    super(code);
+  }
+}
+
 export class CliClient {
   private readonly fetcher: typeof fetch;
   private readonly baseUrl: string;

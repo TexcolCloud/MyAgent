@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { CliClient, CliCredentialError, CliHttpError } from "./client.js";
+import { CliClient, CliCredentialError, CliHttpError, CliValidationError } from "./client.js";
 import { listAgents, setAgentModel } from "./commands/agents.js";
 import { listApprovals, decideApproval } from "./commands/approvals.js";
 import { createBackup } from "./commands/backup.js";
@@ -218,6 +218,7 @@ function oneOf<const T extends readonly string[]>(value: string, allowed: T): T[
 
 function cliFailure(error: unknown): { exitCode: number; problem: CliProblemOutput } {
   if (error instanceof CliUsageError) return { exitCode: 2, problem: error };
+  if (error instanceof CliValidationError) return { exitCode: 2, problem: error };
   if (error instanceof CliCredentialError) return { exitCode: 3, problem: error };
   if (error instanceof CliHttpError) {
     const problem = { code: error.code, detail: error.detail, traceId: error.traceId };

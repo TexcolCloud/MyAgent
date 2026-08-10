@@ -1,7 +1,7 @@
 import { Writable } from "node:stream";
 import { createInterface } from "node:readline/promises";
 
-import type { CliClient } from "../client.js";
+import { CliValidationError, type CliClient } from "../client.js";
 import { writeJson, writeProblem, type CliWrite } from "../formatters.js";
 import { pollVerification, type VerificationView } from "./models.js";
 
@@ -156,10 +156,10 @@ export async function setupModel(
       assignmentExpectedRevisions.set(agentId, assignment.recordRevision ?? 0);
     }
   }
-  const review = reviewValue(baseUrl, authMode, modelId, profileRevision, verification, affectedAgents);
+  const review = reviewValue(connectionRevision.baseUrl, authMode, modelId, profileRevision, verification, affectedAgents);
   writeReview(write, json, review);
   if (verification.status === "cancelled") {
-    writeSetupResult(write, json, { status: "cancelled", traceId: verification.traceId });
+    writeSetupResult(write, json, { status: "cancelled", traceId: verification.traceId }, review);
     return 0;
   }
   if (verification.status !== "passed") {
@@ -174,7 +174,7 @@ export async function setupModel(
   // 8. Promotion is the first point at which active state may change.
   const promote = await prompt.confirm("Promote the verified connection and model profile?");
   if (!promote) {
-    writeSetupResult(write, json, { status: "cancelled", traceId: verification.traceId });
+    writeSetupResult(write, json, { status: "cancelled", traceId: verification.traceId }, review);
     return 0;
   }
   if (currentProfile === undefined) throw new Error("invalid_control_plane_response");
@@ -207,7 +207,7 @@ export async function setupModel(
       body: { modelProfileRevisionId: profileRevision.revisionId, expectedRevision },
     });
   }
-  writeSetupResult(write, json, { status: "configured", profileId: profileSlug, traceId: verification.traceId });
+  writeSetupResult(write, json, { status: "configured", profileId: profileSlug, traceId: verification.traceId }, review);
   return 0;
 }
 
@@ -289,10 +289,7 @@ function reviewValue(
 }
 
 function writeReview(write: CliWrite, json: boolean, review: ReturnType<typeof reviewValue>): void {
-  if (json) {
-    writeJson(write, { status: "review", ...review });
-    return;
-  }
+  if (json) return;
   write(`Destination: ${review.destination}`);
   write(`Auth: ${review.auth}`);
   write(`Model: ${review.model}`);
@@ -304,19 +301,34 @@ function writeReview(write: CliWrite, json: boolean, review: ReturnType<typeof r
   write(`Warnings: ${review.warnings.length === 0 ? "none" : review.warnings.join(", ")}`);
 }
 
-function writeSetupResult(write: CliWrite, json: boolean, value: Record<string, unknown>): void {
-  if (json) writeJson(write, value);
+function writeSetupResult(
+  write: CliWrite,
+  json: boolean,
+  value: Record<string, unknown>,
+  review?: ReturnType<typeof reviewValue>,
+): void {
+  if (json) writeJson(write, review === undefined ? value : { ...value, review });
   else write(value.status === "cancelled" ? "Setup cancelled." : JSON.stringify(value));
 }
 
 function requiredAnswer(value: string): string {
-  if (value.trim().length === 0) throw new Error("missing_interactive_value");
+  if (value.trim().length === 0) {
+    throw new CliValidationError(
+      "missing_interactive_value",
+      "A required interactive value is missing.",
+    );
+  }
   return value.trim();
 }
 
 function positiveInteger(value: string): number {
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("invalid_positive_integer");
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new CliValidationError(
+      "invalid_positive_integer",
+      "A positive integer is required.",
+    );
+  }
   return parsed;
 }
 

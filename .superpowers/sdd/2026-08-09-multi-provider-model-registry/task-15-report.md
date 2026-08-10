@@ -98,3 +98,60 @@ No Task 16 CI/e2e/docs, persistence, RAG, memory, channels, scheduler, native pr
 ## Concerns
 
 - The authoritative final full suite had only the known Windows `EBUSY` database cleanup transient described above. Task 15 focused tests and the exact integration command are green, and an earlier serial full-suite run on the same Task 15 behavior was fully green.
+
+## Fix Round 1
+
+### Status and Scope
+
+Formal review findings were reproduced and fixed without Task 16 work. The round changes only:
+
+- `src/interfaces/cli/client.ts`
+- `src/interfaces/cli/main.ts`
+- `src/interfaces/cli/commands/model-setup.ts`
+- `test/integration/model-cli.test.ts`
+
+The fix makes `model setup --json` emit exactly one terminal JSON object, maps invalid interactive values to validation exit `2`, and builds the safety review from the persisted connection revision Base URL. Non-JSON setup continues to display the review before final confirmation.
+
+### RED/GREEN Evidence
+
+- RED: `npx vitest run test/integration/model-cli.test.ts`
+  - Expected failure, 1 file / 41 tests: 9 failed and 32 passed.
+  - The failures covered successful and cancelled JSON cardinality, blank required input, invalid/nonpositive context limits, Verification failure, HTTP conflict/service failure, and persisted destination review.
+- GREEN: `npx vitest run test/integration/model-cli.test.ts`
+  - PASS, 1 file / 41 tests.
+- GREEN: `npm run test:integration -- test/integration/model-cli.test.ts test/integration/cli.test.ts`
+  - PASS, 24 files / 191 tests.
+
+### Verification and Audits
+
+- `npm run lint`
+  - PASS, exit 0.
+- `npm run typecheck`
+  - PASS, exit 0.
+- `npm run build`
+  - PASS, TypeScript build and migration-copy postbuild exit 0.
+- `git diff --check`
+  - PASS, no output.
+- `rg -n '^import .*from .*?(application|domain|repository|sqlite|secret-decryptor)|node:sqlite|writeFile|appendFile|createWriteStream' src/interfaces/cli`
+  - Expected no-match result; the audit wrapper printed `HTTP_ONLY_AUDIT_NO_MATCHES` and exited 0.
+- `rg -n 'console\.(log|error)|JSON\.stringify\((apiKey|adminToken|token)|process\.argv.*(token|api-key)' src/interfaces/cli`
+  - Expected no-match result; the audit wrapper printed `SECRET_LOG_AUDIT_NO_MATCHES` and exited 0.
+- `npm test -- --maxWorkers=1`
+  - INCOMPLETE: the single required attempt reached the 120-second command cap and was terminated with exit 124 before Vitest printed its aggregate.
+  - No test failure was emitted before termination. `test/e2e/fault-boundaries.test.ts` passed all 17 tests, including both previously flaky SSE cleanup cases, and `test/integration/model-cli.test.ts` passed all 41 tests.
+  - Per instruction, the full suite was not retried and no runner setting or timeout was changed.
+
+### Self-Review
+
+- JSON success and cancellation include the review as a nested object; validation, Verification, conflict, and HTTP failures emit only one Problem object with no interim JSON review.
+- Human output still presents the persisted safety review before Promotion confirmation.
+- `CliValidationError` is confined to the CLI boundary and maps to exit `2` with `{code,detail,traceId}` output.
+- Blank required answers and invalid/nonpositive integers are rejected before the corresponding forbidden mutation.
+- The review destination comes from `connectionRevision.baseUrl`; raw operator input is not echoed into the terminal JSON result.
+- HTTP-only authority boundaries, pre-confirmation revision snapshots, cancellation semantics, and Secret containment remain unchanged.
+
+### Commits and Concerns
+
+- Pre-fix HEAD: `c152b765e95309ccca83fca60cf34fffdcc2129f`.
+- The Fix Round 1 commit is this report's containing commit; its exact SHA is reported in the completion response.
+- Concern: the authoritative full-suite attempt was incomplete because the command harness stopped it at 120 seconds. Focused, integration, static, and audit gates are green, and no test failure appeared in the partial full-suite output.

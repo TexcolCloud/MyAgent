@@ -237,7 +237,7 @@ describe("model control CLI", () => {
     expect(requests.some((request) => request.includes("promotions"))).toBe(false);
     expect(requests.some((request) => request.includes("default-model-profile"))).toBe(false);
     expect(requests.some((request) => request.startsWith("PUT ") && request.includes("model-assignment"))).toBe(false);
-    expect(output.join("\n")).toContain("Destination: https://api.deepseek.com");
+    expect(output.join("\n")).toContain("Destination: https://api.deepseek.com/v1");
     expect(output.join("\n")).toContain("Auth: environment");
     expect(output.join("\n")).toContain("Model: deepseek-v4-flash");
     expect(output.join("\n")).toContain("Protocol: responses");
@@ -301,7 +301,134 @@ describe("model control CLI", () => {
 
     expect(exitCode).toBe(0);
     expect(requests.some((request) => request.includes("promotions"))).toBe(false);
-    expect(output.at(-1)).toBe('{"status":"cancelled","traceId":"verification-trace"}');
+    expect(output).toHaveLength(1);
+    expect(JSON.parse(output[0]!)).toEqual({
+      status: "cancelled",
+      traceId: "verification-trace",
+      review: expect.objectContaining({ destination: "https://api.deepseek.com/v1" }),
+    });
+  });
+
+  it("emits one JSON result for successful interactive setup", async () => {
+    const output: string[] = [];
+    const prompt = scriptedPrompt({
+      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      inputs: ["deepseek", "DeepSeek", "https://raw.example.test/", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", ""],
+      confirmations: [true, false, true],
+    });
+
+    const exitCode = await executeCli(["model", "setup", "--json"], {
+      environment,
+      fetcher: setupFetcher([]),
+      prompt,
+      sleep: async () => undefined,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(output).toHaveLength(1);
+    expect(JSON.parse(output[0]!)).toEqual({
+      status: "configured",
+      profileId: "deepseek-flash",
+      traceId: "verification-trace",
+      review: expect.objectContaining({ destination: "https://api.deepseek.com/v1" }),
+    });
+    expect(output[0]).not.toContain("https://raw.example.test/");
+  });
+
+  it("maps a blank required interactive value to one validation Problem before HTTP", async () => {
+    const output: string[] = [];
+    const fetcher = vi.fn<typeof fetch>();
+    const prompt = scriptedPrompt({
+      selects: ["deepseek"],
+      inputs: ["   "],
+      confirmations: [],
+    });
+
+    const exitCode = await executeCli(["model", "setup", "--json"], {
+      environment,
+      fetcher,
+      prompt,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(2);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(output).toEqual(['{"code":"missing_interactive_value","detail":"A required interactive value is missing.","traceId":"cli"}']);
+  });
+
+  it.each(["0", "not-a-number"])("maps interactive context limit %s to one validation Problem without forbidden mutation", async (contextLimit) => {
+    const requests: string[] = [];
+    const output: string[] = [];
+    const prompt = scriptedPrompt({
+      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      inputs: ["deepseek", "DeepSeek", "https://raw.example.test/", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", contextLimit],
+      confirmations: [],
+    });
+
+    const exitCode = await executeCli(["model", "setup", "--json"], {
+      environment,
+      fetcher: setupFetcher(requests),
+      prompt,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(2);
+    expect(output).toEqual(['{"code":"invalid_positive_integer","detail":"A positive integer is required.","traceId":"cli"}']);
+    expect(requests.some((request) => request.includes("model-profiles"))).toBe(false);
+    expect(requests.some((request) => request.includes("promotions") || request.includes("model-assignment") || request.includes("default-model-profile"))).toBe(false);
+  });
+
+  it("emits one JSON Problem for interactive Verification failure", async () => {
+    const output: string[] = [];
+    const prompt = scriptedPrompt({
+      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      inputs: ["deepseek", "DeepSeek", "https://raw.example.test/", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", ""],
+      confirmations: [true, false],
+    });
+    const fetcher = createFetcher((request) => {
+      if (request.path === "/v1/admin/model-verifications/ver_1") {
+        return jsonResponse({ ...verification("passed"), status: "failed", resultCode: "provider_auth_failed" });
+      }
+      return setupResponse(request);
+    });
+
+    const exitCode = await executeCli(["model", "setup", "--json"], {
+      environment,
+      fetcher,
+      prompt,
+      sleep: async () => undefined,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(5);
+    expect(output).toEqual(['{"code":"provider_auth_failed","detail":"Model verification failed.","traceId":"verification-trace"}']);
+  });
+
+  it.each([
+    [409, "revision_conflict", 4],
+    [503, "database_unavailable", 6],
+  ])("emits one JSON Problem when confirmed setup receives HTTP %i", async (status, code, expectedExit) => {
+    const output: string[] = [];
+    const prompt = scriptedPrompt({
+      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      inputs: ["deepseek", "DeepSeek", "https://raw.example.test/", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", ""],
+      confirmations: [true, false, true],
+    });
+    const fetcher = createFetcher((request) => request.path.endsWith("/promotions")
+      ? jsonResponse({ code, detail: "safe detail", traceId: "setup-http-trace" }, status)
+      : setupResponse(request));
+
+    const exitCode = await executeCli(["model", "setup", "--json"], {
+      environment,
+      fetcher,
+      prompt,
+      sleep: async () => undefined,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(expectedExit);
+    expect(output).toEqual([`{"code":"${code}","detail":"safe detail","traceId":"setup-http-trace"}`]);
   });
 
   it("reviews warnings before confirmed Promotion, default, and Agent assignment", async () => {
@@ -433,9 +560,10 @@ function setupFetcher(requests: string[]): typeof fetch {
 }
 
 function setupResponse(request: CapturedRequest): Response {
-  if (request.path === "/v1/admin/provider-connections") return jsonResponse({ connectionId: "deepseek", displayName: "DeepSeek", providerKind: "deepseek", activeRevisionId: null, retiredAt: null, recordRevision: 0, credentialConfigured: true, revisions: [{ revisionId: "pcr_1", connectionId: "deepseek", state: "draft", baseUrl: "https://api.deepseek.com", allowInsecureHttp: false, protocolPreference: "responses", presetVersion: "1", credentialConfigured: true, createdAt: "2026-08-10T00:00:00.000Z" }] }, 201);
+  if (request.path === "/v1/admin/provider-connections") return jsonResponse({ connectionId: "deepseek", displayName: "DeepSeek", providerKind: "deepseek", activeRevisionId: null, retiredAt: null, recordRevision: 0, credentialConfigured: true, revisions: [{ revisionId: "pcr_1", connectionId: "deepseek", state: "draft", baseUrl: "https://api.deepseek.com/v1", allowInsecureHttp: false, protocolPreference: "responses", presetVersion: "1", credentialConfigured: true, createdAt: "2026-08-10T00:00:00.000Z" }] }, 201);
   if (request.path.endsWith("/discover")) return jsonResponse({ connectionRevisionId: "pcr_1", recordRevision: 1, state: "fresh", models: [{ id: "deepseek-v4-flash" }], cache: { fetchedAt: "2026-08-10T00:00:00.000Z", expiresAt: "2026-08-10T01:00:00.000Z" }, error: null });
   if (request.path === "/v1/admin/model-profiles") return jsonResponse(profileResponse(), 201);
+  if (request.path === "/v1/admin/model-profiles/deepseek-flash") return jsonResponse({ ...profileResponse(), recordRevision: 2 });
   if (request.method === "POST" && request.path.endsWith("/verifications")) return jsonResponse({ verificationId: "ver_1", profileRevisionId: "mpr_1", capabilityBaseline: "text_and_single_tool_call_v1", status: "queued", recordRevision: 1, operationUrl: "/v1/admin/model-verifications/ver_1" }, 202);
   if (request.path === "/v1/admin/model-verifications/ver_1") return jsonResponse(verification("passed"));
   return jsonResponse({ ok: true });
