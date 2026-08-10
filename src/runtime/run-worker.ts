@@ -57,6 +57,10 @@ export class RunWorker {
     );
   }
 
+  isHealthy(): boolean {
+    return this.running && this.fatalFailures.length === 0;
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     for (const [runId, controller] of this.active) {

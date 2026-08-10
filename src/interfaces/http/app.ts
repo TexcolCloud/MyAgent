@@ -3,13 +3,21 @@ import { randomUUID } from "node:crypto";
 import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } from "fastify";
 
 import type { CancelRunService } from "../../application/cancel-run.js";
+import type { AssignModelService } from "../../application/assign-model.js";
 import type { CreateBackupService } from "../../application/create-backup.js";
 import type { CreateRunService } from "../../application/create-run.js";
 import type { DecideApprovalService } from "../../application/decide-approval.js";
 import type { DeleteSessionService } from "../../application/delete-session.js";
+import type { DiscoverModelsService } from "../../application/discover-models.js";
+import type { ManageModelProfilesService } from "../../application/manage-model-profiles.js";
+import type { ManageProviderConnectionsService } from "../../application/manage-provider-connections.js";
+import type { ManageSecretsService } from "../../application/manage-secrets.js";
 import type { ReconcileToolCallService } from "../../application/reconcile-tool-call.js";
+import type { VerifyModelService } from "../../application/verify-model.js";
+import type { CatalogSnapshot } from "../../config/catalog-loader.js";
 import type { CatalogService } from "../../config/catalog-service.js";
 import type { ApprovalStore } from "../../ports/approval-store.js";
+import type { ModelRegistryStore } from "../../ports/model-registry-store.js";
 import type { RunStore } from "../../ports/run-store.js";
 import type { SessionLookupStore } from "../../ports/session-store.js";
 import type { ReconciliationStore } from "../../ports/tool-store.js";
@@ -26,9 +34,22 @@ import { registerToolCallRoutes } from "./routes/tool-calls.js";
 import { serializeWithSchema } from "./schemas.js";
 import type { SseStreamOptions } from "./sse.js";
 
+export interface ModelControlServices {
+  readonly registry: ModelRegistryStore;
+  readonly connections: ManageProviderConnectionsService;
+  readonly profiles: ManageModelProfilesService;
+  readonly secrets: ManageSecretsService;
+  readonly assignments: AssignModelService;
+  readonly discovery: DiscoverModelsService;
+  readonly verifications: VerifyModelService;
+}
+
 export interface HttpAppOptions {
   bearerToken: string;
+  adminToken?: string;
+  modelControl?: ModelControlServices;
   catalog?: CatalogService;
+  prepareCatalogReload?: (candidate: CatalogSnapshot) => void;
   createRuns?: CreateRunService;
   runs?: Pick<RunStore, "getRun" | "listEventsAfter">;
   cancelRuns?: CancelRunService;
@@ -86,7 +107,15 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
     }, { prefix: "/v1" });
   }
   if (options.catalog !== undefined) {
-    app.register((api, _routeOptions, done) => { registerAgentRoutes(api, options.catalog!); registerConfigRoutes(api, options.catalog!); done(); }, { prefix: "/v1" });
+    app.register((api, _routeOptions, done) => {
+      registerAgentRoutes(api, options.catalog!);
+      registerConfigRoutes(
+        api,
+        options.catalog!,
+        options.prepareCatalogReload,
+      );
+      done();
+    }, { prefix: "/v1" });
   }
   if (options.approvals !== undefined && options.decideApprovals !== undefined && options.tools !== undefined) {
     app.register((api, _routeOptions, done) => { registerApprovalRoutes(api, { approvals: options.approvals!, decideApprovals: options.decideApprovals!, tools: options.tools! }); done(); }, { prefix: "/v1" });

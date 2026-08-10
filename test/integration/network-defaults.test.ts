@@ -100,13 +100,16 @@ async function prepareConfig(host?: string): Promise<{ configPath: string; clean
   await writeFile(configPath, stringifyYaml(config));
 
   const previousBearer = process.env.MYAGENT_BEARER_TOKEN;
+  const previousAdmin = process.env.MYAGENT_ADMIN_TOKEN;
   const previousModel = process.env.MODEL_API_KEY;
   process.env.MYAGENT_BEARER_TOKEN = "network-operator-secret";
+  process.env.MYAGENT_ADMIN_TOKEN = "network-admin-secret";
   process.env.MODEL_API_KEY = "network-provider-secret";
   return {
     configPath,
     async cleanup(): Promise<void> {
       restoreEnvironment("MYAGENT_BEARER_TOKEN", previousBearer);
+      restoreEnvironment("MYAGENT_ADMIN_TOKEN", previousAdmin);
       restoreEnvironment("MODEL_API_KEY", previousModel);
       await rm(root, { recursive: true, force: true });
     },

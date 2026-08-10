@@ -15,6 +15,7 @@ import { seedVerifiedChatAssignments } from "../helpers/verified-chat-model-regi
 
 const VALID_FIXTURE = fileURLToPath(new URL("../fixtures/config/valid", import.meta.url));
 const OPERATOR_SECRET = "operator-secret-seeded";
+const ADMIN_SECRET = "admin-secret-seeded";
 const PROVIDER_SECRET = "provider-secret-seeded";
 
 describe("Secret containment", () => {
@@ -25,8 +26,10 @@ describe("Secret containment", () => {
     const configPath = path.join(configRoot, "myagent.yaml");
     const databasePath = path.join(configRoot, "data", "kernel.db");
     const previousBearer = process.env.MYAGENT_BEARER_TOKEN;
+    const previousAdmin = process.env.MYAGENT_ADMIN_TOKEN;
     const previousModel = process.env.MODEL_API_KEY;
     process.env.MYAGENT_BEARER_TOKEN = OPERATOR_SECRET;
+    process.env.MYAGENT_ADMIN_TOKEN = ADMIN_SECRET;
     process.env.MODEL_API_KEY = PROVIDER_SECRET;
     const logs: string[] = [];
     const responses: string[] = [];
@@ -95,11 +98,13 @@ describe("Secret containment", () => {
         expect.arrayContaining([expect.objectContaining({ code: "internal_error", traceId: expect.any(String) })]),
       );
       expect(captured).not.toContain(OPERATOR_SECRET);
+      expect(captured).not.toContain(ADMIN_SECRET);
       expect(captured).not.toContain(PROVIDER_SECRET);
       expect(captured).not.toContain(path.join(root, "missing"));
     } finally {
       await service?.shutdown();
       restoreEnvironment("MYAGENT_BEARER_TOKEN", previousBearer);
+      restoreEnvironment("MYAGENT_ADMIN_TOKEN", previousAdmin);
       restoreEnvironment("MODEL_API_KEY", previousModel);
       await rm(root, { recursive: true, force: true });
     }

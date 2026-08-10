@@ -169,8 +169,10 @@ export async function prepareE2eFixture(
   await writeFile(policyPath, stringifyYaml(policy), "utf8");
 
   const previousBearer = process.env.MYAGENT_BEARER_TOKEN;
+  const previousAdmin = process.env.MYAGENT_ADMIN_TOKEN;
   const previousModel = process.env.E2E_MODEL_API_KEY;
   process.env.MYAGENT_BEARER_TOKEN = BEARER_TOKEN;
+  process.env.MYAGENT_ADMIN_TOKEN = "e2e-admin-token";
   process.env.E2E_MODEL_API_KEY = MODEL_SECRET;
   const connection = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
   try {
@@ -204,6 +206,7 @@ export async function prepareE2eFixture(
     researcherWorkspace,
     async cleanup(): Promise<void> {
       restoreEnvironment("MYAGENT_BEARER_TOKEN", previousBearer);
+      restoreEnvironment("MYAGENT_ADMIN_TOKEN", previousAdmin);
       restoreEnvironment("E2E_MODEL_API_KEY", previousModel);
       await rm(root, { recursive: true, force: true });
     },

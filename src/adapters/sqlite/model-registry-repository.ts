@@ -1,15 +1,17 @@
 import canonicalizeModule from "canonicalize";
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import { ApplicationError, DomainError } from "../../domain/errors.js";
-import type {
-  AgentId,
-  ManagedSecretVersionId,
-  ModelProfileId,
-  ModelProfileRevisionId,
-  ModelVerificationId,
-  ProviderConnectionId,
-  ProviderConnectionRevisionId,
+import {
+  parseAgentId,
+  type AgentId,
+  type ManagedSecretVersionId,
+  type ModelProfileId,
+  type ModelProfileRevisionId,
+  type ModelVerificationId,
+  type ProviderConnectionId,
+  type ProviderConnectionRevisionId,
 } from "../../domain/ids.js";
 import type { SecretReferenceOwner } from "../../domain/managed-secret.js";
 import type {
@@ -20,7 +22,10 @@ import type {
   ModelProfileRevision,
   ModelProfileView,
 } from "../../domain/model-profile.js";
-import type { DiscoveryView } from "../../domain/model-registry.js";
+import {
+  MODEL_CAPABILITY_BASELINE,
+  type DiscoveryView,
+} from "../../domain/model-registry.js";
 import type { ModelVerification } from "../../domain/model-verification.js";
 import type {
   ProviderAuth,
@@ -28,7 +33,6 @@ import type {
   ProviderConnectionView,
 } from "../../domain/provider-connection.js";
 import type {
-  CoreModelRegistryStore,
   BeginVerificationAttemptInput,
   CancelVerificationInput,
   ClaimVerificationInput,
@@ -37,6 +41,10 @@ import type {
   CreateConnectionRevisionRecord,
   CreateProfileRecord,
   CreateProfileRevisionRecord,
+  LegacyImportRecord,
+  LegacyImportResult,
+  LegacyModelSeed,
+  ModelRegistryStore,
   MutationContext,
   PromoteConnectionInput,
   PromoteProfileInput,
@@ -53,6 +61,7 @@ import type {
   SetModelAssignmentInput,
   SynchronizeAgentsInput,
 } from "../../ports/model-registry-store.js";
+import { withImmediateTransaction } from "./database.js";
 
 interface ConnectionRow {
   connection_id: string;
@@ -161,11 +170,16 @@ interface VerificationTargetRow {
   connection_revision_id: string;
 }
 
+interface LegacyImportRow {
+  source_sha256: string;
+  result_json: string;
+}
+
 const canonicalizeJson = canonicalizeModule as unknown as (
   input: unknown,
 ) => string | undefined;
 
-export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
+export class SqliteModelRegistryRepository implements ModelRegistryStore {
   constructor(private readonly db: DatabaseSync) {}
 
   createConnection(input: CreateConnectionRecord): ProviderConnectionView {
@@ -756,6 +770,137 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
     this.recordProviderHealthInTransaction(input);
   }
 
+  importLegacy(input: LegacyImportRecord): LegacyImportResult {
+    return this.immediate(() => {
+      const marker = this.db.prepare(
+        `SELECT source_sha256, result_json
+         FROM legacy_model_imports
+         ORDER BY created_at, source_sha256
+         LIMIT 1`,
+      ).get() as unknown as LegacyImportRow | undefined;
+      if (marker !== undefined) {
+        if (marker.source_sha256 === input.sourceSha256) {
+          return parseLegacyImportResult(marker.result_json);
+        }
+        throw new ApplicationError("legacy_import_already_completed", 409);
+      }
+      const existing = this.db.prepare(
+        `SELECT (
+           EXISTS(SELECT 1 FROM provider_connections) OR
+           EXISTS(SELECT 1 FROM model_profiles) OR
+           EXISTS(SELECT 1 FROM model_assignments) OR
+           EXISTS(SELECT 1 FROM default_model_profile)
+         ) AS registry_has_state`,
+      ).get() as unknown as { registry_has_state: number };
+      if (existing.registry_has_state === 1) {
+        throw new ApplicationError("legacy_import_already_completed", 409);
+      }
+
+      const models = validateLegacyImport(input);
+      const aliases: Record<string, LegacyImportResult["aliases"][string]> = {};
+      const now = input.now.toISOString();
+      for (const model of models) {
+        const ids = legacyIds(input.sourceSha256, model.alias);
+        this.db.prepare(
+          `INSERT INTO provider_connections (
+             connection_id, display_name, provider_kind, active_revision_id,
+             retired_at, record_revision, created_at, updated_at
+           ) VALUES (?, ?, ?, NULL, NULL, 0, ?, ?)`,
+        ).run(ids.connectionId, model.alias, model.providerKind, now, now);
+        this.insertConnectionRevision({
+          revisionId: ids.connectionRevisionId,
+          connectionId: ids.connectionId,
+          state: "legacy_trusted",
+          baseUrl: model.baseUrl,
+          auth: {
+            type: "bearer",
+            secret: { fromEnvironment: model.apiKey.fromEnvironment },
+          },
+          allowInsecureHttp: new URL(model.baseUrl).protocol === "http:",
+          protocolPreference: "chat_completions",
+          presetVersion: "legacy-v1",
+          createdAt: input.now,
+        });
+        this.db.prepare(
+          `UPDATE provider_connections SET active_revision_id = ?
+           WHERE connection_id = ?`,
+        ).run(ids.connectionRevisionId, ids.connectionId);
+
+        this.db.prepare(
+          `INSERT INTO model_profiles (
+             profile_id, display_name, active_revision_id, retired_at,
+             record_revision, created_at, updated_at
+           ) VALUES (?, ?, NULL, NULL, 0, ?, ?)`,
+        ).run(ids.profileId, model.alias, now, now);
+        this.insertProfileRevision({
+          revisionId: ids.profileRevisionId,
+          profileId: ids.profileId,
+          connectionRevisionId: ids.connectionRevisionId,
+          state: "legacy_trusted",
+          providerModelId: model.modelId,
+          invocationProtocol: "chat_completions",
+          maxInputTokens: model.maxInputTokens,
+          contextWindowSource: "operator",
+          capabilityBaseline: MODEL_CAPABILITY_BASELINE,
+          verifiedCapabilities: [],
+          createdAt: input.now,
+        });
+        this.db.prepare(
+          `UPDATE model_profiles SET active_revision_id = ?
+           WHERE profile_id = ?`,
+        ).run(ids.profileRevisionId, ids.profileId);
+        aliases[model.alias] = {
+          connectionId: ids.connectionId,
+          profileId: ids.profileId,
+          revisionId: ids.profileRevisionId,
+        };
+      }
+
+      const assignments: ModelAssignment[] = [];
+      for (const [agentId, alias] of Object.entries(input.agentAliases)
+        .sort(([left], [right]) => left.localeCompare(right))) {
+        const target = aliases[alias];
+        if (target === undefined) throw new Error("invalid_legacy_import");
+        this.db.prepare(
+          `INSERT INTO model_assignments (
+             agent_id, model_profile_revision_id, source,
+             record_revision, updated_at
+           ) VALUES (?, ?, 'legacy_import', 0, ?)`,
+        ).run(agentId, target.revisionId, now);
+        assignments.push(this.getRequiredAssignment(agentId as AgentId));
+      }
+
+      const result: LegacyImportResult = {
+        sourceSha256: input.sourceSha256,
+        aliases,
+        assignments,
+        created: true,
+      };
+      this.db.prepare(
+        `INSERT INTO legacy_model_imports (
+           source_sha256, migration_version, result_json, record_revision, created_at
+         ) VALUES (?, ?, ?, 0, ?)`,
+      ).run(
+        input.sourceSha256,
+        input.migrationVersion,
+        serialize(result),
+        now,
+      );
+      this.appendAudit(
+        input,
+        "legacy_model_import",
+        input.sourceSha256,
+        "legacy_model.imported",
+        {
+          migrationVersion: input.migrationVersion,
+          aliases,
+          assignedAgentIds: assignments.map(({ agentId }) => agentId),
+        },
+      );
+      return result;
+    });
+  }
+
   promoteConnection(input: PromoteConnectionInput): ProviderConnectionView {
     return this.immediate(() => {
       this.assertMutableStableRevision(
@@ -952,18 +1097,23 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
 
   synchronizeAgents(input: SynchronizeAgentsInput): readonly ModelAssignment[] {
     return this.immediate(() => {
+      const unassigned: AgentId[] = [];
+      const seen = new Set<string>();
+      for (const agentId of input.agentIds) {
+        if (seen.has(agentId)) continue;
+        seen.add(agentId);
+        if (this.assignmentRow(agentId) === undefined) unassigned.push(agentId);
+      }
+      if (unassigned.length === 0) return [];
       const defaultProfile = this.getDefaultProfile();
-      if (defaultProfile === null) throw new DomainError("model_assignment_required");
+      if (defaultProfile === null) return [];
       const profile = this.getProfile(defaultProfile.profileId);
       if (profile.activeRevisionId === null) {
         throw new DomainError("model_assignment_required");
       }
       this.assertAssignmentEligible(profile.activeRevisionId);
       const created: ModelAssignment[] = [];
-      const seen = new Set<string>();
-      for (const agentId of input.agentIds) {
-        if (seen.has(agentId)) continue;
-        seen.add(agentId);
+      for (const agentId of unassigned) {
         const result = this.db.prepare(
           `INSERT INTO model_assignments (
              agent_id, model_profile_revision_id, source,
@@ -1625,15 +1775,7 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
   }
 
   private immediate<T>(operation: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const result = operation();
-      this.db.exec("COMMIT");
-      return result;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    return withImmediateTransaction(this.db, operation);
   }
 }
 
@@ -1657,6 +1799,69 @@ function assertProfileRevisionOwner(
 
 function throwRevisionConflict(): never {
   throw new ApplicationError("revision_conflict", 409);
+}
+
+function validateLegacyImport(input: LegacyImportRecord): readonly LegacyModelSeed[] {
+  if (input.migrationVersion !== 1 || !/^[a-f0-9]{64}$/.test(input.sourceSha256)) {
+    throw new Error("invalid_legacy_import");
+  }
+  const aliases = new Set<string>();
+  const models = [...input.models].sort((left, right) =>
+    left.alias.localeCompare(right.alias)
+  );
+  for (const model of models) {
+    if (
+      model.alias.length === 0 ||
+      aliases.has(model.alias) ||
+      model.modelId.length === 0 ||
+      !Number.isSafeInteger(model.maxInputTokens) ||
+      model.maxInputTokens <= 0 ||
+      !/^[A-Za-z_][A-Za-z0-9_]*$/.test(model.apiKey.fromEnvironment)
+    ) {
+      throw new Error("invalid_legacy_import");
+    }
+    new URL(model.baseUrl);
+    aliases.add(model.alias);
+  }
+  for (const [agentId, alias] of Object.entries(input.agentAliases)) {
+    parseAgentId(agentId);
+    if (!aliases.has(alias)) throw new Error("invalid_legacy_import");
+  }
+  return models;
+}
+
+interface GeneratedLegacyIds {
+  readonly connectionId: ProviderConnectionId;
+  readonly connectionRevisionId: ProviderConnectionRevisionId;
+  readonly profileId: ModelProfileId;
+  readonly profileRevisionId: ModelProfileRevisionId;
+}
+
+function legacyIds(sourceSha256: string, alias: string): GeneratedLegacyIds {
+  const digest = (kind: string): string => createHash("sha256")
+    .update(`${sourceSha256}\u0000${alias}\u0000${kind}`)
+    .digest("hex");
+  return {
+    connectionId: `legacy-${digest("connection").slice(0, 40)}` as ProviderConnectionId,
+    connectionRevisionId:
+      `pcr_legacy_${digest("connection-revision")}` as ProviderConnectionRevisionId,
+    profileId: `legacy-${digest("profile").slice(0, 40)}` as ModelProfileId,
+    profileRevisionId:
+      `mpr_legacy_${digest("profile-revision")}` as ModelProfileRevisionId,
+  };
+}
+
+function parseLegacyImportResult(serialized: string): LegacyImportResult {
+  const parsed = JSON.parse(serialized) as Omit<LegacyImportResult, "assignments"> & {
+    assignments: Array<Omit<ModelAssignment, "updatedAt"> & { updatedAt: string }>;
+  };
+  return {
+    ...parsed,
+    assignments: parsed.assignments.map((assignment) => ({
+      ...assignment,
+      updatedAt: new Date(assignment.updatedAt),
+    })),
+  };
 }
 
 function serialize(value: unknown): string {

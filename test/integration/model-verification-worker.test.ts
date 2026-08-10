@@ -410,6 +410,8 @@ describe("ModelVerificationWorker", () => {
     worker.start();
     await running;
     await expect(fatal).resolves.toBe(unavailable);
+    expect((worker as ModelVerificationWorker & { isHealthy?: () => boolean })
+      .isHealthy?.()).toBe(false);
     await expect(worker.stop()).rejects.toBe(unavailable);
   });
 

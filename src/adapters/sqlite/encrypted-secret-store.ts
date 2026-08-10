@@ -17,6 +17,7 @@ import type {
   ManagedSecretStore,
   RotateManagedSecretKeyInput,
 } from "../../ports/managed-secret-store.js";
+import { withImmediateTransaction } from "./database.js";
 
 export interface ManagedSecretKeyEnvironment {
   readonly MYAGENT_MASTER_KEY?: string;
@@ -299,15 +300,7 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
   }
 
   private immediate<T>(operation: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const result = operation();
-      this.db.exec("COMMIT");
-      return result;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    return withImmediateTransaction(this.db, operation);
   }
 }
 

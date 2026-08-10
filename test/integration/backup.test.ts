@@ -5,8 +5,11 @@ import { describe, expect, it } from "vitest";
 
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { SqliteBackupWriter } from "../../src/adapters/sqlite/backup.js";
+import { SqliteEncryptedSecretStore } from "../../src/adapters/sqlite/encrypted-secret-store.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
+import { loadCatalog } from "../../src/config/catalog-loader.js";
 import type { CatalogSnapshot } from "../../src/config/catalog-loader.js";
+import { managedSecretVersionIdFromUuid } from "../../src/domain/ids.js";
 import { tempPath } from "../helpers/temp-dir.js";
 import { startTestApp } from "../helpers/start-test-app.js";
 
@@ -93,6 +96,58 @@ describe("HTTP backup", () => {
       expect(response.json()).toMatchObject({ code: "invalid_request" });
     } finally {
       await harness.close();
+    }
+  });
+
+  it("restores encrypted Secret rows with the external key while excluding Secret data from the manifest", async () => {
+    const databasePath = tempPath("backup-managed-secret.db");
+    const destination = tempPath("backup-managed-secret");
+    const masterKey = Buffer.alloc(32, 29).toString("base64");
+    const plaintext = "backup-provider-plaintext";
+    const versionId = managedSecretVersionIdFromUuid("backup-managed-secret");
+    const connection = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    try {
+      migrate(connection.db);
+      const metadata = new SqliteEncryptedSecretStore(connection.db, {
+        MYAGENT_MASTER_KEY: masterKey,
+      }).createVersion({
+        versionId,
+        secretId: "backup-provider-key",
+        purpose: "provider_api_key",
+        plaintext,
+        now: new Date("2026-08-09T00:00:00.000Z"),
+      });
+      await new SqliteBackupWriter(connection.db).create({
+        destination,
+        catalog: await loadCatalog("test/fixtures/config/valid/myagent.yaml"),
+        occurredAt: new Date("2026-08-09T00:01:00.000Z"),
+      });
+
+      const manifest = await readFile(path.join(destination, "manifest.json"), "utf8");
+      expect(manifest).not.toContain(masterKey);
+      expect(manifest).not.toContain(plaintext);
+      expect(manifest).not.toContain(versionId);
+      expect(manifest).not.toContain(metadata.secretId);
+      expect(manifest).not.toContain(metadata.keyId);
+      expect((await readFile(path.join(destination, "kernel.db"))).includes(
+        Buffer.from(plaintext),
+      )).toBe(false);
+
+      const restored = openDatabase({
+        path: path.join(destination, "kernel.db"),
+        busyTimeoutMs: 5_000,
+      });
+      try {
+        expect(new SqliteEncryptedSecretStore(restored.db, {
+          MYAGENT_MASTER_KEY: masterKey,
+        }).resolve(versionId)).toBe(plaintext);
+      } finally {
+        restored.close();
+      }
+    } finally {
+      connection.close();
+      await rm(databasePath, { force: true });
+      await rm(destination, { recursive: true, force: true });
     }
   });
 

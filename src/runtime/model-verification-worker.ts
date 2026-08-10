@@ -67,6 +67,10 @@ export class ModelVerificationWorker {
     );
   }
 
+  isHealthy(): boolean {
+    return this.running && this.fatalFailures.length === 0;
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     this.abortActive(new Error("verification_worker_stopped"));

@@ -316,6 +316,8 @@ describe("RunWorker", () => {
     await waitFor(() => reported !== undefined).catch(() => undefined);
 
     expect(reported).toBe(failure);
+    expect((worker as RunWorker & { isHealthy?: () => boolean }).isHealthy?.())
+      .toBe(false);
     await expect(worker.stop()).rejects.toBe(failure);
   });
 

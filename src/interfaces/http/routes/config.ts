@@ -4,9 +4,17 @@ import type { CatalogSnapshot } from "../../../config/catalog-loader.js";
 import type { CatalogService } from "../../../config/catalog-service.js";
 import { configReloadResponseSchema } from "../schemas.js";
 
-export function registerConfigRoutes(app: FastifyInstance, catalog: CatalogService): void {
+export function registerConfigRoutes(
+  app: FastifyInstance,
+  catalog: CatalogService,
+  prepare?: (candidate: CatalogSnapshot) => void,
+): void {
   app.post("/config/reload", { schema: { response: { 200: configReloadResponseSchema } } }, async () => {
-    return catalog.reload(configReloadResponse);
+    return catalog.reload((candidate) => {
+      const response = configReloadResponse(candidate);
+      prepare?.(candidate);
+      return response;
+    });
   });
 }
 

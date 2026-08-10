@@ -47,8 +47,10 @@ describe("readiness", () => {
     await writeFile(configPath, stringifyYaml(config));
 
     const previousBearer = process.env.MYAGENT_BEARER_TOKEN;
+    const previousAdmin = process.env.MYAGENT_ADMIN_TOKEN;
     const previousModel = process.env.MODEL_API_KEY;
     process.env.MYAGENT_BEARER_TOKEN = "readiness-operator-secret";
+    process.env.MYAGENT_ADMIN_TOKEN = "readiness-admin-secret";
     process.env.MODEL_API_KEY = "readiness-provider-secret";
     let service: Awaited<ReturnType<typeof bootstrap>> | undefined;
     let blocker: DatabaseSync | undefined;
@@ -77,6 +79,7 @@ describe("readiness", () => {
       blocker?.close();
       await service?.shutdown();
       restoreEnvironment("MYAGENT_BEARER_TOKEN", previousBearer);
+      restoreEnvironment("MYAGENT_ADMIN_TOKEN", previousAdmin);
       restoreEnvironment("MODEL_API_KEY", previousModel);
       await rm(root, { recursive: true, force: true });
     }
