@@ -162,6 +162,10 @@ export async function bootstrap(
       modelRegistry,
       clock,
       ids,
+      {
+        run: <Result>(operation: () => Result): Result =>
+          withImmediateTransaction(connection.db, operation),
+      },
     );
     const connections = new ManageProviderConnectionsService(
       modelRegistry,

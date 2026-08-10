@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { DomainError } from "../../src/domain/errors.js";
 import { ModelProviderError } from "../../src/ports/model.js";
 import { startTestApp } from "../helpers/start-test-app.js";
 
@@ -85,6 +86,35 @@ describe("HTTP model control plane", () => {
       });
       expect(response.payload).not.toContain("mpr_missing");
     } finally {
+      await harness.close();
+    }
+  });
+
+  it("maps unapproved internal Domain errors to a generic Problem without echo", async () => {
+    const harness = await startTestApp();
+    const registry = harness.modelRegistry as unknown as {
+      getProfile: () => never;
+    };
+    const original = registry.getProfile;
+    registry.getProfile = () => {
+      throw new DomainError(
+        "private_registry_diagnostic" as never,
+        "private owner and revision detail",
+      );
+    };
+    try {
+      const response = await harness.app.inject({
+        method: "GET",
+        url: "/v1/admin/model-profiles/test-chat",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+      });
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toMatchObject({ code: "internal_error" });
+      expect(response.payload).not.toContain("private_registry_diagnostic");
+      expect(response.payload).not.toContain("private owner and revision detail");
+    } finally {
+      registry.getProfile = original;
       await harness.close();
     }
   });
@@ -812,6 +842,44 @@ describe("HTTP model control plane", () => {
       });
       expect(response.payload).not.toContain("leaseOwner");
       expect(response.payload).not.toContain("leaseExpiresAt");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a persisted lifecycle code from Verification projection", async () => {
+    const harness = await startTestApp();
+    try {
+      const profile = await createDraftProfile(harness, "closed-result");
+      const queued = await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/model-profile-revisions/${profile.profileRevisionId}/verifications`,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          expectedRevision: profile.recordRevision,
+          capabilityBaseline: "text_and_single_tool_call_v1",
+        },
+      });
+      const operation = queued.json() as {
+        verificationId: string;
+        operationUrl: string;
+      };
+      harness.connection.db.prepare(
+        `UPDATE model_verifications
+         SET state = 'failed', result_code = 'revision_conflict'
+         WHERE verification_id = ?`,
+      ).run(operation.verificationId);
+
+      const response = await harness.app.inject({
+        method: "GET",
+        url: operation.operationUrl,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+      });
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toMatchObject({ code: "internal_error" });
+      expect(response.payload).not.toContain("revision_conflict");
     } finally {
       await harness.close();
     }

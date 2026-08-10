@@ -2,7 +2,10 @@ import { existsSync, readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import {
+  openDatabase,
+  withImmediateTransaction,
+} from "../../src/adapters/sqlite/database.js";
 import { SqliteEncryptedSecretStore } from "../../src/adapters/sqlite/encrypted-secret-store.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { ManageSecretsService } from "../../src/application/manage-secrets.js";
@@ -104,6 +107,18 @@ describe("Model control Secret containment", () => {
       const secretVersionId = created.json().secretVersionId as string;
       const connectionRevisionId = created.json().revisions[0].revisionId as string;
 
+      const staleReferenced = await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/managed-secret-versions/${secretVersionId}/destruction`,
+        remoteAddress: "127.0.0.1",
+        headers: { authorization: "Bearer test-admin-token" },
+        payload: { expectedRevision: 1, confirm: true },
+      });
+      responses.push(staleReferenced.payload);
+      expect(staleReferenced.statusCode).toBe(409);
+      expect(staleReferenced.json()).toMatchObject({ code: "revision_conflict" });
+      expect(staleReferenced.payload).not.toContain("ownerCategories");
+
       const referenced = await harness.app.inject({
         method: "POST",
         url: `/v1/admin/managed-secret-versions/${secretVersionId}/destruction`,
@@ -199,6 +214,7 @@ describe("Model control Secret containment", () => {
       { inspectSecretReferences: () => [] },
       new FakeClock(now),
       { managedSecretVersionId: () => versionId },
+      { run: (operation) => withImmediateTransaction(database.db, operation) },
     );
     const app = createHttpApp({
       bearerToken: "test-token",

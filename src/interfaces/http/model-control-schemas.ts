@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { PROVIDER_RUNTIME_ERROR_CODES } from "../../domain/errors.js";
+import { VERIFICATION_RESULT_CODES } from "../../domain/errors.js";
 import { agentIdSchema, identifierSchema } from "./schemas.js";
 
 export const invocationProtocolSchema = z.enum(["chat_completions", "responses"]);
@@ -185,7 +185,7 @@ export const modelVerificationResponseSchema = z.strictObject({
   profileRevisionId: identifierSchema,
   capabilityBaseline: z.literal("text_and_single_tool_call_v1"),
   status: z.enum(["queued", "running", "passed", "failed", "cancelled"]),
-  resultCode: z.enum(PROVIDER_RUNTIME_ERROR_CODES).nullable(),
+  resultCode: z.enum(VERIFICATION_RESULT_CODES).nullable(),
   safeStatus: z.number().int().min(400).max(599).nullable(),
   capabilities: z.array(z.enum(["streaming_text", "single_tool_call"])),
   usage: z.strictObject({

@@ -1,4 +1,4 @@
-import { assertPurgeAllowed } from "../domain/model-profile.js";
+import { DomainError } from "../domain/errors.js";
 import type { ManagedSecretVersionId } from "../domain/ids.js";
 import type { ManagedSecretVersionMetadata } from "../domain/managed-secret.js";
 import type { Clock } from "../ports/clock.js";
@@ -9,12 +9,17 @@ import type {
 } from "../ports/managed-secret-store.js";
 import type { ModelRegistryStore } from "../ports/model-registry-store.js";
 
+export interface ManagedSecretTransaction {
+  run<Result>(operation: () => Result): Result;
+}
+
 export class ManageSecretsService {
   constructor(
     private readonly store: ManagedSecretStore,
     private readonly registry: Pick<ModelRegistryStore, "inspectSecretReferences">,
     private readonly clock: Clock,
     private readonly ids: Pick<IdGenerator, "managedSecretVersionId">,
+    private readonly transaction: ManagedSecretTransaction,
   ) {}
 
   createProviderApiKey(input: {
@@ -34,9 +39,24 @@ export class ManageSecretsService {
     readonly versionId: ManagedSecretVersionId;
     readonly expectedRevision: number;
   }): ManagedSecretVersionMetadata {
-    const references = this.registry.inspectSecretReferences(input.versionId);
-    assertPurgeAllowed(references.length);
-    return this.store.destroy({ ...input, now: this.clock.now() });
+    return this.transaction.run(() => {
+      this.store.assertActiveVersion(input);
+      const references = this.registry.inspectSecretReferences(input.versionId);
+      if (references.length > 0) {
+        throw new DomainError("resource_in_use", "resource_in_use", {
+          ownerCategories: [
+            ...new Set(references.map((reference) => reference.type)),
+          ],
+        });
+      }
+      return this.store.destroy({ ...input, now: this.clock.now() });
+    });
+  }
+
+  assertVersionActive(versionId: ManagedSecretVersionId): void {
+    this.transaction.run(() => {
+      this.store.assertActiveVersion({ versionId });
+    });
   }
 
   rotateMasterKey(input: {

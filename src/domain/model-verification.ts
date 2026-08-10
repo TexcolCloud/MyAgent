@@ -1,5 +1,5 @@
 import type { ModelUsage } from "../ports/model.js";
-import type { ProviderRuntimeErrorCode } from "./errors.js";
+import type { VerificationResultCode } from "./errors.js";
 import type { ModelProfileRevisionId, ModelVerificationId } from "./ids.js";
 import {
   MODEL_CAPABILITY_BASELINE,
@@ -14,7 +14,7 @@ export interface ModelVerification {
   readonly state: VerificationState;
   readonly attemptCount: number;
   readonly capabilities: readonly ModelCapability[];
-  readonly resultCode?: ProviderRuntimeErrorCode;
+  readonly resultCode?: VerificationResultCode;
   readonly safeStatus?: number;
   readonly usage?: ModelUsage;
   readonly traceId: string;
@@ -28,7 +28,7 @@ export interface ModelVerification {
 }
 
 export interface VerificationProviderError {
-  readonly code: ProviderRuntimeErrorCode;
+  readonly code: VerificationResultCode;
   readonly transient: boolean;
   readonly retryAfterMs?: number;
   readonly status?: number;

@@ -106,6 +106,7 @@ describe("ManageSecretsService", () => {
       { inspectSecretReferences: () => [] },
       new FakeClock(NOW),
       new FakeIds({ managedSecretVersionIds: [versionId] }),
+      { run: (operation) => operation() },
     );
 
     expect(service.createProviderApiKey({
@@ -114,25 +115,42 @@ describe("ManageSecretsService", () => {
     })).toEqual(metadata(versionId, "provider:deepseek:api-key", NOW));
   });
 
-  it("checks retained references before attempting destruction", () => {
+  it("checks the expected revision before retained references and destruction", () => {
     const versionId = managedSecretVersionIdFromUuid("referenced");
+    const operations: string[] = [];
     const store = serviceStore({
+      assertActiveVersion: (input) => {
+        operations.push(`assert:${input.expectedRevision}`);
+      },
       destroy: () => { throw new Error("destroy_should_not_run"); },
     });
     const service = new ManageSecretsService(
       store,
       {
-        inspectSecretReferences: () => [{
-          type: "retained_run_snapshot",
-          id: "revision-retained",
-        }],
+        inspectSecretReferences: () => {
+          operations.push("inspect");
+          return [{
+            type: "retained_run_snapshot",
+            id: "revision-retained",
+          }];
+        },
       },
       new FakeClock(NOW),
       new FakeIds(),
+      {
+        run: (operation) => {
+          operations.push("transaction");
+          return operation();
+        },
+      },
     );
 
     expect(() => service.destroyVersion({ versionId, expectedRevision: 0 }))
-      .toThrowError("resource_in_use");
+      .toThrowError(expect.objectContaining({
+        code: "resource_in_use",
+        details: { ownerCategories: ["retained_run_snapshot"] },
+      }));
+    expect(operations).toEqual(["transaction", "assert:0", "inspect"]);
   });
 
   it("supplies current time to allowed destruction and Keyring rotation", () => {
@@ -140,6 +158,11 @@ describe("ManageSecretsService", () => {
     const destroyedAt = new Date("2026-08-09T00:00:00.000Z");
     const destroyed = { ...metadata(versionId, "provider:key", NOW), state: "destroyed" as const, recordRevision: 1, destroyedAt };
     const store = serviceStore({
+      assertActiveVersion: (input) => {
+        if (input.versionId !== versionId || input.expectedRevision !== 0) {
+          throw new Error("wrong_assert_input");
+        }
+      },
       destroy: (input) => input.now.getTime() === NOW.getTime() && input.expectedRevision === 0
         ? destroyed
         : (() => { throw new Error("wrong_destroy_input"); })(),
@@ -152,6 +175,7 @@ describe("ManageSecretsService", () => {
       { inspectSecretReferences: () => [] },
       new FakeClock(NOW),
       new FakeIds(),
+      { run: (operation) => operation() },
     );
 
     expect(service.destroyVersion({ versionId, expectedRevision: 0 })).toEqual(destroyed);
@@ -181,6 +205,7 @@ function serviceStore(
   return {
     createVersion: () => { throw new Error("unexpected_create"); },
     resolve: () => { throw new Error("unexpected_resolve"); },
+    assertActiveVersion: () => { throw new Error("unexpected_assert"); },
     destroy: () => { throw new Error("unexpected_destroy"); },
     rotateMasterKey: () => { throw new Error("unexpected_rotate"); },
     ...overrides,

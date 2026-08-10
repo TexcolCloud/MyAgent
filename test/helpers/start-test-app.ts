@@ -62,7 +62,13 @@ export async function startTestApp(
   const managedSecrets = new SqliteEncryptedSecretStore(connection.db, {
     MYAGENT_MASTER_KEY: TEST_MASTER_KEY,
   });
-  const manageSecrets = new ManageSecretsService(managedSecrets, modelRegistry, clock, ids);
+  const manageSecrets = new ManageSecretsService(
+    managedSecrets,
+    modelRegistry,
+    clock,
+    ids,
+    { run: (operation) => withImmediateTransaction(connection.db, operation) },
+  );
   const manageConnections = new ManageProviderConnectionsService(
     modelRegistry,
     manageSecrets,

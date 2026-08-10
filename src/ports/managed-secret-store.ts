@@ -15,6 +15,11 @@ export interface DestroyManagedSecretVersionInput {
   readonly now: Date;
 }
 
+export interface AssertManagedSecretVersionInput {
+  readonly versionId: ManagedSecretVersionId;
+  readonly expectedRevision?: number;
+}
+
 export interface RotateManagedSecretKeyInput {
   readonly expectedRevision: number;
   readonly now: Date;
@@ -29,6 +34,7 @@ export interface ManagedSecretRotationResult {
 export interface ManagedSecretStore {
   createVersion(input: CreateManagedSecretVersionInput): ManagedSecretVersionMetadata;
   resolve(versionId: ManagedSecretVersionId): string;
+  assertActiveVersion(input: AssertManagedSecretVersionInput): void;
   destroy(input: DestroyManagedSecretVersionInput): ManagedSecretVersionMetadata;
   rotateMasterKey(input: RotateManagedSecretKeyInput): ManagedSecretRotationResult;
 }

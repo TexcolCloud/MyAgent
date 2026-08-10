@@ -1,9 +1,7 @@
 import type { FastifyInstance } from "fastify";
 
 import type { ManageSecretsService } from "../../../application/manage-secrets.js";
-import { ApplicationError } from "../../../domain/errors.js";
 import type { ManagedSecretVersionId } from "../../../domain/ids.js";
-import type { ModelRegistryStore } from "../../../ports/model-registry-store.js";
 import {
   confirmedDestructionSchema,
   expectedRevisionSchema,
@@ -18,7 +16,6 @@ export function registerManagedSecretRoutes(
       ManageSecretsService,
       "destroyVersion" | "rotateMasterKey"
     >;
-    readonly registry: Pick<ModelRegistryStore, "inspectSecretReferences">;
   },
 ): void {
   app.post(
@@ -28,12 +25,6 @@ export function registerManagedSecretRoutes(
         (request.params as { secretVersionId: string }).secretVersionId as
           ManagedSecretVersionId;
       const body = parseSchema(confirmedDestructionSchema, request.body);
-      const references = services.registry.inspectSecretReferences(versionId);
-      if (references.length > 0) {
-        throw new ApplicationError("resource_in_use", 409, "resource_in_use", {
-          ownerCategories: [...new Set(references.map((reference) => reference.type))],
-        });
-      }
       services.secrets.destroyVersion({
         versionId,
         expectedRevision: body.expectedRevision,

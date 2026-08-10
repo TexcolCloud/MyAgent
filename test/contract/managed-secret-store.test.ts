@@ -7,6 +7,7 @@ import { SqliteEncryptedSecretStore } from "../../src/adapters/sqlite/encrypted-
 import {
   openDatabase,
   type SqliteDatabase,
+  withImmediateTransaction,
 } from "../../src/adapters/sqlite/database.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
@@ -364,6 +365,7 @@ describe("SqliteEncryptedSecretStore", () => {
       new SqliteModelRegistryRepository(db),
       new FakeClock(LATER),
       new FakeIds(),
+      { run: (operation) => withImmediateTransaction(db, operation) },
     );
 
     expect(() => service.destroyVersion({ versionId, expectedRevision: 0 }))
@@ -374,6 +376,78 @@ describe("SqliteEncryptedSecretStore", () => {
       record_revision: 0,
       destroyed_at: null,
     });
+  });
+
+  it("serializes a two-connection reference race before destruction", () => {
+    const databasePath = tempPath("managed-secret-reference-race.db");
+    const owner = createStore(databasePath, {
+      MYAGENT_MASTER_KEY: CURRENT_KEY,
+    });
+    const contender = openDatabase({ path: databasePath, busyTimeoutMs: 10 });
+    opened.push(contender);
+    const versionId = version("reference-race");
+    owner.store.createVersion(createInput(versionId, "race-secret"));
+    const contenderStore = new SqliteEncryptedSecretStore(contender.db, {
+      MYAGENT_MASTER_KEY: CURRENT_KEY,
+    });
+    const contenderService = new ManageSecretsService(
+      contenderStore,
+      new SqliteModelRegistryRepository(contender.db),
+      new FakeClock(LATER),
+      new FakeIds(),
+      { run: (operation) => withImmediateTransaction(contender.db, operation) },
+    );
+    let referenceTransactionOpen = false;
+    try {
+      owner.db.exec("BEGIN IMMEDIATE");
+      referenceTransactionOpen = true;
+      owner.db.prepare(
+        `INSERT INTO provider_connections (
+           connection_id, display_name, provider_kind, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run("racing", "Racing", "openai", NOW.toISOString(), NOW.toISOString());
+      owner.db.prepare(
+        `INSERT INTO provider_connection_revisions (
+           revision_id, connection_id, state, base_url, auth_json,
+           allow_insecure_http, protocol_preference, preset_version, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "pcr_racing",
+        "racing",
+        "draft",
+        "https://api.openai.example/v1",
+        JSON.stringify({
+          type: "bearer",
+          secret: { managedSecretVersionId: versionId },
+        }),
+        0,
+        "responses",
+        "2026-08-09",
+        NOW.toISOString(),
+      );
+
+      expect(() => contenderService.destroyVersion({
+        versionId,
+        expectedRevision: 0,
+      })).toThrowError(expect.objectContaining({ errcode: 5 }));
+      expect(readSecretRow(owner.db, versionId).state).toBe("active");
+
+      owner.db.exec("COMMIT");
+      referenceTransactionOpen = false;
+      expect(() => contenderService.destroyVersion({
+        versionId,
+        expectedRevision: 0,
+      })).toThrowError(expect.objectContaining({
+        code: "resource_in_use",
+        details: { ownerCategories: ["provider_connection_revision"] },
+      }));
+      expect(readSecretRow(owner.db, versionId)).toMatchObject({
+        state: "active",
+        record_revision: 0,
+      });
+    } finally {
+      if (referenceTransactionOpen) owner.db.exec("ROLLBACK");
+    }
   });
 
   it("restarts with both generations, resolves old rows, and blocks creation before rotation", () => {

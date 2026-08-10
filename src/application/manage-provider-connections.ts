@@ -88,7 +88,10 @@ export interface PromoteProviderConnectionInput extends MutateProviderConnection
 export class ManageProviderConnectionsService {
   constructor(
     private readonly registry: ConnectionManagementRegistry,
-    private readonly secrets: Pick<ManageSecretsService, "createProviderApiKey">,
+    private readonly secrets: Pick<
+      ManageSecretsService,
+      "assertVersionActive" | "createProviderApiKey"
+    >,
     private readonly clock: Pick<Clock, "now">,
     private readonly ids: Pick<
       IdGenerator,
@@ -239,6 +242,7 @@ export class ManageProviderConnectionsService {
           secret: { fromEnvironment: credential.fromEnvironment },
         };
       case "managed_secret":
+        this.secrets.assertVersionActive(credential.managedSecretVersionId);
         return {
           type: "bearer",
           secret: {

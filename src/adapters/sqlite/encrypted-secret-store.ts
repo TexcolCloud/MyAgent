@@ -11,6 +11,7 @@ import { ApplicationError, DomainError } from "../../domain/errors.js";
 import type { ManagedSecretVersionId } from "../../domain/ids.js";
 import type { ManagedSecretVersionMetadata } from "../../domain/managed-secret.js";
 import type {
+  AssertManagedSecretVersionInput,
   CreateManagedSecretVersionInput,
   DestroyManagedSecretVersionInput,
   ManagedSecretRotationResult,
@@ -126,11 +127,21 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
     }
   }
 
+  assertActiveVersion(input: AssertManagedSecretVersionInput): void {
+    const row = this.row(input.versionId);
+    if (row === undefined || row.state !== "active") throwLocked();
+    if (
+      input.expectedRevision !== undefined &&
+      row.record_revision !== input.expectedRevision
+    ) {
+      throwRevisionConflict();
+    }
+  }
+
   destroy(input: DestroyManagedSecretVersionInput): ManagedSecretVersionMetadata {
     return this.immediate(() => {
-      const row = this.row(input.versionId);
-      if (row === undefined || row.state !== "active") throwLocked();
-      if (row.record_revision !== input.expectedRevision) throwRevisionConflict();
+      this.assertActiveVersion(input);
+      const row = this.requiredActiveRow(input.versionId);
       const keyring = this.keyring();
       if (keyring === undefined) throwLocked();
       const generation = this.authoritativeGeneration(keyring, row);

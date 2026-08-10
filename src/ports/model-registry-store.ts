@@ -11,6 +11,7 @@ import type {
   ProviderConnectionRevisionId,
 } from "../domain/ids.js";
 import type { SecretReferenceOwner } from "../domain/managed-secret.js";
+import type { VerificationResultCode } from "../domain/errors.js";
 import type {
   DefaultModelProfile,
   ModelAssignment,
@@ -109,7 +110,7 @@ export interface CompleteVerificationInput extends MutationContext {
   readonly leaseOwner: string;
   readonly outcome: "passed" | "failed";
   readonly capabilities: ModelVerification["capabilities"];
-  readonly resultCode?: string;
+  readonly resultCode?: VerificationResultCode;
   readonly safeStatus?: number;
   readonly usage?: ModelUsage;
   readonly fallback?: {

@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import type { EffectiveModelRuntime } from "../domain/agent-revision.js";
 import {
   DomainError,
-  PROVIDER_RUNTIME_ERROR_CODES,
-  type ProviderRuntimeErrorCode,
+  VERIFICATION_RESULT_CODES,
+  type VerificationResultCode,
 } from "../domain/errors.js";
 import {
   canTryFallback,
@@ -89,7 +89,7 @@ interface ProbeResult {
 }
 
 interface SafeProbeFailure {
-  readonly code: ProviderRuntimeErrorCode;
+  readonly code: VerificationResultCode;
   readonly status?: number;
   readonly unsupportedEndpoint?: ValidatedUnsupportedEndpointEvidence;
 }
@@ -164,7 +164,7 @@ export class VerifyModelService {
 
   failClaimed(
     claimed: ModelVerification,
-    code: ProviderRuntimeErrorCode = "provider_unavailable",
+    code: VerificationResultCode = "provider_unavailable",
   ): ModelVerification {
     if (claimed.state !== "running" || claimed.leaseOwner === null) {
       throw new DomainError("verification_lease_lost");
@@ -571,7 +571,7 @@ function safeProbeFailure(error: unknown): SafeProbeFailure | undefined {
       ...(status === undefined ? {} : { status }),
     };
   }
-  if (error instanceof DomainError && isProviderRuntimeErrorCode(error.code)) {
+  if (error instanceof DomainError && isVerificationResultCode(error.code)) {
     return { code: error.code };
   }
   return undefined;
@@ -601,12 +601,12 @@ function findProviderError(error: unknown): ModelProviderError | undefined {
   return undefined;
 }
 
-function normalizedProviderCode(code: string): ProviderRuntimeErrorCode {
-  return isProviderRuntimeErrorCode(code) ? code : "model_protocol_error";
+function normalizedProviderCode(code: string): VerificationResultCode {
+  return isVerificationResultCode(code) ? code : "model_protocol_error";
 }
 
-function isProviderRuntimeErrorCode(code: string): code is ProviderRuntimeErrorCode {
-  return PROVIDER_RUNTIME_ERROR_CODES.includes(code as ProviderRuntimeErrorCode);
+function isVerificationResultCode(code: string): code is VerificationResultCode {
+  return VERIFICATION_RESULT_CODES.includes(code as VerificationResultCode);
 }
 
 function isEndpointAbsenceProtocolError(

@@ -1,6 +1,11 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 
-import { ApplicationError, DomainError } from "../../domain/errors.js";
+import {
+  ApplicationError,
+  DomainError,
+  PUBLIC_PROBLEM_CODES,
+  type PublicProblemCode,
+} from "../../domain/errors.js";
 import { ModelProviderError } from "../../ports/model.js";
 
 interface Problem {
@@ -44,6 +49,7 @@ export function sendError(
   reply: FastifyReply,
 ): FastifyReply {
   if (error instanceof ApplicationError) {
+    if (!isPublicProblemCode(error.code)) return sendInternalError(request, reply);
     return sendProblem(
       reply,
       request,
@@ -54,6 +60,7 @@ export function sendError(
     );
   }
   if (error instanceof DomainError) {
+    if (!isPublicProblemCode(error.code)) return sendInternalError(request, reply);
     return sendProblem(
       reply,
       request,
@@ -93,8 +100,7 @@ export function sendError(
   if (isSqliteUnavailable(error)) {
     return sendProblem(reply, request, 503, "database_unavailable", "The database is temporarily unavailable.");
   }
-  request.log.error({ traceId: request.id, code: "internal_error" }, "request failed");
-  return sendProblem(reply, request, 500, "internal_error", "The request could not be completed.");
+  return sendInternalError(request, reply);
 }
 
 const CONTROL_PLANE_NOT_FOUND_CODES = [
@@ -133,6 +139,24 @@ function isMalformedRequest(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const httpError = error as Error & { statusCode?: unknown; code?: unknown };
   return httpError.statusCode === 400 || httpError.code === "FST_ERR_CTP_INVALID_JSON_BODY";
+}
+
+function isPublicProblemCode(code: string): code is PublicProblemCode {
+  return PUBLIC_PROBLEM_CODES.includes(code as PublicProblemCode);
+}
+
+function sendInternalError(
+  request: FastifyRequest,
+  reply: FastifyReply,
+): FastifyReply {
+  request.log.error({ traceId: request.id, code: "internal_error" }, "request failed");
+  return sendProblem(
+    reply,
+    request,
+    500,
+    "internal_error",
+    "The request could not be completed.",
+  );
 }
 
 function domainStatus(code: string): number {

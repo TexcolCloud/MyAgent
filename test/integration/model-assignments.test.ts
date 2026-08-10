@@ -373,11 +373,64 @@ describe("AssignModelService", () => {
 });
 
 describe("ManageProviderConnectionsService", () => {
+  it("cannot create a reference to a Secret destroyed by the serialized winner", () => {
+    usingFixture("connection-destroyed-secret", ({ db, repository }) => {
+      const clock = new FakeClock(NOW);
+      const versionId = "msv_destroyed_winner" as ManagedSecretVersionId;
+      const ids = new FakeIds({
+        providerConnectionRevisionIds: [
+          "pcr_destroyed_secret" as ProviderConnectionRevisionId,
+        ],
+        modelRegistryEventIds: [
+          "mre_destroyed_secret" as ModelRegistryEventId,
+        ],
+      });
+      const secretStore = new SqliteEncryptedSecretStore(db, {
+        MYAGENT_MASTER_KEY: Buffer.alloc(32, 13).toString("base64"),
+      });
+      secretStore.createVersion({
+        versionId,
+        secretId: "destroyed-winner",
+        purpose: "provider_api_key",
+        plaintext: "destroyed-winner-secret",
+        now: NOW,
+      });
+      const secrets = new ManageSecretsService(
+        secretStore,
+        repository,
+        clock,
+        ids,
+        transaction(db),
+      );
+      secrets.destroyVersion({ versionId, expectedRevision: 0 });
+      const service = new ManageProviderConnectionsService(
+        repository,
+        secrets,
+        clock,
+        ids,
+        transaction(db),
+      );
+
+      expect(() => service.create({
+        connectionId: "destroyed-secret" as ProviderConnectionId,
+        displayName: "Destroyed Secret",
+        providerKind: "openai",
+        credential: { type: "managed_secret", managedSecretVersionId: versionId },
+        traceId: "destroyed-secret",
+      })).toThrowError(expect.objectContaining({ code: "secret_locked" }));
+      expect(tableCount(db, "provider_connections")).toBe(0);
+      expect(tableCount(db, "provider_connection_revisions")).toBe(0);
+    });
+  });
+
   it("rejects no-auth OpenAI presets without creating registry state", () => {
     usingFixture("connection-required-auth", ({ db, repository }) => {
       const service = new ManageProviderConnectionsService(
         repository,
-        { createProviderApiKey: () => { throw new Error("must_not_create_secret"); } },
+        {
+          assertVersionActive: () => { throw new Error("must_not_assert_secret"); },
+          createProviderApiKey: () => { throw new Error("must_not_create_secret"); },
+        },
         new FakeClock(NOW),
         new FakeIds({
           providerConnectionRevisionIds: [
@@ -429,7 +482,10 @@ describe("ManageProviderConnectionsService", () => {
       ).run();
       const service = new ManageProviderConnectionsService(
         repository,
-        { createProviderApiKey: () => { throw new Error("must_not_create_secret"); } },
+        {
+          assertVersionActive: () => { throw new Error("must_not_assert_secret"); },
+          createProviderApiKey: () => { throw new Error("must_not_create_secret"); },
+        },
         new FakeClock(NOW),
         new FakeIds({
           providerConnectionRevisionIds: [
@@ -473,7 +529,13 @@ describe("ManageProviderConnectionsService", () => {
       const secretStore = new SqliteEncryptedSecretStore(db, {
         MYAGENT_MASTER_KEY: Buffer.alloc(32, 7).toString("base64"),
       });
-      const secrets = new ManageSecretsService(secretStore, repository, clock, ids);
+      const secrets = new ManageSecretsService(
+        secretStore,
+        repository,
+        clock,
+        ids,
+        transaction(db),
+      );
       const service = new ManageProviderConnectionsService(
         repository,
         secrets,
@@ -598,7 +660,13 @@ describe("ManageProviderConnectionsService", () => {
       });
       const service = new ManageProviderConnectionsService(
         repository,
-        new ManageSecretsService(secretStore, repository, clock, ids),
+        new ManageSecretsService(
+          secretStore,
+          repository,
+          clock,
+          ids,
+          transaction(db),
+        ),
         clock,
         ids,
         transaction(db),
