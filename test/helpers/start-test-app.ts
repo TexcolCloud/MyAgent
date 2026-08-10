@@ -156,8 +156,40 @@ export interface VerifiedModelSetup {
   readonly verificationId: string;
 }
 
+export interface AsyncCleanupStack {
+  use<T>(resource: T, cleanup: (resource: T) => Promise<void> | void): T;
+  dispose(): Promise<void>;
+}
+
+export function createAsyncCleanupStack(): AsyncCleanupStack {
+  const cleanups: Array<() => Promise<void> | void> = [];
+  let disposed = false;
+  return {
+    use<T>(resource: T, cleanup: (resource: T) => Promise<void> | void): T {
+      if (disposed) throw new Error("cleanup_stack_disposed");
+      cleanups.push(() => cleanup(resource));
+      return resource;
+    },
+    async dispose(): Promise<void> {
+      if (disposed) return;
+      disposed = true;
+      let firstError: unknown;
+      for (const cleanup of cleanups.reverse()) {
+        try {
+          await cleanup();
+        } catch (error) {
+          firstError ??= error;
+        }
+      }
+      if (firstError !== undefined) throw firstError;
+    },
+  };
+}
+
 export async function startRealTestApp(options: {
   readonly verificationRequestTimeoutMs?: number;
+  readonly listenPort?: number;
+  readonly onRootCreated?: (root: string) => void;
 } = {}): Promise<{
   readonly root: string;
   readonly url: string;
@@ -165,6 +197,7 @@ export async function startRealTestApp(options: {
   readonly databasePath: string;
   readonly primaryWorkspace: string;
   readonly logs: readonly string[];
+  readonly setupResponseBodies: readonly string[];
   setupVerifiedModel(input: {
     connectionSlug: string;
     profileSlug: string;
@@ -195,6 +228,7 @@ export async function startRealTestApp(options: {
   close(): Promise<void>;
 }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "myagent-real-e2e-"));
+  options.onRootCreated?.(root);
   const configRoot = path.join(root, "config");
   await cp(EXAMPLES, configRoot, { recursive: true });
   const configPath = path.join(configRoot, "myagent.yaml");
@@ -221,13 +255,14 @@ export async function startRealTestApp(options: {
   process.env.MYAGENT_MASTER_KEY = TEST_MASTER_KEY;
 
   const logs: string[] = [];
+  const setupResponseBodies: string[] = [];
   let service: BootstrappedService | undefined;
   let closed = false;
 
   const start = async (): Promise<void> => {
     if (service !== undefined) return;
     service = await bootstrap(configPath, {
-      listen: { host: "127.0.0.1", port: 0 },
+      listen: { host: "127.0.0.1", port: options.listenPort ?? 0 },
       signals: false,
       log: { write: (line) => logs.push(line) },
       worker: { concurrency: 1, idleDelayMs: 10, leaseDurationMs: 1_000 },
@@ -256,6 +291,14 @@ export async function startRealTestApp(options: {
   });
   const adminRequest = (pathname: string, init: RequestInit = {}): Promise<Response> =>
     request(REAL_ADMIN_TOKEN, `/v1/admin${pathname}`, init);
+  const setupAdminRequest = async (
+    pathname: string,
+    init: RequestInit = {},
+  ): Promise<Response> => {
+    const response = await adminRequest(pathname, init);
+    setupResponseBodies.push(await response.clone().text());
+    return response;
+  };
   const runRequest = (pathname: string, init: RequestInit = {}): Promise<Response> =>
     request(REAL_RUN_TOKEN, pathname, init);
   const requireStatus = async (
@@ -285,11 +328,12 @@ export async function startRealTestApp(options: {
     databasePath,
     primaryWorkspace,
     logs,
+    setupResponseBodies,
     async setupVerifiedModel(input): Promise<VerifiedModelSetup> {
       if (input.apiKey !== undefined && input.apiKeyEnvironment !== undefined) {
         throw new Error("real_test_provider_auth_ambiguous");
       }
-      const connectionResponse = await requireStatus(await adminRequest(
+      const connectionResponse = await requireStatus(await setupAdminRequest(
         "/provider-connections",
         {
           method: "POST",
@@ -315,13 +359,13 @@ export async function startRealTestApp(options: {
       const connectionRevisionId = connection.revisions[0]?.revisionId;
       if (connectionRevisionId === undefined) throw new Error("connection_revision_missing");
 
-      const discoveryResponse = await requireStatus(await adminRequest(
+      const discoveryResponse = await requireStatus(await setupAdminRequest(
         `/provider-connection-revisions/${connectionRevisionId}/discover`,
         { method: "POST", body: JSON.stringify({ expectedRevision: 0 }) },
       ), 200, "discover_models");
       const discovery = await discoveryResponse.json() as { recordRevision: number };
 
-      const profileResponse = await requireStatus(await adminRequest(
+      const profileResponse = await requireStatus(await setupAdminRequest(
         "/model-profiles",
         {
           method: "POST",
@@ -344,7 +388,7 @@ export async function startRealTestApp(options: {
       const profileRevisionId = profile.revisions[0]?.revisionId;
       if (profileRevisionId === undefined) throw new Error("profile_revision_missing");
 
-      const queuedResponse = await requireStatus(await adminRequest(
+      const queuedResponse = await requireStatus(await setupAdminRequest(
         `/model-profile-revisions/${profileRevisionId}/verifications`,
         {
           method: "POST",
@@ -356,14 +400,14 @@ export async function startRealTestApp(options: {
       ), 202, "queue_verification");
       const queued = await queuedResponse.json() as { verificationId: string };
       const verification = await waitForVerification(
-        () => adminRequest(`/model-verifications/${queued.verificationId}`),
+        () => setupAdminRequest(`/model-verifications/${queued.verificationId}`),
         input.verificationTimeoutMs ?? 10_000,
       );
       if (verification.status !== "passed") {
         throw new Error(`verification_failed:${verification.resultCode ?? verification.status}`);
       }
 
-      await requireStatus(await adminRequest(
+      await requireStatus(await setupAdminRequest(
         `/provider-connections/${connection.connectionId}/promotions`,
         {
           method: "POST",
@@ -374,12 +418,12 @@ export async function startRealTestApp(options: {
         },
       ), 200, "promote_connection");
       const currentProfileResponse = await requireStatus(
-        await adminRequest(`/model-profiles/${profile.profileId}`),
+        await setupAdminRequest(`/model-profiles/${profile.profileId}`),
         200,
         "read_profile",
       );
       const currentProfile = await currentProfileResponse.json() as { recordRevision: number };
-      await requireStatus(await adminRequest(
+      await requireStatus(await setupAdminRequest(
         `/model-profiles/${profile.profileId}/promotions`,
         {
           method: "POST",
@@ -390,14 +434,14 @@ export async function startRealTestApp(options: {
         },
       ), 200, "promote_profile");
       const currentAssignmentResponse = await requireStatus(
-        await adminRequest(`/agents/${input.agentId}/model-assignment`),
+        await setupAdminRequest(`/agents/${input.agentId}/model-assignment`),
         200,
         "read_assignment",
       );
       const currentAssignment = await currentAssignmentResponse.json() as {
         recordRevision: number | null;
       };
-      await requireStatus(await adminRequest(
+      await requireStatus(await setupAdminRequest(
         `/agents/${input.agentId}/model-assignment`,
         {
           method: "PUT",

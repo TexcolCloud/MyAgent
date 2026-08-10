@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -6,21 +8,66 @@ import { describe, expect, it } from "vitest";
 
 import { executeCli } from "../../src/interfaces/cli/main.js";
 import { FakeOpenAiProvider } from "../helpers/fake-openai-provider.js";
-import { startRealTestApp } from "../helpers/start-test-app.js";
+import {
+  createAsyncCleanupStack,
+  startRealTestApp,
+} from "../helpers/start-test-app.js";
 
 describe("multi-provider model registry release isolation", () => {
+  it("cleans partial service startup before closing an earlier provider", async () => {
+    const cleanup = createAsyncCleanupStack();
+    let providerModelsUrl = "";
+    try {
+      const provider = cleanup.use(
+        await FakeOpenAiProvider.start({ models: ["cleanup-model"] }),
+        (active) => active.close(),
+      );
+      providerModelsUrl = `${provider.baseUrl}/models`;
+      const occupiedPort = Number(new URL(provider.baseUrl).port);
+      const previousEnvironment = {
+        runToken: process.env.MYAGENT_BEARER_TOKEN,
+        adminToken: process.env.MYAGENT_ADMIN_TOKEN,
+        masterKey: process.env.MYAGENT_MASTER_KEY,
+      };
+      let failedRoot = "";
+      const startup = await startRealTestApp({
+        listenPort: occupiedPort,
+        onRootCreated: (root: string) => { failedRoot = root; },
+      }).then(
+        (service) => ({ service }),
+        (error: unknown) => ({ error }),
+      );
+      if ("service" in startup) await startup.service.close();
+
+      expect("error" in startup).toBe(true);
+      if (!("error" in startup)) throw new Error("expected_startup_failure");
+      expect(String(startup.error)).toMatch(/EADDRINUSE|address already in use/i);
+      expect(failedRoot.length).toBeGreaterThan(0);
+      expect(existsSync(failedRoot)).toBe(false);
+      expect(process.env.MYAGENT_BEARER_TOKEN).toBe(previousEnvironment.runToken);
+      expect(process.env.MYAGENT_ADMIN_TOKEN).toBe(previousEnvironment.adminToken);
+      expect(process.env.MYAGENT_MASTER_KEY).toBe(previousEnvironment.masterKey);
+      expect((await fetch(providerModelsUrl)).status).toBe(200);
+    } finally {
+      await cleanup.dispose();
+    }
+    await expect(fetch(providerModelsUrl, { signal: AbortSignal.timeout(1_000) }))
+      .rejects.toThrow();
+  });
+
   it("honors the caller's Verification polling deadline", async () => {
-    const provider = await FakeOpenAiProvider.start({
-      models: ["slow-verification-model"],
-      chat: [{
-        type: "verification_text",
-        text: "slow verification response",
-        delayMs: 200,
-      }],
-    });
-    const service = await startRealTestApp();
+    const cleanup = createAsyncCleanupStack();
 
     try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["slow-verification-model"],
+        chat: [{
+          type: "verification_text",
+          text: "slow verification response",
+          delayMs: 200,
+        }],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp(), (active) => active.close());
       const input = {
         connectionSlug: "slow-verification",
         profileSlug: "slow-verification",
@@ -32,30 +79,61 @@ describe("multi-provider model registry release isolation", () => {
       } as Parameters<typeof service.setupVerifiedModel>[0];
       await expect(service.setupVerifiedModel(input)).rejects.toThrow(/verification_timeout:/);
     } finally {
-      await service.close();
-      await provider.close();
+      await cleanup.dispose();
     }
   }, 10_000);
 
   it("runs separate Chat and Responses profiles without Session, Tool, or provider-request leakage", async () => {
     const chatMarker = "CHAT_AGENT_REQUEST_MARKER";
     const responsesMarker = "RESPONSES_AGENT_REQUEST_MARKER";
-    const provider = await FakeOpenAiProvider.start({
-      models: ["chat-release-model", "responses-release-model"],
-      chat: [
-        { type: "verification_text", text: "chat verification passed" },
-        { type: "verification_tool", callId: "verify-chat-call" },
-        { type: "text", text: "chat agent completed" },
-      ],
-      responses: [
-        { type: "verification_text", text: "responses verification passed" },
-        { type: "verification_tool", callId: "verify-responses-call" },
-        { type: "text", text: "responses agent completed" },
-      ],
-    });
-    const service = await startRealTestApp();
+    const chatCallId = "chat-isolation-call-16";
+    const responsesCallId = "responses-isolation-call-16";
+    const chatToolArgument = "CHAT_TOOL_ARGUMENT_MARKER_16";
+    const chatToolResult = createHash("sha256").update(chatToolArgument).digest("hex");
+    const responsesToolResult = "RESPONSES_TOOL_RESULT_MARKER_16";
+    const encodedResponsesResult = Buffer.from(responsesToolResult).toString("base64");
+    const cleanup = createAsyncCleanupStack();
 
     try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["chat-release-model", "responses-release-model"],
+        chat: [
+        { type: "verification_text", text: "chat verification passed" },
+        { type: "verification_tool", callId: "verify-chat-call" },
+        {
+          type: "tool",
+          callId: chatCallId,
+          name: "write_file",
+          arguments: {
+            path: "chat-isolation.txt",
+            content: chatToolArgument,
+            expectedSha256: null,
+          },
+        },
+        { type: "text", text: "chat agent completed" },
+        ],
+        responses: [
+        { type: "verification_text", text: "responses verification passed" },
+        { type: "verification_tool", callId: "verify-responses-call" },
+        {
+          type: "tool",
+          callId: responsesCallId,
+          name: "run_command",
+          arguments: {
+            program: process.execPath,
+            args: [
+              "-e",
+              `process.stdout.write(Buffer.from("${encodedResponsesResult}", "base64").toString("utf8"))`,
+            ],
+            cwd: ".",
+            env: {},
+            timeoutMs: 5_000,
+          },
+        },
+        { type: "text", text: "responses agent completed" },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp(), (active) => active.close());
       const chat = await service.setupVerifiedModel({
         connectionSlug: "chat-release",
         profileSlug: "chat-release",
@@ -89,12 +167,25 @@ describe("multi-provider model registry release isolation", () => {
         }),
       ]);
       await Promise.all([
+        service.waitForRunEvent(chatRun.runId, "approval.required"),
+        service.waitForRunEvent(responsesRun.runId, "approval.required"),
+      ]);
+      const approvalsResponse = await service.runRequest("/v1/approvals?status=pending");
+      expect(approvalsResponse.status).toBe(200);
+      const approvals = await approvalsResponse.json() as {
+        approvals: Array<{ approvalId: string; runId: string }>;
+      };
+      expect(new Set(approvals.approvals.map(({ runId }) => runId))).toEqual(
+        new Set([chatRun.runId, responsesRun.runId]),
+      );
+      await Promise.all(approvals.approvals.map(({ approvalId }) => service.approve(approvalId)));
+      await Promise.all([
         service.waitForRunStatus(chatRun.runId, "completed"),
         service.waitForRunStatus(responsesRun.runId, "completed"),
       ]);
 
-      expect(provider.chatRequests).toHaveLength(1);
-      expect(provider.responsesRequests).toHaveLength(1);
+      expect(provider.chatRequests).toHaveLength(2);
+      expect(provider.responsesRequests).toHaveLength(2);
       const chatRequest = JSON.stringify(provider.chatRequests);
       const responsesRequest = JSON.stringify(provider.responsesRequests);
       expect(chatRequest).toContain(chatMarker);
@@ -103,6 +194,34 @@ describe("multi-provider model registry release isolation", () => {
       expect(responsesRequest).not.toContain(chatMarker);
       expect(chatRequest).not.toContain("Researcher Agent");
       expect(responsesRequest).not.toContain("Primary Agent");
+      const chatHistory = JSON.stringify(
+        (provider.chatRequests[1]!.body as { messages?: unknown }).messages,
+      );
+      const responsesHistory = JSON.stringify(
+        (provider.responsesRequests[1]!.body as { input?: unknown }).input,
+      );
+      for (const own of [
+        chatMarker,
+        chatCallId,
+        "write_file",
+        chatToolArgument,
+        chatToolResult,
+      ]) {
+        expect(chatHistory).toContain(own);
+        expect(responsesHistory).not.toContain(own);
+      }
+      for (const own of [
+        responsesMarker,
+        responsesCallId,
+        "run_command",
+        encodedResponsesResult,
+        responsesToolResult,
+      ]) {
+        expect(responsesHistory).toContain(own);
+        expect(chatHistory).not.toContain(own);
+      }
+      expect(await readFile(path.join(service.primaryWorkspace, "chat-isolation.txt"), "utf8"))
+        .toBe(chatToolArgument);
       expect([...provider.chatRequests, ...provider.responsesRequests].every((request) =>
         !("authorization" in request))).toBe(true);
 
@@ -145,22 +264,301 @@ describe("multi-provider model registry release isolation", () => {
         database.close();
       }
     } finally {
-      await service.close();
-      await provider.close();
+      await cleanup.dispose();
     }
   }, 30_000);
+
+  it("contains managed plaintext and raw provider fields across the composed system", async () => {
+    const managedPlaintext = "MANAGED_PLAINTEXT_COMPOSED_MARKER_16";
+    const rawReasoning = "RAW_REASONING_COMPOSED_MARKER_16";
+    const rawResponsesReasoning = "RAW_RESPONSES_REASONING_COMPOSED_MARKER_16";
+    const rawProviderBody = "RAW_PROVIDER_BODY_COMPOSED_MARKER_16";
+    const cleanup = createAsyncCleanupStack();
+
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["containment-chat-model", "containment-responses-model"],
+        expectedApiKey: managedPlaintext,
+        chat: [
+        { type: "verification_text", text: "containment verification passed" },
+        { type: "verification_tool", callId: "verify-containment-call" },
+        {
+          type: "text",
+          text: "normalized containment completion",
+          reasoning: rawReasoning,
+          rawBody: rawProviderBody,
+        },
+        ],
+        responses: [
+        { type: "verification_text", text: "Responses containment verification passed" },
+        { type: "verification_tool", callId: "verify-responses-containment-call" },
+        {
+          type: "text",
+          text: "normalized Responses containment completion",
+          reasoning: rawResponsesReasoning,
+          rawBody: rawProviderBody,
+        },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp(), (active) => active.close());
+      const setup = await service.setupVerifiedModel({
+        connectionSlug: "composed-containment",
+        profileSlug: "composed-containment",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "containment-chat-model",
+        protocol: "chat_completions",
+        agentId: "primary",
+        apiKey: managedPlaintext,
+      });
+      const responsesSetup = await service.setupVerifiedModel({
+        connectionSlug: "composed-responses-containment",
+        profileSlug: "composed-responses-containment",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "containment-responses-model",
+        protocol: "responses",
+        agentId: "researcher",
+      });
+      const setupResponseBodies = service.setupResponseBodies;
+      expect(setupResponseBodies.length).toBeGreaterThan(0);
+      provider.clearCapturedRequests();
+
+      const [chatRun, responsesRun] = await Promise.all([
+        service.createRun({
+          agentId: "primary",
+          sessionKey: "composed:containment",
+          text: "Exercise the normalized Chat provider boundary.",
+          idempotencyKey: "composed-containment-chat-run",
+        }),
+        service.createRun({
+          agentId: "researcher",
+          sessionKey: "composed:containment",
+          text: "Exercise the normalized Responses provider boundary.",
+          idempotencyKey: "composed-containment-responses-run",
+        }),
+      ]);
+      await Promise.all([
+        service.waitForRunStatus(chatRun.runId, "completed"),
+        service.waitForRunStatus(responsesRun.runId, "completed"),
+      ]);
+
+      const httpJson: string[] = [];
+      for (const [authority, pathname] of [
+        ["run", "/healthz"],
+        ["run", "/readyz"],
+        ["run", `/v1/runs/${chatRun.runId}`],
+        ["run", `/v1/runs/${responsesRun.runId}`],
+        ["admin", "/provider-connections"],
+        ["admin", `/provider-connections/${setup.connectionId}`],
+        ["admin", "/model-profiles"],
+        ["admin", `/model-verifications/${setup.verificationId}`],
+        ["admin", `/model-verifications/${responsesSetup.verificationId}`],
+        ["admin", "/agents/primary/model-assignment"],
+        ["admin", "/agents/researcher/model-assignment"],
+      ] as const) {
+        const response = authority === "admin"
+          ? await service.adminRequest(pathname)
+          : await service.runRequest(pathname);
+        expect(response.status).toBe(200);
+        httpJson.push(await response.text());
+      }
+
+      const sseResponses = await Promise.all([
+        service.runRequest(`/v1/runs/${chatRun.runId}/events`),
+        service.runRequest(`/v1/runs/${responsesRun.runId}/events`),
+      ]);
+      expect(sseResponses.every(({ status }) => status === 200)).toBe(true);
+      const sse = (await Promise.all(sseResponses.map((response) => response.text()))).join("\n");
+      expect(sse).toContain("run.completed");
+      expect(httpJson.length).toBeGreaterThan(0);
+      expect(service.logs.length).toBeGreaterThan(0);
+
+      const cliOutput: string[] = [];
+      const cliErrors: string[] = [];
+      const environment = {
+        MYAGENT_API_URL: service.url,
+        MYAGENT_BEARER_TOKEN: "run-test-token",
+        MYAGENT_ADMIN_TOKEN: "admin-test-token",
+      };
+      expect(await executeCli(["providers", "list", "--json"], {
+        environment,
+        write: (line) => cliOutput.push(line),
+        writeError: (line) => cliErrors.push(line),
+      })).toBe(0);
+      expect(await executeCli(["run", "watch", chatRun.runId], {
+        environment,
+        write: (line) => cliOutput.push(line),
+        writeError: (line) => cliErrors.push(line),
+      })).toBe(0);
+      expect(await executeCli(["run", "watch", responsesRun.runId], {
+        environment,
+        write: (line) => cliOutput.push(line),
+        writeError: (line) => cliErrors.push(line),
+      })).toBe(0);
+      expect(await executeCli(["providers", "list", "--not-a-real-option"], {
+        environment,
+        write: (line) => cliOutput.push(line),
+        writeError: (line) => cliErrors.push(line),
+      })).toBe(2);
+      expect(cliOutput.length).toBeGreaterThan(0);
+      expect(cliErrors.length).toBeGreaterThan(0);
+
+      const thrown = await service.waitForRunStatus(chatRun.runId, "failed", 1)
+        .then(() => "unexpected_success", (error: unknown) => String(error));
+      expect(thrown).not.toBe("unexpected_success");
+      expect(thrown.length).toBeGreaterThan(0);
+
+      const backupPath = path.join(service.root, "composed-containment-backup");
+      const backupResponse = await service.runRequest("/v1/backups", {
+        method: "POST",
+        body: JSON.stringify({ destination: backupPath }),
+      });
+      expect(backupResponse.status).toBe(201);
+      httpJson.push(await backupResponse.text());
+
+      const database = new DatabaseSync(service.databasePath, { readOnly: true });
+      let keyId = "";
+      let ciphertextHex = "";
+      let ciphertextBase64 = "";
+      let durableSurfaces = "";
+      try {
+        const secret = database.prepare(
+          `SELECT key_id, ciphertext, hex(ciphertext) AS ciphertext_hex
+           FROM managed_secret_versions`,
+        ).get() as {
+          key_id: string;
+          ciphertext: Uint8Array;
+          ciphertext_hex: string;
+        };
+        keyId = secret.key_id;
+        ciphertextHex = secret.ciphertext_hex;
+        ciphertextBase64 = Buffer.from(secret.ciphertext).toString("base64");
+        const runEvents = database.prepare(
+          `SELECT payload_json FROM run_events
+           WHERE run_id IN (?, ?) ORDER BY run_id, sequence`,
+        ).all(chatRun.runId, responsesRun.runId);
+        const snapshots = database.prepare(
+          "SELECT content_json FROM agent_revisions ORDER BY revision_id",
+        ).all();
+        const verifications = database.prepare(
+          "SELECT * FROM model_verifications ORDER BY verification_id",
+        ).all();
+        const health = database.prepare(
+          "SELECT * FROM provider_health ORDER BY health_id",
+        ).all();
+        const audit = database.prepare(
+          "SELECT payload_json FROM model_registry_events ORDER BY event_id",
+        ).all();
+        expect(runEvents.length).toBeGreaterThan(0);
+        expect(snapshots.length).toBeGreaterThan(0);
+        expect(verifications.length).toBeGreaterThan(0);
+        expect(health.length).toBeGreaterThan(0);
+        expect(audit.length).toBeGreaterThan(0);
+        durableSurfaces = JSON.stringify({ runEvents, snapshots, verifications, health, audit });
+      } finally {
+        database.close();
+      }
+
+      const backupDatabasePath = path.join(backupPath, "kernel.db");
+      const backupDatabase = new DatabaseSync(backupDatabasePath, { readOnly: true });
+      try {
+        const backupSecret = backupDatabase.prepare(
+          `SELECT key_id, hex(ciphertext) AS ciphertext_hex
+           FROM managed_secret_versions`,
+        ).get();
+        expect(backupSecret).toEqual({
+          key_id: keyId,
+          ciphertext_hex: ciphertextHex,
+        });
+      } finally {
+        backupDatabase.close();
+      }
+
+      const rawDatabaseFiles = await Promise.all(
+        [service.databasePath, `${service.databasePath}-wal`, `${service.databasePath}-shm`]
+          .filter(existsSync)
+          .map((candidate) => readFile(candidate, "latin1")),
+      );
+      const backupDatabaseBytes = await readFile(backupDatabasePath, "latin1");
+      const backupManifest = await readFile(path.join(backupPath, "manifest.json"), "utf8");
+      expect(rawDatabaseFiles.length).toBeGreaterThan(0);
+      expect(backupDatabaseBytes.length).toBeGreaterThan(0);
+      expect(backupManifest.length).toBeGreaterThan(0);
+
+      const emittedProviderBodies = (
+        provider.rawResponseBodies
+      );
+      expect(emittedProviderBodies.join("\n")).toContain(rawReasoning);
+      expect(emittedProviderBodies.join("\n")).toContain(rawResponsesReasoning);
+      expect(emittedProviderBodies.join("\n")).toContain(rawProviderBody);
+      expect(provider.chatRequests).toHaveLength(1);
+      expect(provider.responsesRequests).toHaveLength(1);
+      expect(provider.chatRequests[0]?.credentialMatched).toBe(true);
+
+      expect(managedPlaintext.length).toBeGreaterThan(16);
+      expect(rawReasoning.length).toBeGreaterThan(16);
+      expect(rawResponsesReasoning.length).toBeGreaterThan(16);
+      expect(rawProviderBody.length).toBeGreaterThan(16);
+      expect(keyId.length).toBeGreaterThan(16);
+      expect(ciphertextHex.length).toBeGreaterThan(16);
+      expect(new Set([
+        managedPlaintext,
+        rawReasoning,
+        rawResponsesReasoning,
+        rawProviderBody,
+        keyId,
+        ciphertextHex,
+      ]).size).toBe(6);
+
+      const publicAndObservable = JSON.stringify({
+        httpJson,
+        sse,
+        cliOutput,
+        cliErrors,
+        thrown,
+        logs: service.logs,
+        providerRequests: [...provider.chatRequests, ...provider.responsesRequests],
+        setupResponseBodies,
+        durableSurfaces,
+        backupManifest,
+      });
+      const allDurableBytes = [
+        publicAndObservable,
+        ...rawDatabaseFiles,
+        backupDatabaseBytes,
+      ].join("\n");
+      for (const forbidden of [
+        managedPlaintext,
+        rawReasoning,
+        rawResponsesReasoning,
+        rawProviderBody,
+      ]) {
+        expect(allDurableBytes).not.toContain(forbidden);
+      }
+      expect(publicAndObservable).not.toContain(keyId);
+      for (const encodedCiphertext of [ciphertextHex, ciphertextBase64]) {
+        expect(encodedCiphertext.length).toBeGreaterThan(16);
+        expect(publicAndObservable.toLowerCase())
+          .not.toContain(encodedCiphertext.toLowerCase());
+      }
+    } finally {
+      await cleanup.dispose();
+    }
+  }, 35_000);
 
   it("keeps the active assignment byte-stable across verification, key, timeout, redirect, outage, and cancellation failures", async () => {
     const activeApiKey = "ACTIVE_API_KEY_ASSIGNMENT_MARKER";
     const rotatedApiKey = "ROTATED_API_KEY_ASSIGNMENT_MARKER";
     const rawProviderMarker = "RAW_PROVIDER_FAILURE_MARKER";
-    const provider = await FakeOpenAiProvider.start({
-      models: ["active-chat-model", "failed-responses-model"],
-      chat: [
+    const cleanup = createAsyncCleanupStack();
+
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["active-chat-model", "failed-responses-model"],
+        chat: [
         { type: "verification_text", text: "active verification passed" },
         { type: "verification_tool", callId: "verify-active-call" },
       ],
-      responses: [{
+        responses: [{
         type: "error",
         status: 400,
         body: { error: { message: rawProviderMarker } },
@@ -172,18 +570,19 @@ describe("multi-provider model registry release isolation", () => {
         type: "verification_text",
         text: "retry must also exceed the provider request deadline",
         delayMs: 500,
-      }],
-    });
-    const redirectTarget = await FakeOpenAiProvider.start();
-    const redirectSource = await FakeOpenAiProvider.start({
-      models: ["redirect-responses-model"],
-      responsesRedirectUrl: `${redirectTarget.baseUrl}/responses`,
-    });
-    const service = await startRealTestApp({
-      verificationRequestTimeoutMs: 50,
-    });
-
-    try {
+        }],
+      }), (active) => active.close());
+      const redirectTarget = cleanup.use(
+        await FakeOpenAiProvider.start(),
+        (active) => active.close(),
+      );
+      const redirectSource = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["redirect-responses-model"],
+        responsesRedirectUrl: `${redirectTarget.baseUrl}/responses`,
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp({
+        verificationRequestTimeoutMs: 50,
+      }), (active) => active.close());
       const active = await service.setupVerifiedModel({
         connectionSlug: "active-failure-proof",
         profileSlug: "active-failure-proof",
@@ -414,10 +813,7 @@ describe("multi-provider model registry release isolation", () => {
         database.close();
       }
     } finally {
-      await service.close();
-      await provider.close();
-      await redirectSource.close();
-      await redirectTarget.close();
+      await cleanup.dispose();
     }
   }, 35_000);
 });

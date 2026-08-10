@@ -16,7 +16,13 @@ export interface FakeModelsFailure {
 }
 
 export type FakeProviderTurn =
-  | { readonly type: "text"; readonly text: string; readonly delayMs?: number }
+  | {
+      readonly type: "text";
+      readonly text: string;
+      readonly reasoning?: string;
+      readonly rawBody?: string;
+      readonly delayMs?: number;
+    }
   | { readonly type: "verification_text"; readonly text: string; readonly delayMs?: number }
   | { readonly type: "verification_tool"; readonly callId: string; readonly delayMs?: number }
   | {
@@ -37,6 +43,7 @@ export interface CapturedProviderRequest {
   readonly method: string;
   readonly path: string;
   readonly body: JsonValue;
+  readonly credentialMatched: boolean;
 }
 
 export interface FakeOpenAiProviderOptions {
@@ -44,16 +51,19 @@ export interface FakeOpenAiProviderOptions {
   readonly chat?: readonly FakeProviderTurn[];
   readonly responses?: readonly FakeProviderTurn[];
   readonly responsesRedirectUrl?: string;
+  readonly expectedApiKey?: string;
 }
 
 export class FakeOpenAiProvider {
   readonly requests: Array<{ path: string; after?: string }> = [];
   readonly chatRequests: CapturedProviderRequest[] = [];
   readonly responsesRequests: CapturedProviderRequest[] = [];
+  readonly rawResponseBodies: string[] = [];
   private readonly pages = new Map<string | undefined, FakeModelsPage>();
   private readonly chatTurns: FakeProviderTurn[];
   private readonly responsesTurns: FakeProviderTurn[];
   private readonly responsesRedirectUrl: string | undefined;
+  private readonly expectedApiKey: string | undefined;
   private readonly timers = new Set<NodeJS.Timeout>();
   private readonly sockets = new Set<Socket>();
   private failure: FakeModelsFailure | undefined;
@@ -68,6 +78,7 @@ export class FakeOpenAiProvider {
     this.chatTurns = [...(options.chat ?? [])];
     this.responsesTurns = [...(options.responses ?? [])];
     this.responsesRedirectUrl = options.responsesRedirectUrl;
+    this.expectedApiKey = options.expectedApiKey;
     this.modelsPages([{
       data: (options.models ?? []).map((id) => ({ id, object: "model", owned_by: "fake" })),
       has_more: false,
@@ -118,6 +129,7 @@ export class FakeOpenAiProvider {
     this.requests.length = 0;
     this.chatRequests.length = 0;
     this.responsesRequests.length = 0;
+    this.rawResponseBodies.length = 0;
   }
 
   replaceChatTurns(turns: readonly FakeProviderTurn[]): void {
@@ -145,13 +157,13 @@ export class FakeOpenAiProvider {
     }
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
       const body = await readJsonBody(request);
-      this.chatRequests.push({ method: request.method, path: url.pathname, body });
+      this.chatRequests.push(this.captureRequest(request, url.pathname, body));
       this.respondToTurn("chat", body, response);
       return;
     }
     if (request.method === "POST" && url.pathname === "/v1/responses") {
       const body = await readJsonBody(request);
-      this.responsesRequests.push({ method: request.method, path: url.pathname, body });
+      this.responsesRequests.push(this.captureRequest(request, url.pathname, body));
       if (this.responsesRedirectUrl !== undefined) {
         response.writeHead(307, { location: this.responsesRedirectUrl }).end();
         return;
@@ -194,7 +206,9 @@ export class FakeOpenAiProvider {
     this.schedule(turn.delayMs ?? 0, () => {
       if (turn.type === "error") {
         response.writeHead(turn.status, { "content-type": "application/json" });
-        response.end(JSON.stringify(turn.body ?? { error: { code: "fake_provider_error" } }));
+        const payload = JSON.stringify(turn.body ?? { error: { code: "fake_provider_error" } });
+        this.rawResponseBodies.push(payload);
+        response.end(payload);
         return;
       }
       const normalized = turn.type === "verification_tool"
@@ -209,9 +223,29 @@ export class FakeOpenAiProvider {
       const events = protocol === "chat"
         ? chatEvents(normalized)
         : responsesEvents(normalized);
-      for (const event of events) response.write(`data: ${JSON.stringify(event)}\n\n`);
-      response.end("data: [DONE]\n\n");
+      const payload = [
+        ...events.map((event) => `data: ${JSON.stringify(event)}\n\n`),
+        "data: [DONE]\n\n",
+      ].join("");
+      this.rawResponseBodies.push(payload);
+      response.end(payload);
     });
+  }
+
+  private captureRequest(
+    request: IncomingMessage,
+    path: string,
+    body: JsonValue,
+  ): CapturedProviderRequest {
+    const authorization = request.headers.authorization;
+    return {
+      method: request.method ?? "",
+      path,
+      body,
+      credentialMatched: this.expectedApiKey === undefined
+        ? authorization === undefined
+        : authorization === `Bearer ${this.expectedApiKey}`,
+    };
   }
 
   private schedule(delayMs: number, action: () => void): void {
@@ -228,8 +262,18 @@ function chatEvents(
   turn: Exclude<FakeProviderTurn, { type: "error" | "verification_tool" }>,
 ): JsonValue[] {
   if (turn.type === "text" || turn.type === "verification_text") {
+    const rawFields = turn.type === "text"
+      ? {
+          ...(turn.reasoning === undefined
+            ? {}
+            : { reasoning_content: turn.reasoning }),
+          ...(turn.rawBody === undefined
+            ? {}
+            : { raw_provider_body: turn.rawBody }),
+        }
+      : {};
     return [
-      chatFrame({ content: turn.text }),
+      { ...chatFrame({ content: turn.text, ...rawFields }), ...rawFields },
       chatFrame({}, "stop"),
       chatUsageFrame(),
     ];
@@ -252,7 +296,18 @@ function responsesEvents(
   turn: Exclude<FakeProviderTurn, { type: "error" | "verification_tool" }>,
 ): JsonValue[] {
   if (turn.type === "text" || turn.type === "verification_text") {
+    const rawEvents: JsonValue[] = turn.type === "text" &&
+      (turn.reasoning !== undefined || turn.rawBody !== undefined)
+      ? [{
+          type: "response.reasoning_summary_text.delta",
+          delta: turn.reasoning ?? "",
+          ...(turn.rawBody === undefined
+            ? {}
+            : { raw_provider_body: turn.rawBody }),
+        }]
+      : [];
     return [
+      ...rawEvents,
       { type: "response.output_text.delta", delta: turn.text },
       {
         type: "response.completed",
@@ -309,7 +364,10 @@ function completedResponse(output: JsonValue[]): JsonValue {
   };
 }
 
-function chatFrame(delta: JsonValue, finishReason: string | null = null): JsonValue {
+function chatFrame(
+  delta: JsonValue,
+  finishReason: string | null = null,
+): Record<string, JsonValue> {
   return {
     id: "chatcmpl-fake",
     object: "chat.completion.chunk",

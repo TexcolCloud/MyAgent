@@ -29,7 +29,7 @@ Retain the old Secret Version while any revision references it. Destruction is a
 Use this four-step two-key procedure:
 
 1. Record the current Keyring record revision, retain the old 32-byte key material, and generate a new 32-byte key outside MyAgent.
-2. Set `MYAGENT_MASTER_KEY` to the new Base64 key material and `MYAGENT_PREVIOUS_MASTER_KEY` to the old Base64 key material, then restart. Existing Secrets remain readable through the previous key; new managed-Secret writes remain Locked until rotation completes.
+2. Set `MYAGENT_MASTER_KEY` to the new Base64 key material and `MYAGENT_PREVIOUS_MASTER_KEY` to the old Base64 key material, then restart. Existing Secrets remain readable through the previous key while new managed-Secret writes use the new current key until transactional rotation completes.
 3. Run `myagent secrets rotate-master-key --expected-revision <keyring-revision>`. A successful response reports only the re-encrypted row count, the derived current Key ID, and the next Keyring record revision.
 4. Remove `MYAGENT_PREVIOUS_MASTER_KEY` and restart. Confirm readiness, access to managed-Secret-backed resources, and creation of a new managed Secret before retiring the old key material.
 

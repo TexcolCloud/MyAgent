@@ -450,25 +450,51 @@ describe("SqliteEncryptedSecretStore", () => {
     }
   });
 
-  it("restarts with both generations, resolves old rows, and blocks creation before rotation", () => {
+  it("uses the new key for writes while resolving both generations before rotation", () => {
     const path = tempPath("managed-secret-two-generations.db");
     const initial = createStore(path, { MYAGENT_MASTER_KEY: CURRENT_KEY });
-    const versionId = version("old-generation");
-    initial.store.createVersion(createInput(versionId, "old-secret"));
+    const oldVersionId = version("old-generation");
+    const newVersionId = version("new-generation");
+    initial.store.createVersion(createInput(oldVersionId, "old-secret"));
     initial.connection.close();
 
     const restarted = createStore(path, {
       MYAGENT_MASTER_KEY: NEXT_KEY,
       MYAGENT_PREVIOUS_MASTER_KEY: CURRENT_KEY,
     });
-    expect(restarted.store.resolve(versionId)).toBe("old-secret");
-    expect(() => restarted.store.createVersion(
-      createInput(version("blocked-before-rotate"), "new-secret"),
-    )).toThrowError("secret_locked");
+    expect(restarted.store.resolve(oldVersionId)).toBe("old-secret");
+    expect(restarted.store.createVersion(createInput(newVersionId, "new-secret")))
+      .toMatchObject({ keyId: NEXT_KEY_ID });
+    expect(restarted.store.resolve(newVersionId)).toBe("new-secret");
     expect(readKeyring(restarted.db)).toMatchObject({
       current_key_id: CURRENT_KEY_ID,
       record_revision: 0,
     });
+    expect(readSecretRow(restarted.db, oldVersionId).key_id).toBe(CURRENT_KEY_ID);
+    expect(readSecretRow(restarted.db, newVersionId).key_id).toBe(NEXT_KEY_ID);
+
+    expect(restarted.store.rotateMasterKey({ expectedRevision: 0, now: LATER }))
+      .toEqual({ reencrypted: 1, currentKeyId: NEXT_KEY_ID, recordRevision: 1 });
+    expect(readKeyring(restarted.db)).toMatchObject({
+      current_key_id: NEXT_KEY_ID,
+      record_revision: 1,
+    });
+    expect(readSecretRow(restarted.db, oldVersionId)).toMatchObject({
+      key_id: NEXT_KEY_ID,
+      record_revision: 1,
+    });
+    expect(readSecretRow(restarted.db, newVersionId)).toMatchObject({
+      key_id: NEXT_KEY_ID,
+      record_revision: 0,
+    });
+    expect(restarted.store.resolve(oldVersionId)).toBe("old-secret");
+    expect(restarted.store.resolve(newVersionId)).toBe("new-secret");
+    restarted.connection.close();
+
+    const currentOnly = createStore(path, { MYAGENT_MASTER_KEY: NEXT_KEY });
+    expect(currentOnly.store.resolve(oldVersionId)).toBe("old-secret");
+    expect(currentOnly.store.resolve(newVersionId)).toBe("new-secret");
+    currentOnly.connection.close();
   });
 
   it("rotates every active old-key row atomically with fresh nonces", () => {

@@ -83,7 +83,10 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
              singleton_id, current_key_id, record_revision, updated_at
            ) VALUES (1, ?, 0, ?)`,
         ).run(current.id, input.now.toISOString());
-      } else if (keyring.current_key_id !== current.id) {
+      } else if (
+        keyring.current_key_id !== current.id &&
+        !this.rotationInProgress(keyring)
+      ) {
         throwLocked();
       }
 
@@ -179,12 +182,19 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
       }
 
       const rows = this.activeRows();
-      if (rows.some((row) => row.key_id !== previous.id)) throwLocked();
+      if (rows.some((row) => row.key_id !== previous.id && row.key_id !== current.id)) {
+        throwLocked();
+      }
 
       const decrypted: Array<{ row: SecretRow; plaintext: Buffer }> = [];
       try {
         for (const row of rows) {
-          decrypted.push({ row, plaintext: decrypt(previous, row) });
+          if (row.key_id === current.id) {
+            const plaintext = decrypt(current, row);
+            plaintext.fill(0);
+          } else {
+            decrypted.push({ row, plaintext: decrypt(previous, row) });
+          }
         }
         for (const { row, plaintext } of decrypted) {
           const envelope = encrypt(current, {
@@ -231,7 +241,7 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
         );
         if (updatedKeyring.changes !== 1) throwRevisionConflict();
         return {
-          reencrypted: rows.length,
+          reencrypted: decrypted.length,
           currentKeyId: current.id,
           recordRevision: input.expectedRevision + 1,
         };
@@ -256,10 +266,22 @@ export class SqliteEncryptedSecretStore implements ManagedSecretStore {
     keyring: KeyringRow,
     row: SecretRow,
   ): KeyGeneration {
-    if (row.key_id !== keyring.current_key_id) throwLocked();
-    const generation = this.generation(keyring.current_key_id);
+    const authoritativeKeyId = row.key_id === keyring.current_key_id
+      ? keyring.current_key_id
+      : this.rotationInProgress(keyring) && row.key_id === this.current?.id
+        ? row.key_id
+        : null;
+    if (authoritativeKeyId === null) throwLocked();
+    const generation = this.generation(authoritativeKeyId);
     if (generation === null) throwLocked();
     return generation;
+  }
+
+  private rotationInProgress(keyring: KeyringRow): boolean {
+    return this.current !== null &&
+      this.previous !== null &&
+      this.current.id !== this.previous.id &&
+      keyring.current_key_id === this.previous.id;
   }
 
   private keyring(): KeyringRow | undefined {

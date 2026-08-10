@@ -5,15 +5,21 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 
 import { FakeOpenAiProvider } from "../helpers/fake-openai-provider.js";
-import { startRealTestApp } from "../helpers/start-test-app.js";
+import {
+  createAsyncCleanupStack,
+  startRealTestApp,
+} from "../helpers/start-test-app.js";
 
 describe("Responses Approval restart recovery", () => {
   it("preserves the provider call ID, executes once, and replays only committed SSE", async () => {
     const providerCallId = "responses-call-release-01";
     const effectFileName = "responses-approval-effect.log";
-    const provider = await FakeOpenAiProvider.start({
-      models: ["responses-approval-model"],
-      responses: [
+    const cleanup = createAsyncCleanupStack();
+
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["responses-approval-model"],
+        responses: [
         { type: "verification_text", text: "responses verification passed" },
         { type: "verification_tool", callId: "verify-responses-approval" },
         {
@@ -32,11 +38,9 @@ describe("Responses Approval restart recovery", () => {
           },
         },
         { type: "text", text: "approved Responses run completed" },
-      ],
-    });
-    const service = await startRealTestApp();
-
-    try {
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp(), (active) => active.close());
       await service.setupVerifiedModel({
         connectionSlug: "responses-approval",
         profileSlug: "responses-approval",
@@ -89,6 +93,23 @@ describe("Responses Approval restart recovery", () => {
         .toBe("executed");
       const database = new DatabaseSync(service.databasePath, { readOnly: true });
       try {
+        const committedAfterCursor = database.prepare(
+          `SELECT sequence, event_type, payload_json FROM run_events
+           WHERE run_id = ? AND sequence > ? ORDER BY sequence`,
+        ).all(run.runId, approvalEvent.sequence).map((row) => {
+          const persisted = row as {
+            sequence: number;
+            event_type: string;
+            payload_json: string;
+          };
+          return {
+            sequence: persisted.sequence,
+            type: persisted.event_type,
+            payload: JSON.parse(persisted.payload_json) as Record<string, unknown>,
+          };
+        });
+        expect(replay.map(({ sequence, type, payload }) => ({ sequence, type, payload })))
+          .toEqual(committedAfterCursor);
         expect(database.prepare(
           `SELECT provider_call_id, state FROM tool_calls WHERE run_id = ?`,
         ).all(run.runId)).toEqual([{ provider_call_id: providerCallId, state: "succeeded" }]);
@@ -100,8 +121,7 @@ describe("Responses Approval restart recovery", () => {
         database.close();
       }
     } finally {
-      await service.close();
-      await provider.close();
+      await cleanup.dispose();
     }
   }, 35_000);
 });

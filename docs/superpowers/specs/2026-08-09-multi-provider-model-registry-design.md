@@ -220,7 +220,7 @@ Queueing a Verification is a mutation of the owning Model Profile. Its request t
 
 Master-key rotation supplies the singleton Managed Secret Keyring's `expectedRevision`. The transaction increments that record only after all active Secret Versions have been re-encrypted successfully.
 
-The first successful Secret Version creation initializes an absent Keyring at record revision `0`. Startup never changes the stored Keyring. If configured current material differs from the Keyring, existing rows may resolve through matching previous material, but new Secret creation is `secret_locked` until explicit rotation succeeds. Rotation requires the stored Keyring to match the configured previous generation, re-encrypts to the configured current generation, and then increments the Keyring revision. A missing Keyring cannot be rotated.
+The first successful Secret Version creation initializes an absent Keyring at record revision `0`. Startup never changes the stored Keyring. If configured current material differs from the Keyring and configured previous material matches it, existing rows resolve through the previous generation while new Secret Versions use the configured current generation. Rotation requires that previous-generation Keyring match, re-encrypts only old-generation rows to the configured current generation, verifies that no active old-key envelope remains, and then increments the Keyring revision. A missing Keyring cannot be rotated.
 
 Appending an immutable Model Profile Revision is an optimistic mutation of its stable Model Profile. The application/store command requires the Profile's `expectedRevision`, rejects retired Profiles, appends one revision, and emits one audit event without changing the active head.
 
@@ -496,7 +496,7 @@ Master-key rotation uses current and previous keys identified by non-secret Key 
 1. Configure the new key as current and the old key as previous.
 2. Restart so both generations can be decrypted and new writes use the new key.
 3. Invoke an authenticated transactional re-encryption operation.
-4. Verify that no old Key ID remains.
+4. Verify that no active old-key envelope remains.
 5. Remove the previous key and restart.
 
 A database backup contains encrypted Secret rows and Key IDs but no master key. Restore requires the matching key generation.
