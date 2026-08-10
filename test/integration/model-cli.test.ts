@@ -69,6 +69,236 @@ describe("model control CLI", () => {
     expect(JSON.parse(output[0]!)).toMatchObject({ status: "passed", traceId: "verification-trace" });
   });
 
+  it("follows an explicit fallback Verification to the passing candidate", async () => {
+    const paths: string[] = [];
+    const output: string[] = [];
+    const fetcher = createFetcher((request) => {
+      paths.push(request.path);
+      if (request.method === "POST") {
+        return jsonResponse({
+          verificationId: "ver_1",
+          profileRevisionId: "mpr_1",
+          capabilityBaseline: "text_and_single_tool_call_v1",
+          status: "queued",
+          recordRevision: 1,
+          operationUrl: "/v1/admin/model-verifications/ver_1",
+        }, 202);
+      }
+      if (request.path === "/v1/admin/model-verifications/ver_1") {
+        return jsonResponse({
+          ...verification("passed"),
+          status: "failed",
+          resultCode: "invocation_protocol_unsupported",
+          fallbackProfileRevisionId: "mpr_2",
+          fallbackVerificationId: "ver_2",
+        });
+      }
+      return jsonResponse({
+        ...verification("passed"),
+        verificationId: "ver_2",
+        profileRevisionId: "mpr_2",
+      });
+    });
+
+    const exitCode = await executeCli([
+      "models", "verify", "--profile-revision", "mpr_1", "--expected-revision", "0", "--json",
+    ], {
+      environment,
+      fetcher,
+      sleep: async () => undefined,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(paths).toEqual([
+      "/v1/admin/model-profile-revisions/mpr_1/verifications",
+      "/v1/admin/model-verifications/ver_1",
+      "/v1/admin/model-verifications/ver_2",
+    ]);
+    expect(output).toHaveLength(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      verificationId: "ver_2",
+      profileRevisionId: "mpr_2",
+      status: "passed",
+      traceId: "verification-trace",
+    });
+  });
+
+  it.each([
+    [
+      "failed",
+      5,
+      '{"code":"provider_auth_failed","detail":"Model verification failed.","traceId":"fallback-trace"}',
+    ],
+    ["cancelled", 0, null],
+  ] as const)(
+    "uses the fallback Verification terminal %s result",
+    async (status, expectedExit, expectedProblem) => {
+      const paths: string[] = [];
+      const output: string[] = [];
+      const fetcher = createFetcher((request) => {
+        paths.push(request.path);
+        if (request.method === "POST") {
+          return jsonResponse({
+            verificationId: "ver_1",
+            profileRevisionId: "mpr_1",
+            status: "queued",
+            operationUrl: "/v1/admin/model-verifications/ver_1",
+          }, 202);
+        }
+        if (request.path.endsWith("/ver_1")) {
+          return jsonResponse({
+            ...verification("passed"),
+            status: "failed",
+            resultCode: "invocation_protocol_unsupported",
+            fallbackProfileRevisionId: "mpr_2",
+            fallbackVerificationId: "ver_2",
+          });
+        }
+        return jsonResponse({
+          ...verification("passed"),
+          verificationId: "ver_2",
+          profileRevisionId: "mpr_2",
+          status,
+          resultCode: status === "failed" ? "provider_auth_failed" : null,
+          traceId: "fallback-trace",
+        });
+      });
+
+      const exitCode = await executeCli([
+        "models", "verify", "--profile-revision", "mpr_1", "--expected-revision", "0", "--json",
+      ], {
+        environment,
+        fetcher,
+        write: (line) => output.push(line),
+      });
+
+      expect(exitCode).toBe(expectedExit);
+      expect(paths.at(-1)).toBe("/v1/admin/model-verifications/ver_2");
+      expect(output).toHaveLength(1);
+      if (expectedProblem === null) {
+        expect(JSON.parse(output[0]!)).toMatchObject({
+          verificationId: "ver_2",
+          profileRevisionId: "mpr_2",
+          status: "cancelled",
+          traceId: "fallback-trace",
+        });
+      } else {
+        expect(output).toEqual([expectedProblem]);
+      }
+    },
+  );
+
+  it("stops a cyclic fallback Verification chain", async () => {
+    const paths: string[] = [];
+    const output: string[] = [];
+    const fetcher = createFetcher((request) => {
+      paths.push(request.path);
+      if (request.method === "POST") {
+        return jsonResponse({
+          verificationId: "ver_1",
+          profileRevisionId: "mpr_1",
+          status: "queued",
+          operationUrl: "/v1/admin/model-verifications/ver_1",
+        }, 202);
+      }
+      const first = request.path.endsWith("/ver_1");
+      return jsonResponse({
+        ...verification("passed"),
+        verificationId: first ? "ver_1" : "ver_2",
+        profileRevisionId: first ? "mpr_1" : "mpr_2",
+        status: "failed",
+        resultCode: "invocation_protocol_unsupported",
+        fallbackProfileRevisionId: first ? "mpr_2" : "mpr_1",
+        fallbackVerificationId: first ? "ver_2" : "ver_1",
+      });
+    });
+
+    const exitCode = await executeCli([
+      "models", "verify", "--profile-revision", "mpr_1", "--expected-revision", "0", "--json",
+    ], {
+      environment,
+      fetcher,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(6);
+    expect(paths).toEqual([
+      "/v1/admin/model-profile-revisions/mpr_1/verifications",
+      "/v1/admin/model-verifications/ver_1",
+      "/v1/admin/model-verifications/ver_2",
+    ]);
+    expect(output).toEqual([
+      '{"code":"service_unavailable","detail":"The service could not be reached.","traceId":"cli"}',
+    ]);
+  });
+
+  it("rejects malformed fallback identifiers without following them", async () => {
+    const paths: string[] = [];
+    const output: string[] = [];
+    const fetcher = createFetcher((request) => {
+      paths.push(request.path);
+      if (request.method === "POST") {
+        return jsonResponse({
+          verificationId: "ver_1",
+          profileRevisionId: "mpr_1",
+          status: "queued",
+          operationUrl: "/v1/admin/model-verifications/ver_1",
+        }, 202);
+      }
+      return jsonResponse({
+        ...verification("passed"),
+        status: "failed",
+        resultCode: "invocation_protocol_unsupported",
+        fallbackProfileRevisionId: "mpr_2",
+        fallbackVerificationId: "../ver_2",
+      });
+    });
+
+    const exitCode = await executeCli([
+      "models", "verify", "--profile-revision", "mpr_1", "--expected-revision", "0", "--json",
+    ], {
+      environment,
+      fetcher,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(6);
+    expect(paths).toEqual([
+      "/v1/admin/model-profile-revisions/mpr_1/verifications",
+      "/v1/admin/model-verifications/ver_1",
+    ]);
+    expect(output).toHaveLength(1);
+  });
+
+  it("rejects an unknown Verification status instead of reporting success", async () => {
+    const output: string[] = [];
+    const fetcher = createFetcher((request) => request.method === "POST"
+      ? jsonResponse({
+        verificationId: "ver_1",
+        profileRevisionId: "mpr_1",
+        status: "queued",
+        operationUrl: "/v1/admin/model-verifications/ver_1",
+      }, 202)
+      : jsonResponse({
+        ...verification("passed"),
+        status: "complete",
+      }));
+
+    const exitCode = await executeCli([
+      "models", "verify", "--profile-revision", "mpr_1", "--expected-revision", "0", "--json",
+    ], {
+      environment,
+      fetcher,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(6);
+    expect(output).toEqual([
+      '{"code":"service_unavailable","detail":"The service could not be reached.","traceId":"cli"}',
+    ]);
+  });
+
   it.each([
     ["failed", 5, '{"code":"provider_auth_failed","detail":"Model verification failed.","traceId":"verification-trace"}'],
     ["cancelled", 0, undefined],
@@ -493,6 +723,107 @@ describe("model control CLI", () => {
       "PUT /v1/admin/default-model-profile",
       "PUT /v1/admin/agents/primary/model-assignment",
     ]));
+  });
+
+  it("reviews and promotes only the passing fallback candidate", async () => {
+    const requests: CapturedRequest[] = [];
+    const output: string[] = [];
+    const prompt = scriptedPrompt({
+      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      inputs: [
+        "deepseek",
+        "DeepSeek",
+        "https://api.deepseek.com",
+        "DEEPSEEK_API_KEY",
+        "deepseek-flash",
+        "DeepSeek Flash",
+        "65536",
+        "primary",
+      ],
+      confirmations: [true, true, true],
+    });
+    const fallbackRevision = {
+      ...profileResponse().revisions[0],
+      revisionId: "mpr_2",
+      invocationProtocol: "chat_completions",
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      state: "verified",
+    };
+    const fetcher = createFetcher((request) => {
+      requests.push(request);
+      if (request.path === "/v1/admin/model-verifications/ver_1") {
+        return jsonResponse({
+          ...verification("passed"),
+          status: "failed",
+          resultCode: "invocation_protocol_unsupported",
+          fallbackProfileRevisionId: "mpr_2",
+          fallbackVerificationId: "ver_2",
+        });
+      }
+      if (request.path === "/v1/admin/model-verifications/ver_2") {
+        return jsonResponse({
+          ...verification("passed"),
+          verificationId: "ver_2",
+          profileRevisionId: "mpr_2",
+          traceId: "fallback-trace",
+        });
+      }
+      if (request.method === "GET" && request.path === "/v1/admin/model-profiles/deepseek-flash") {
+        return jsonResponse({
+          ...profileResponse(),
+          recordRevision: 2,
+          revisions: [...profileResponse().revisions, fallbackRevision],
+        });
+      }
+      if (request.method === "GET" && request.path === "/v1/admin/default-model-profile") {
+        return jsonResponse({ state: "unset", profileId: null, recordRevision: null });
+      }
+      if (request.method === "GET" && request.path.endsWith("/model-assignment")) {
+        return jsonResponse({
+          agentId: "primary",
+          state: "unassigned",
+          modelProfileRevisionId: null,
+          source: null,
+          recordRevision: null,
+          updatedAt: null,
+        });
+      }
+      if (request.method === "POST" && request.path.endsWith("/verifications")) {
+        return jsonResponse({
+          verificationId: "ver_1",
+          profileRevisionId: "mpr_1",
+          status: "queued",
+          operationUrl: "/v1/admin/model-verifications/ver_1",
+        }, 202);
+      }
+      return setupResponse(request);
+    });
+
+    const exitCode = await executeCli(["model", "setup"], {
+      environment,
+      fetcher,
+      prompt,
+      sleep: async () => undefined,
+      write: (line) => output.push(line),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(output).toContain("Candidate revision: mpr_2");
+    expect(output).toContain("Protocol: chat_completions");
+    expect(requests.find((request) =>
+      request.path === "/v1/admin/model-profiles/deepseek-flash/promotions")?.body)
+      .toEqual({ profileRevisionId: "mpr_2", expectedRevision: 2 });
+    expect(requests.find((request) =>
+      request.path === "/v1/admin/agents/primary/model-assignment" &&
+      request.method === "PUT")?.body)
+      .toEqual({ modelProfileRevisionId: "mpr_2", expectedRevision: 0 });
+    expect(requests.find((request) =>
+      request.path === "/v1/admin/default-model-profile" && request.method === "PUT")?.body)
+      .toEqual({ profileId: "deepseek-flash", expectedRevision: 0 });
+    expect(requests.some((request) =>
+      JSON.stringify(request.body ?? null).includes('"profileRevisionId":"mpr_1"') ||
+      JSON.stringify(request.body ?? null).includes('"modelProfileRevisionId":"mpr_1"')))
+      .toBe(false);
   });
 });
 

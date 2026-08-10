@@ -6,10 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
 import { OpenAiChatCompletionsModel } from "../../src/adapters/model/openai-chat-completions.js";
 import { NodeProviderHttpTransport } from "../../src/adapters/provider-http-transport.js";
-import {
-  parseProviderConnectionId,
-  providerConnectionRevisionIdFromUuid,
-} from "../../src/domain/ids.js";
+import { providerConnectionRevisionIdFromUuid } from "../../src/domain/ids.js";
 import type { JsonValue } from "../../src/domain/json.js";
 import type { ProviderAuth } from "../../src/domain/provider-connection.js";
 import type { ModelChunk, ModelRequest } from "../../src/ports/model.js";
@@ -27,6 +24,48 @@ describe("OpenAiChatCompletionsModel", () => {
           }),
       ),
     );
+  });
+
+  it("executes from the stored runtime without a Model Registry", async () => {
+    const fake = await startServer(successEvents("snapshot-authority"));
+    servers.push(fake.server);
+    const model = new OpenAiChatCompletionsModel({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" }),
+      }),
+    });
+
+    const chunks = await collect(model.streamAttempt(
+      request(fake.baseUrl),
+      new AbortController().signal,
+    ));
+
+    expect(chunks).toContainEqual({ type: "text_delta", text: "snapshot-authority" });
+    expect(fake.requests).toHaveLength(1);
+  });
+
+  it("defaults a legacy snapshot without network policy to secure HTTP rules", async () => {
+    const fake = await startServer(successEvents("legacy-policy"));
+    servers.push(fake.server);
+    const observedPolicies: boolean[] = [];
+    const delegate = new NodeProviderHttpTransport({
+      secretResolver: new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" }),
+    });
+    const transport: ProviderHttpTransport = {
+      createFetch(input) {
+        observedPolicies.push(input.connection.allowInsecureHttp);
+        return delegate.createFetch(input);
+      },
+    };
+    const legacyRequest = request(fake.baseUrl);
+    delete (legacyRequest.model as { allowInsecureHttp?: boolean }).allowInsecureHttp;
+
+    await collect(new OpenAiChatCompletionsModel({ transport }).streamAttempt(
+      legacyRequest,
+      new AbortController().signal,
+    ));
+
+    expect(observedPolicies).toEqual([false]);
   });
 
   it("maps all message roles and a paired Tool continuation with canonical JSON", async () => {
@@ -889,66 +928,6 @@ describe("OpenAiChatCompletionsModel", () => {
     });
   });
 
-  it("accepts Chat when the exact stored Connection prefers Responses", async () => {
-    const fake = await startServer(successEvents());
-    servers.push(fake.server);
-
-    const chunks = await collect(
-      adapter(fake.baseUrl, { protocolPreference: "responses" }).streamAttempt(
-        request(fake.baseUrl),
-        new AbortController().signal,
-      ),
-    );
-
-    expect(chunks.at(-1)).toEqual({
-      type: "completed",
-      finishReason: "completed",
-    });
-    expect(fake.requests).toHaveLength(1);
-  });
-
-  it.each([
-    {
-      name: "revision ID",
-      mutate: (canonical: ModelRequest): ModelRequest => ({
-        ...canonical,
-        model: {
-          ...canonical.model,
-          providerConnectionRevisionId: providerConnectionRevisionIdFromUuid(
-            "00000000-0000-7000-8000-000000000399",
-          ),
-        },
-      }),
-    },
-    {
-      name: "base URL",
-      mutate: (canonical: ModelRequest): ModelRequest => ({
-        ...canonical,
-        model: { ...canonical.model, baseUrl: "http://127.0.0.1:2/v1" },
-      }),
-    },
-    {
-      name: "auth",
-      mutate: (canonical: ModelRequest): ModelRequest => ({
-        ...canonical,
-        model: { ...canonical.model, providerAuth: { type: "none" } },
-      }),
-    },
-    {
-      name: "compatibility preset",
-      mutate: (canonical: ModelRequest): ModelRequest => ({
-        ...canonical,
-        model: { ...canonical.model, compatibilityPresetVersion: "other-v1" },
-      }),
-    },
-  ])("rejects a snapshot with inconsistent exact Connection $name", async ({ mutate }) => {
-    const baseUrl = "http://127.0.0.1:1/v1";
-
-    await expect(collect(adapter(baseUrl).streamAttempt(
-      mutate(request(baseUrl)),
-      new AbortController().signal,
-    ))).rejects.toMatchObject(protocolErrorMatch);
-  });
 });
 
 const protocolErrorMatch = {
@@ -957,45 +936,18 @@ const protocolErrorMatch = {
 };
 
 interface AdapterOptions {
-  readonly protocolPreference?: "chat_completions" | "responses";
   readonly auth?: ProviderAuth;
   readonly transport?: ProviderHttpTransport;
 }
 
 function adapter(
-  storedBaseUrl: string,
+  _storedBaseUrl: string,
   options: AdapterOptions = {},
 ): OpenAiChatCompletionsModel {
-  const revisionId = providerConnectionRevisionIdFromUuid(
-    "00000000-0000-7000-8000-000000000301",
-  );
-  const auth = options.auth ?? {
-    type: "bearer",
-    secret: { fromEnvironment: "TEST_API_KEY" },
-  };
   return new OpenAiChatCompletionsModel({
     transport: options.transport ?? new NodeProviderHttpTransport({
       secretResolver: new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" }),
     }),
-    connections: {
-      getConnectionRevision(requestedRevisionId) {
-        if (requestedRevisionId !== revisionId) return null;
-        return {
-          providerKind: "openai_compatible",
-          revision: {
-            revisionId,
-            connectionId: parseProviderConnectionId("openai-test"),
-            state: "active",
-            baseUrl: storedBaseUrl,
-            auth,
-            allowInsecureHttp: true,
-            protocolPreference: options.protocolPreference ?? "chat_completions",
-            presetVersion: "openai-chat-v1",
-            createdAt: new Date("2026-08-09T00:00:00.000Z"),
-          },
-        };
-      },
-    },
   });
 }
 
@@ -1020,6 +972,7 @@ function request(baseUrl: string, options: RequestOptions = {}): ModelRequest {
         type: "bearer",
         secret: { fromEnvironment: "TEST_API_KEY" },
       },
+      allowInsecureHttp: true,
       modelId: "test-model",
       invocationProtocol: "chat_completions",
       maxInputTokens: 8_192,

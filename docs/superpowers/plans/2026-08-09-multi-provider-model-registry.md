@@ -168,6 +168,7 @@ export interface EffectiveModelRuntime {
   providerKind: ProviderKind;
   baseUrl: string;
   providerAuth: ProviderAuth;
+  allowInsecureHttp: boolean;
   modelId: string;
   invocationProtocol: InvocationProtocol;
   maxInputTokens: number;
@@ -1115,7 +1116,7 @@ Use `loadBootConfig` from Task 5. Build `AgentDefinitionRevision` without a mode
 
 - [ ] **Step 4: Implement exact Agent resolution**
 
-Resolve the current file definition, exact assignment, profile revision, and connection revision. Return `model_assignment_required` 422 for none, `verification_required` 422 for an ineligible non-legacy revision, and `model_provider_locked` 503 when its Managed Secret cannot resolve. Existing verified assignments remain usable when their exact Profile or Connection revision becomes `superseded` or `retired`; only creation/replacement requires an active Profile revision. A Legacy-Trusted revision is accepted only when the stored assignment source is `legacy_import`. Compute snapshot `revisionId/contentSha256` from canonical combined definition/model content without resolving plaintext.
+Resolve the current file definition, exact assignment, profile revision, and connection revision. Return `model_assignment_required` 422 for none, `verification_required` 422 for an ineligible non-legacy revision, and `model_provider_locked` 503 when its Managed Secret cannot resolve. Existing verified assignments remain usable when their exact Profile or Connection revision becomes `superseded` or `retired`; only creation/replacement requires an active Profile revision. A Legacy-Trusted revision is accepted only when the stored assignment source is `legacy_import`. Snapshot the exact Connection revision's `allowInsecureHttp` value explicitly with its Base URL and Secret reference. Compute snapshot `revisionId/contentSha256` from canonical combined definition/model content without resolving plaintext.
 
 - [ ] **Step 5: Change Run creation and delegation to `AgentResolverPort`**
 
@@ -1123,7 +1124,7 @@ Resolve the current file definition, exact assignment, profile revision, and con
 
 - [ ] **Step 6: Keep the composition root buildable during protocol migration**
 
-Initialize the Model Registry, encrypted/composite Secret resolver, Provider HTTP Transport, and `AgentResolver` in bootstrap. Mechanically adapt the existing Chat adapter to the canonical model field names and shared transport, and make it reject any non-`chat_completions` snapshot with `invocation_protocol_unsupported`; Task 9 supplies its full contract coverage and Task 10 replaces direct wiring with the two-protocol router. This task's normal fixtures seed Chat profiles, so existing Run tests remain executable without a protocol fallback or temporary model configuration.
+Initialize the Model Registry, encrypted/composite Secret resolver, Provider HTTP Transport, and `AgentResolver` in bootstrap. Mechanically adapt the existing Chat adapter to the canonical model field names and shared transport, and make it reject any non-`chat_completions` snapshot with `invocation_protocol_unsupported`; runtime protocol adapters receive no Model Registry dependency and build transport input solely from the stored effective runtime. Interpret a persisted pre-change snapshot without `allowInsecureHttp` as `false`. Task 9 supplies its full contract coverage and Task 10 replaces direct wiring with the two-protocol router. This task's normal fixtures seed Chat profiles, so existing Run tests remain executable without a protocol fallback or temporary model configuration.
 
 - [ ] **Step 7: Replace `messages` with canonical `input`**
 
@@ -1601,7 +1602,7 @@ export interface CliPrompt {
 }
 ```
 
-Follow the approved nine-step sequence exactly: provider, connection, Secret/revision, discovery/manual eligibility, model/context, async Verification poll, capability review, explicit promotion, optional default/Agent binding. Display destination/auth/model/protocol/capabilities/Usage/context source/affected Agents before final confirmation. Cancellation returns exit code 0 after leaving drafts/Verification history but never changes active/default/assignment state.
+Follow the approved nine-step sequence exactly: provider, connection, Secret/revision, discovery/manual eligibility, model/context, async Verification poll, capability review, explicit promotion, optional default/Agent binding. Follow a bounded, visited chain only when the control plane returns explicit fallback candidate and Verification IDs; never infer runtime fallback. Poll the terminal candidate and display its exact revision ID plus destination/auth/model/fixed protocol/capabilities/Usage/context source/affected Agents before final confirmation. Promote and optionally assign only that terminal passing revision. Cancellation returns exit code 0 after leaving drafts/Verification history but never changes active/default/assignment state.
 
 - [ ] **Step 6: Run CLI tests**
 

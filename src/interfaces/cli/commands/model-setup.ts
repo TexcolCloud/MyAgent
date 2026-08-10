@@ -32,12 +32,12 @@ interface DiscoveryResponse {
 interface ProfileResponse {
   readonly profileId: string;
   readonly recordRevision: number;
-  readonly revisions: readonly [{
+  readonly revisions: readonly {
     readonly revisionId: string;
     readonly invocationProtocol: "chat_completions" | "responses";
     readonly maxInputTokens: number;
     readonly contextWindowSource: "preset" | "operator" | "assumed_32768";
-  }];
+  }[];
 }
 
 export async function setupModel(
@@ -137,16 +137,35 @@ export async function setupModel(
     method: "POST",
     body: { expectedRevision: profile.recordRevision, capabilityBaseline: "text_and_single_tool_call_v1" },
   });
-  const verification = await pollVerification(client, queued.operationUrl, sleep);
+  const verification = await pollVerification(
+    client,
+    queued.operationUrl,
+    profileRevision.revisionId,
+    sleep,
+  );
 
   // 7. Resolve the optional post-promotion intent and visibly review every safety field.
   const makeDefault = await prompt.confirm("Make this model profile the default after Promotion?");
   const affectedAgents = parseAgents(await prompt.input("Agent IDs to bind after Promotion (comma-separated, blank for none)"));
   let currentProfile: ProfileResponse | undefined;
+  let selectedProfileRevision = profileRevision;
   let defaultExpectedRevision: number | undefined;
   const assignmentExpectedRevisions = new Map<string, number>();
-  if (verification.status === "passed") {
+  if (
+    verification.status === "passed" ||
+    verification.profileRevisionId !== profileRevision.revisionId
+  ) {
     currentProfile = await client.request<ProfileResponse>(`/v1/admin/model-profiles/${encodeURIComponent(profileSlug)}`, { authority: "admin" });
+    const terminalCandidate = currentProfile.revisions.find((revision) =>
+      revision.revisionId === verification.profileRevisionId
+    );
+    if (terminalCandidate === undefined) {
+      throw new Error("invalid_control_plane_response");
+    }
+    selectedProfileRevision = terminalCandidate;
+  }
+  if (verification.status === "passed") {
+    if (currentProfile === undefined) throw new Error("invalid_control_plane_response");
     if (makeDefault) {
       const currentDefault = await client.request<{ readonly recordRevision: number | null }>("/v1/admin/default-model-profile", { authority: "admin" });
       defaultExpectedRevision = currentDefault.recordRevision ?? 0;
@@ -156,7 +175,15 @@ export async function setupModel(
       assignmentExpectedRevisions.set(agentId, assignment.recordRevision ?? 0);
     }
   }
-  const review = reviewValue(connectionRevision.baseUrl, authMode, modelId, profileRevision, verification, affectedAgents);
+  const review = reviewValue(
+    connectionRevision.baseUrl,
+    authMode,
+    modelId,
+    selectedProfileRevision,
+    profileRevision.revisionId,
+    verification,
+    affectedAgents,
+  );
   writeReview(write, json, review);
   if (verification.status === "cancelled") {
     writeSetupResult(write, json, { status: "cancelled", traceId: verification.traceId }, review);
@@ -186,7 +213,10 @@ export async function setupModel(
   await client.request(`/v1/admin/model-profiles/${encodeURIComponent(profileSlug)}/promotions`, {
     authority: "admin",
     method: "POST",
-    body: { profileRevisionId: profileRevision.revisionId, expectedRevision: currentProfile.recordRevision },
+    body: {
+      profileRevisionId: selectedProfileRevision.revisionId,
+      expectedRevision: currentProfile.recordRevision,
+    },
   });
 
   // 9. Default and Agent assignment mutations are separate and explicitly optional.
@@ -204,7 +234,10 @@ export async function setupModel(
     await client.request(`/v1/admin/agents/${encodeURIComponent(agentId)}/model-assignment`, {
       authority: "admin",
       method: "PUT",
-      body: { modelProfileRevisionId: profileRevision.revisionId, expectedRevision },
+      body: {
+        modelProfileRevisionId: selectedProfileRevision.revisionId,
+        expectedRevision,
+      },
     });
   }
   writeSetupResult(write, json, { status: "configured", profileId: profileSlug, traceId: verification.traceId }, review);
@@ -264,6 +297,7 @@ function reviewValue(
   auth: string,
   model: string,
   profile: ProfileResponse["revisions"][number],
+  preferredProfileRevisionId: string,
   verification: VerificationView,
   affectedAgents: readonly string[],
 ) {
@@ -271,14 +305,15 @@ function reviewValue(
     ...(verification.resultCode === null
       ? []
       : [`${verification.resultCode}${verification.safeStatus == null ? "" : ` (HTTP ${verification.safeStatus})`}`]),
-    ...(verification.fallbackProfileRevisionId == null
+    ...(profile.revisionId === preferredProfileRevisionId
       ? []
-      : [`Fallback candidate: ${verification.fallbackProfileRevisionId}`]),
+      : [`Fallback candidate selected: ${profile.revisionId}`]),
   ];
   return {
     destination,
     auth,
     model,
+    profileRevisionId: profile.revisionId,
     protocol: profile.invocationProtocol,
     capabilities: verification.capabilities,
     usage: verification.usage ?? null,
@@ -293,6 +328,7 @@ function writeReview(write: CliWrite, json: boolean, review: ReturnType<typeof r
   write(`Destination: ${review.destination}`);
   write(`Auth: ${review.auth}`);
   write(`Model: ${review.model}`);
+  write(`Candidate revision: ${review.profileRevisionId}`);
   write(`Protocol: ${review.protocol}`);
   write(`Capabilities: ${review.capabilities.length === 0 ? "none" : review.capabilities.join(", ")}`);
   write(`Usage: ${review.usage === null ? "unavailable" : `${review.usage.inputTokens} input, ${review.usage.outputTokens} output`}`);

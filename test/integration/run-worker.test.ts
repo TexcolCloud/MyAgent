@@ -3,6 +3,7 @@ import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { SqliteApprovalRepository } from "../../src/adapters/sqlite/approval-repository.js";
+import { OpenAiChatCompletionsModel } from "../../src/adapters/model/openai-chat-completions.js";
 import { SqliteCatalogRepository } from "../../src/adapters/sqlite/catalog-repository.js";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
@@ -27,6 +28,7 @@ import type { JsonValue } from "../../src/domain/json.js";
 import type { Run } from "../../src/domain/run.js";
 import type { Clock } from "../../src/ports/clock.js";
 import type { ModelChunk, ModelPort, ModelRequest } from "../../src/ports/model.js";
+import type { ProviderHttpTransport } from "../../src/ports/provider-http-transport.js";
 import type { RunStore } from "../../src/ports/run-store.js";
 import type {
   ToolDefinition,
@@ -83,6 +85,97 @@ describe("RunWorker", () => {
       expect(model.requests).toHaveLength(1);
     } finally {
       connection.close();
+    }
+  });
+
+  it("recovers a persisted Run from its stored runtime without a Model Registry", async () => {
+    const databasePath = tempPath("run-worker-snapshot-recovery.db");
+    const clock = new SystemClock();
+    const ids = new FakeIds({
+      sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000041")],
+      runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000041")],
+      attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000041")],
+    });
+    const initial = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    const created = (() => {
+      try {
+        migrate(initial.db);
+        const catalog = new SqliteCatalogRepository(initial.db);
+        return new CreateRunService(
+          resolvedAgents(new CatalogService(catalogSnapshot), {
+            baseUrl: "https://stored-provider.example/v1",
+            providerAuth: { type: "none" },
+            allowInsecureHttp: true,
+            modelId: "stored-model",
+          }),
+          new SqliteRunRepository(initial.db, catalog),
+          clock,
+          ids,
+        ).execute({
+          agentId: "primary",
+          sessionKey: "integration:snapshot-recovery",
+          input: { type: "text", text: "recover from the stored snapshot" },
+          idempotencyKey: "run-worker-snapshot-recovery-0001",
+          source: { kind: "http" },
+        });
+      } finally {
+        initial.close();
+      }
+    })();
+
+    const restarted = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    try {
+      const observedConnections: Array<{
+        baseUrl: string;
+        auth: unknown;
+        allowInsecureHttp: boolean;
+      }> = [];
+      const transport: ProviderHttpTransport = {
+        createFetch(input) {
+          observedConnections.push(input.connection);
+          return (async () => successfulChatResponse()) as typeof fetch;
+        },
+      };
+      const catalog = new SqliteCatalogRepository(restarted.db);
+      const runs = new SqliteRunRepository(restarted.db, catalog);
+      const sessions = new SqliteSessionRepository(restarted.db);
+      const advance = new AdvanceRunService({
+        runs,
+        tools: new SqliteToolRepository(restarted.db),
+        approvals: new SqliteApprovalRepository(restarted.db),
+        sessions,
+        model: new OpenAiChatCompletionsModel({ transport }),
+        prompts: new PromptAssembler(sessions),
+        registry: new ToolRegistry(),
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        modelRegistry: noOpProviderHealthSink,
+      });
+      const worker = new RunWorker({
+        runs,
+        advance,
+        clock,
+        workerId: "worker-snapshot-recovery",
+        concurrency: 1,
+        leaseDurationMs: 1_000,
+        idleDelayMs: 5,
+      });
+
+      worker.start();
+      try {
+        await waitFor(() => runs.getRun(created.runId).state === "completed");
+      } finally {
+        await worker.stop();
+      }
+
+      expect(observedConnections).toEqual([{
+        baseUrl: "https://stored-provider.example/v1",
+        auth: { type: "none" },
+        allowInsecureHttp: true,
+      }]);
+    } finally {
+      restarted.close();
     }
   });
 
@@ -734,6 +827,22 @@ describe("RunWorker", () => {
     }
   });
 });
+
+function successfulChatResponse(): Response {
+  const frame = (delta: Record<string, unknown>, finishReason: string | null) =>
+    `data: ${JSON.stringify({
+      id: "chatcmpl-snapshot-recovery",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "stored-model",
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+      usage: null,
+    })}\n\n`;
+  return new Response(
+    `${frame({ content: "recovered" }, null)}${frame({}, "stop")}data: [DONE]\n\n`,
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+}
 
 async function waitFor(condition: () => boolean): Promise<void> {
   const deadline = Date.now() + 2_000;

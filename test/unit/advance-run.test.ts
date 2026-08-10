@@ -2310,6 +2310,7 @@ function resolvedRevision(
         type: "bearer",
         secret: { fromEnvironment: "MODEL_API_KEY" },
       },
+      allowInsecureHttp: false,
       modelId: "test-model",
       invocationProtocol: "chat_completions",
       maxInputTokens: 32_768,

@@ -89,7 +89,7 @@ Domain and application modules do not import Fastify, SQLite, Node crypto, or th
 
 Agent files no longer contain the active model. At Run creation, an `AgentResolver` combines the current file-defined Agent revision with the exact Model Profile Revision selected by its Model Assignment. The resulting `AgentRevisionSnapshot` contains the complete effective model runtime configuration and is stored with the Run.
 
-Workers recovering an existing Run use only its stored snapshot. They do not query the current Model Registry and cannot observe later Provider Connection, Model Profile, Secret, Promotion, or Assignment changes.
+Workers recovering an existing Run use only its stored snapshot. The Chat and Responses adapters construct provider transport inputs from the snapshot's Base URL, Secret reference, and network policy without querying the current Model Registry. They cannot observe later Provider Connection, Model Profile, Secret, Promotion, Retirement, or Assignment changes. A pre-change snapshot without `allowInsecureHttp` is interpreted as `false`; every newly resolved snapshot stores an explicit boolean.
 
 ### 3.3 Protocol-first routing
 
@@ -385,6 +385,7 @@ providerConnectionRevisionId
 providerKind
 baseUrl
 providerAuth SecretRef
+allowInsecureHttp
 modelId
 invocationProtocol
 maxInputTokens
@@ -562,7 +563,7 @@ myagent verifications get
 myagent secrets rotate-master-key
 ```
 
-Every command has non-interactive flags, `--json`, stable exit codes, and trace IDs for failures. Interactive setup displays connection destination, auth mode, selected model, resolved protocol, capability result, context-window source, and affected Agents before the final Promotion and Assignment confirmation.
+Every command has non-interactive flags, `--json`, stable exit codes, and trace IDs for failures. `models verify` and interactive setup follow only the bounded chain of explicit fallback candidate and Verification IDs returned by the control plane. Interactive setup loads the terminal passing candidate and displays its exact revision ID and fixed protocol with the connection destination, auth mode, selected model, capability result, context-window source, and affected Agents before promoting or assigning that exact revision.
 
 The CLI never opens SQLite, decrypts Managed Secrets, or edits YAML directly.
 

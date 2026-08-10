@@ -7,7 +7,6 @@ import type {
   ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
-import type { EffectiveModelRuntime } from "../../domain/agent-revision.js";
 import type { JsonValue } from "../../domain/json.js";
 import {
   ModelProviderError,
@@ -17,15 +16,11 @@ import {
   type ModelRequest,
   type ModelUsage,
 } from "../../ports/model.js";
-import type {
-  ExactProviderConnectionRevision,
-  ModelRegistryStore,
-} from "../../ports/model-registry-store.js";
 import type { ProviderHttpTransport } from "../../ports/provider-http-transport.js";
+import { providerRuntimeConnection } from "./provider-runtime-connection.js";
 
 export interface OpenAiResponsesModelOptions {
   transport: ProviderHttpTransport;
-  connections: Pick<ModelRegistryStore, "getConnectionRevision">;
 }
 
 const REQUEST_TIMEOUT_MS = 120_000;
@@ -59,13 +54,12 @@ export class OpenAiResponsesModel implements ModelPort {
         code: "invocation_protocol_unsupported",
       });
     }
-    const connection = exactConnection(request.model, this.options.connections);
     const client = new OpenAI({
       apiKey: "transport-owned-authentication",
       baseURL: request.model.baseUrl,
       maxRetries: 0,
       fetch: this.options.transport.createFetch({
-        connection: connection.revision,
+        connection: providerRuntimeConnection(request.model),
         timeoutMs: REQUEST_TIMEOUT_MS,
         maxResponseBytes: MAX_RESPONSE_BYTES,
       }),
@@ -390,37 +384,6 @@ function responseInput(input: readonly ModelInput[]): ResponseInput {
     index += 1;
   }
   return result;
-}
-
-function exactConnection(
-  model: EffectiveModelRuntime,
-  connections: Pick<ModelRegistryStore, "getConnectionRevision">,
-): ExactProviderConnectionRevision {
-  const target = connections.getConnectionRevision(model.providerConnectionRevisionId);
-  if (
-    target === null ||
-    target.providerKind !== model.providerKind ||
-    target.revision.baseUrl !== model.baseUrl ||
-    target.revision.presetVersion !== model.compatibilityPresetVersion ||
-    !sameAuth(target.revision.auth, model.providerAuth)
-  ) {
-    throw protocolError();
-  }
-  return target;
-}
-
-function sameAuth(
-  left: ExactProviderConnectionRevision["revision"]["auth"],
-  right: EffectiveModelRuntime["providerAuth"],
-): boolean {
-  if (left.type !== right.type) return false;
-  if (left.type === "none" || right.type === "none") return true;
-  if ("fromEnvironment" in left.secret) {
-    return "fromEnvironment" in right.secret &&
-      left.secret.fromEnvironment === right.secret.fromEnvironment;
-  }
-  return "managedSecretVersionId" in right.secret &&
-    left.secret.managedSecretVersionId === right.secret.managedSecretVersionId;
 }
 
 function canonicalJson(value: JsonValue): string {

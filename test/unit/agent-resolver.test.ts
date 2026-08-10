@@ -35,6 +35,17 @@ describe("AgentResolver", () => {
     expect(first).toEqual(second);
   });
 
+  it("snapshots the explicit provider network policy", () => {
+    const fixture = registryFixture({ allowInsecureHttp: true });
+    const snapshot = new AgentResolver({
+      catalog: { resolve: () => ({ id: agentId, definition }) },
+      registry: fixture.registry,
+      secrets: { resolve: () => "resolved-secret" },
+    }).resolve(agentId);
+
+    expect(snapshot.model.allowInsecureHttp).toBe(true);
+  });
+
   it("rejects an Agent without an exact model assignment", () => {
     const resolver = new AgentResolver({
       catalog: { resolve: () => ({ id: agentId, definition }) },
@@ -202,6 +213,7 @@ const definition: AgentDefinitionRevision = {
 };
 
 function registryFixture(options: {
+  allowInsecureHttp?: boolean;
   connectionState?: RegistryRevisionState;
   profileState?: RegistryRevisionState;
   assignmentSource?: ModelAssignment["source"];
@@ -266,7 +278,7 @@ function registryFixture(options: {
         type: "bearer",
         secret: { fromEnvironment: "OPENAI_API_KEY" },
       },
-      allowInsecureHttp: false,
+      allowInsecureHttp: options.allowInsecureHttp ?? false,
       protocolPreference: "chat_completions",
       presetVersion: "openai-v1",
       createdAt: now,

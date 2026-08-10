@@ -5,11 +5,7 @@ import type { AddressInfo } from "node:net";
 import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
 import { OpenAiResponsesModel } from "../../src/adapters/model/openai-responses.js";
 import { NodeProviderHttpTransport } from "../../src/adapters/provider-http-transport.js";
-import type { ProviderAuth } from "../../src/domain/provider-connection.js";
-import {
-  parseProviderConnectionId,
-  providerConnectionRevisionIdFromUuid,
-} from "../../src/domain/ids.js";
+import { providerConnectionRevisionIdFromUuid } from "../../src/domain/ids.js";
 import type { JsonValue } from "../../src/domain/json.js";
 import type { ModelChunk, ModelRequest } from "../../src/ports/model.js";
 
@@ -22,6 +18,26 @@ afterEach(async () => {
 });
 
 describe("OpenAiResponsesModel", () => {
+  it("executes from the stored runtime without a Model Registry", async () => {
+    const fake = await startServer([
+      { type: "response.output_text.delta", delta: "snapshot-authority" },
+      { type: "response.completed", response: completedResponse() },
+    ]);
+    servers.push(fake.server);
+    const model = new OpenAiResponsesModel({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" }),
+      }),
+    });
+
+    const chunks = await collect(model.streamAttempt(request(fake.baseUrl, {
+      input: [{ type: "message", role: "user", content: "Recover." }],
+    }), new AbortController().signal));
+
+    expect(chunks).toContainEqual({ type: "text_delta", text: "snapshot-authority" });
+    expect(fake.requests).toHaveLength(1);
+  });
+
   it("reconstructs stateless function call history without previous response state", async () => {
     const fake = await startServer([
       { type: "response.output_text.delta", delta: "ok" },
@@ -29,7 +45,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    const chunks = await collect(adapter(fake.baseUrl).streamAttempt(request(fake.baseUrl, {
+    const chunks = await collect(adapter().streamAttempt(request(fake.baseUrl, {
       input: [
         { type: "message", role: "user", content: "Inspect." },
         { type: "assistant_tool_call", callId: "call_7", name: "read_file", arguments: { path: "a.txt" } },
@@ -92,7 +108,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    const chunks = await collect(adapter(fake.baseUrl).streamAttempt(
+    const chunks = await collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Read." }] }),
       new AbortController().signal,
     ));
@@ -118,7 +134,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    const chunks = await collect(adapter(fake.baseUrl).streamAttempt(
+    const chunks = await collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ));
@@ -137,7 +153,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await collect(adapter(fake.baseUrl).streamAttempt(request(fake.baseUrl, {
+    await collect(adapter().streamAttempt(request(fake.baseUrl, {
       purpose: "verification_tool",
       toolChoice: "required",
       input: [{ type: "message", role: "user", content: "Verify." }],
@@ -150,7 +166,7 @@ describe("OpenAiResponsesModel", () => {
     const fake = await startServer([{ type: "response.completed", response: completedResponse() }]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -170,7 +186,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    const error = await collect(adapter(fake.baseUrl).streamAttempt(
+    const error = await collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     )).catch((cause: unknown) => cause);
@@ -186,7 +202,7 @@ describe("OpenAiResponsesModel", () => {
     });
     servers.push(fake.server);
 
-    const error = await collect(adapter(fake.baseUrl).streamAttempt(
+    const error = await collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     )).catch((cause: unknown) => cause);
@@ -212,7 +228,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -230,7 +246,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    const chunks = await collect(adapter(fake.baseUrl).streamAttempt(
+    const chunks = await collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ));
@@ -260,7 +276,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -282,7 +298,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -300,7 +316,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -322,7 +338,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -339,7 +355,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -363,7 +379,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -383,7 +399,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -393,7 +409,7 @@ describe("OpenAiResponsesModel", () => {
     const fake = await startServer([{ type: "response.output_text.delta", delta: "partial" }]);
     servers.push(fake.server);
 
-    await expect(collect(adapter(fake.baseUrl).streamAttempt(
+    await expect(collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
@@ -403,7 +419,7 @@ describe("OpenAiResponsesModel", () => {
     const fake = await startServer([{ type: "response.output_text.delta", delta: "partial" }], { holdOpen: true });
     servers.push(fake.server);
     const controller = new AbortController();
-    const pending = collect(adapter(fake.baseUrl).streamAttempt(
+    const pending = collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       controller.signal,
     ));
@@ -424,7 +440,7 @@ describe("OpenAiResponsesModel", () => {
     ]);
     servers.push(fake.server);
 
-    const chunks = await collect(adapter(fake.baseUrl).streamAttempt(
+    const chunks = await collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     ));
@@ -451,7 +467,7 @@ describe("OpenAiResponsesModel", () => {
     const fake = await startServer([], { status, headers, body: { error: { message: "provider-body-secret" } } });
     servers.push(fake.server);
 
-    const error = await collect(adapter(fake.baseUrl).streamAttempt(
+    const error = await collect(adapter().streamAttempt(
       request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
       new AbortController().signal,
     )).catch((cause: unknown) => cause);
@@ -464,7 +480,7 @@ describe("OpenAiResponsesModel", () => {
     const controller = new AbortController();
     controller.abort(new Error("secret-abort-reason"));
 
-    const error = await collect(adapter("http://127.0.0.1:1/v1").streamAttempt(
+    const error = await collect(adapter().streamAttempt(
       request("http://127.0.0.1:1/v1", { input: [{ type: "message", role: "user", content: "Hello" }] }),
       controller.signal,
     )).catch((cause: unknown) => cause);
@@ -474,32 +490,11 @@ describe("OpenAiResponsesModel", () => {
   });
 });
 
-function adapter(storedBaseUrl: string): OpenAiResponsesModel {
-  const revisionId = providerConnectionRevisionIdFromUuid("00000000-0000-7000-8000-000000000401");
-  const auth: ProviderAuth = { type: "bearer", secret: { fromEnvironment: "TEST_API_KEY" } };
+function adapter(): OpenAiResponsesModel {
   return new OpenAiResponsesModel({
     transport: new NodeProviderHttpTransport({
       secretResolver: new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" }),
     }),
-    connections: {
-      getConnectionRevision(requestedRevisionId) {
-        if (requestedRevisionId !== revisionId) return null;
-        return {
-          providerKind: "openai_compatible",
-          revision: {
-            revisionId,
-            connectionId: parseProviderConnectionId("openai-responses-test"),
-            state: "active",
-            baseUrl: storedBaseUrl,
-            auth,
-            allowInsecureHttp: true,
-            protocolPreference: "responses",
-            presetVersion: "openai-responses-v1",
-            createdAt: new Date("2026-08-10T00:00:00.000Z"),
-          },
-        };
-      },
-    },
   });
 }
 
@@ -514,6 +509,7 @@ function request(
       providerKind: "openai_compatible",
       baseUrl,
       providerAuth: { type: "bearer", secret: { fromEnvironment: "TEST_API_KEY" } },
+      allowInsecureHttp: true,
       modelId: "deepseek-v4-flash",
       invocationProtocol: "responses",
       maxInputTokens: 8_192,

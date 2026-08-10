@@ -3,8 +3,8 @@ import { request as httpsRequest } from "node:https";
 import type { RequestOptions as HttpsRequestOptions } from "node:https";
 import { isIP } from "node:net";
 
-import type { ProviderConnectionRevision } from "../domain/provider-connection.js";
 import type {
+  ProviderHttpConnectionRuntime,
   ProviderHttpTransport,
   ProviderHttpTransportInput,
 } from "../ports/provider-http-transport.js";
@@ -59,7 +59,7 @@ export interface NodeProviderHttpTransportOptions {
 
 interface RequestContext {
   readonly baseOrigin: string;
-  readonly connection: ProviderConnectionRevision;
+  readonly connection: ProviderHttpConnectionRuntime;
   readonly deadline: number;
   readonly maxResponseBytes: number;
   bearerToken?: string;
@@ -169,7 +169,7 @@ export class NodeProviderHttpTransport implements ProviderHttpTransport {
     );
   }
 
-  private resolveBearerToken(connection: ProviderConnectionRevision): string {
+  private resolveBearerToken(connection: ProviderHttpConnectionRuntime): string {
     if (connection.auth.type === "none") return "";
     try {
       const token = this.options.secretResolver.resolve(connection.auth.secret);

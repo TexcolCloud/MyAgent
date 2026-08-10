@@ -189,11 +189,9 @@ export async function bootstrap(
     const providerModel = new ModelRuntimeRouter({
       chatCompletions: new OpenAiChatCompletionsModel({
         transport: providerTransport,
-        connections: modelRegistry,
       }),
       responses: new OpenAiResponsesModel({
         transport: providerTransport,
-        connections: modelRegistry,
       }),
     });
     const model = options.model ?? providerModel;

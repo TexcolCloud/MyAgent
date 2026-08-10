@@ -15,6 +15,7 @@ export function testModelRuntime(
       type: "bearer",
       secret: { fromEnvironment: "TEST_API_KEY" },
     },
+    allowInsecureHttp: false,
     modelId: "test-model",
     invocationProtocol: "chat_completions",
     maxInputTokens: 8_192,

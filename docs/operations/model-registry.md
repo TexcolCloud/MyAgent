@@ -12,8 +12,8 @@ Run `myagent model setup` for the guided flow, or use the individual `providers`
 
 1. Create a Provider Connection and discover its models.
 2. Create a Model Profile from a discovered model. If discovery is unsupported, acknowledge manual eligibility and supply the model ID and context-window source explicitly.
-3. Start Verification and wait for both the streaming-text and single-Tool-call probes to pass. Verification proposes a Tool Call but never executes it.
-4. Promote the Connection Revision, then promote the verified Profile Revision.
+3. Start Verification and wait for both the streaming-text and single-Tool-call probes to pass. Verification proposes a Tool Call but never executes it. If endpoint-absence evidence creates an automatic fallback candidate, the CLI follows only the returned fallback operation ID and reports that candidate's fixed protocol and exact revision.
+4. Promote the Connection Revision, then promote the terminal passing Profile Revision shown by the CLI. Never promote the earlier failed preferred-protocol candidate.
 5. Set the default Profile or assign the exact active Profile Revision to an Agent.
 
 Promotion never moves an existing Agent Assignment. Use `myagent agents set-model` for each deliberate rebind.

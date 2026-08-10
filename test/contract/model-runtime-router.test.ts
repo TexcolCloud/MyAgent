@@ -63,6 +63,7 @@ function request(invocationProtocol: "chat_completions" | "responses"): ModelReq
       providerKind: "openai_compatible",
       baseUrl: "https://provider.example/v1",
       providerAuth: { type: "none" },
+      allowInsecureHttp: false,
       modelId: "deepseek-v4-flash",
       invocationProtocol,
       maxInputTokens: 8_192,

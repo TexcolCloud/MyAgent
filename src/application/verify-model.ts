@@ -438,6 +438,7 @@ export class VerifyModelService {
       providerKind: connection.providerKind,
       baseUrl: connectionRevision.baseUrl,
       providerAuth: connectionRevision.auth,
+      allowInsecureHttp: connectionRevision.allowInsecureHttp,
       modelId: profileRevision.providerModelId,
       invocationProtocol: profileRevision.invocationProtocol,
       maxInputTokens: profileRevision.maxInputTokens,

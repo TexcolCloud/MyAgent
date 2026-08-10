@@ -1,16 +1,13 @@
 import { existsSync, writeFileSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 
 import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
 import { OpenAiChatCompletionsModel } from "../../src/adapters/model/openai-chat-completions.js";
 import { NodeProviderHttpTransport } from "../../src/adapters/provider-http-transport.js";
-import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
 import { bootstrap } from "../../src/bootstrap.js";
 import type { ModelPort } from "../../src/ports/model.js";
 import type { FaultInjector, FaultPoint } from "../../src/runtime/fault-injector.js";
 
 const configPath = requiredEnvironment("MYAGENT_FAULT_CONFIG");
-const databasePath = requiredEnvironment("MYAGENT_FAULT_DATABASE");
 const selected = process.env.MYAGENT_FAULT_POINT as FaultPoint | undefined;
 const armPath = requiredEnvironment("MYAGENT_FAULT_ARM");
 const hitPath = requiredEnvironment("MYAGENT_FAULT_HIT");
@@ -34,7 +31,6 @@ const innerModel = new OpenAiChatCompletionsModel({
   transport: new NodeProviderHttpTransport({
     secretResolver: new EnvironmentSecretResolver(),
   }),
-  connections: new SqliteModelRegistryRepository(new DatabaseSync(databasePath)),
 });
 const model = modelAckMarker === undefined || modelAckPath === undefined
   ? innerModel

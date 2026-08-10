@@ -41,6 +41,7 @@ export interface EffectiveModelRuntime {
   providerKind: ProviderKind;
   baseUrl: string;
   providerAuth: ProviderAuth;
+  allowInsecureHttp: boolean;
   modelId: string;
   invocationProtocol: InvocationProtocol;
   maxInputTokens: number;

@@ -391,6 +391,7 @@ function revision(maxInputTokens: number): AgentRevisionSnapshot {
         type: "bearer",
         secret: { fromEnvironment: "TEST_API_KEY" },
       },
+      allowInsecureHttp: false,
       modelId: "test-model",
       invocationProtocol: "chat_completions",
       maxInputTokens,

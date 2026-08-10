@@ -80,6 +80,7 @@ export class AgentResolver implements AgentResolverPort {
       providerKind: connectionView.providerKind,
       baseUrl: connectionRevision.baseUrl,
       providerAuth: connectionRevision.auth,
+      allowInsecureHttp: connectionRevision.allowInsecureHttp,
       modelId: profileRevision.providerModelId,
       invocationProtocol: profileRevision.invocationProtocol,
       maxInputTokens: profileRevision.maxInputTokens,
