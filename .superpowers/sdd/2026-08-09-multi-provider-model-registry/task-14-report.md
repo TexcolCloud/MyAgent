@@ -73,3 +73,136 @@ The final serialized `npm test -- --maxWorkers=1` gate did not produce a clean e
 ## Concerns
 
 The pre-existing Windows E2E cleanup flake prevents a clean final full-suite exit despite isolated reproduction passing and all changed behavior remaining green. The failure is confined to temporary-file unlink after an unchanged fault-boundary SSE case; no Task 14 code path participates in that cleanup.
+
+## Formal Fix Round 1/5
+
+### Status and Commits
+
+Both Important findings from the formal Task 14 review are resolved without
+deferral.
+
+- Implementation commit: `0eb5005c1f7963083c998a2e3972ccaf0de5f06d`.
+- Report commit: this report's final commit SHA is recorded in the Task 14 status
+  contract because a Git commit cannot contain its own final SHA.
+
+### Important 1: Atomic Managed Secret Destruction
+
+Finding: Managed Secret reference inspection occurred before the Secret Store's
+destructive transaction. A concurrent Connection reference could be created
+between inspection and ciphertext destruction, and a stale referenced request
+returned `resource_in_use` before validating `expectedRevision`.
+
+Resolution:
+
+- Added a store-level active-version/CAS assertion and made destruction reuse it.
+- Moved expected-revision validation, exact reference inspection, safe category
+  derivation, and ciphertext destruction into one outer `BEGIN IMMEDIATE`
+  transaction, with CAS validation first.
+- Removed the non-atomic HTTP route preflight.
+- Required managed-Secret Connection creation/revision to assert the Secret is
+  active inside the existing outer Connection transaction. Nested SQLite
+  transaction helpers execute inline, so Secret validation and reference insertion
+  share the same writer lock.
+- Preserved exact, deduplicated `provider_connection_revision` category evidence
+  without exposing Secret or owner IDs.
+
+RED evidence:
+
+- The stale referenced destruction regression expected `revision_conflict` but
+  received `resource_in_use` before the fix.
+- The Connection regression allowed a Connection to reference an already-destroyed
+  Secret before active-version validation was added.
+
+GREEN evidence and covering tests:
+
+- `test/unit/managed-secret-service.test.ts` verifies transaction entry, CAS-first
+  ordering, reference inspection, and exact safe category details.
+- `test/contract/managed-secret-store.test.ts` uses two SQLite connections: an open
+  reference writer blocks the destructive contender with SQLite busy; after the
+  reference commits, destruction returns `resource_in_use` with exactly
+  `provider_connection_revision` and leaves the Secret active.
+- `test/integration/model-secret-leak.test.ts` verifies stale-revision precedence and
+  safe referenced-destruction containment.
+- `test/integration/model-assignments.test.ts` verifies a destroyed Secret cannot win
+  before a new Connection reference.
+- Command:
+  `npx vitest run test/unit/managed-secret-service.test.ts test/contract/managed-secret-store.test.ts test/integration/model-secret-leak.test.ts test/integration/model-assignments.test.ts --maxWorkers=1`
+  passed 4 files and 48 tests.
+
+### Important 2: Closed Verification and Problem Codes
+
+Finding: the Verification response schema reused a provider-runtime vocabulary that
+also contained lifecycle codes, while the HTTP error handler published arbitrary
+`DomainError.code` and `ApplicationError.code` strings.
+
+Resolution:
+
+- Removed lifecycle/resource codes from `PROVIDER_RUNTIME_ERROR_CODES`.
+- Added the exact nine-code `VERIFICATION_RESULT_CODES` /
+  `VerificationResultCode` contract and applied it to the Verification domain,
+  persistence port, orchestration normalization, and HTTP response schema.
+- Added closed `DomainErrorCode`, `ApplicationErrorCode`,
+  `ControlPlaneProblemCode`, and `PublicProblemCode` vocabularies. Existing error
+  construction is now compile-time checked.
+- HTTP projection now checks the closed public allowlist. An unknown or unapproved
+  Domain/Application error is logged as `internal_error` and returns only the
+  generic `500 internal_error` Problem, without echoing its code, message, or
+  details.
+- Persisted invalid Verification result codes fail response parsing and are handled
+  as generic internal errors rather than serialized as successful operations.
+
+RED evidence:
+
+- Command:
+  `npx vitest run test/unit/model-control-schemas.test.ts test/integration/http-model-control.test.ts --maxWorkers=1`
+  failed 6 tests and passed 30: all four lifecycle codes were accepted as
+  Verification results, the unknown Domain code was echoed as a 422 Problem, and a
+  persisted `revision_conflict` Verification result was serialized with 200.
+- `npm run typecheck` failed because `ControlPlaneProblemCode` and
+  `VerificationResultCode` did not exist and the negative type assertion was
+  unused.
+
+GREEN evidence and covering tests:
+
+- The same focused command passed 2 files and 36 tests.
+- `test/unit/model-control-schemas.test.ts` rejects lifecycle results, accepts only
+  the nine approved results, accepts `revision_conflict` as a control-plane Problem
+  at compile time, and uses `@ts-expect-error` to prove it is not a Verification
+  result.
+- `test/integration/http-model-control.test.ts` proves unknown Domain diagnostics and
+  invalid persisted Verification result codes become generic 500 Problems without
+  echo.
+
+### Verification
+
+- Exact Task 14 command:
+  `npm run test:integration -- test/integration/http-model-control.test.ts test/integration/model-verification-worker.test.ts test/integration/model-assignments.test.ts test/integration/model-secret-leak.test.ts`
+  passed 23 files and 149 tests.
+- Repository/Secret command:
+  `npx vitest run test/contract/model-registry-repository.test.ts test/contract/managed-secret-store.test.ts test/unit/managed-secret-service.test.ts --maxWorkers=1`
+  passed 3 files and 72 tests.
+- `npm run lint`: passed.
+- `npm run typecheck`: passed.
+- `npm run build`: passed, including migration-copy postbuild.
+- `git diff --check`: passed.
+- Serialized full-suite command, run exactly once:
+  `npm test -- --maxWorkers=1`.
+  It reached 72 passing files, 689 passing tests, and 5 skipped tests. The sole
+  failure was the known unchanged Windows cleanup issue in
+  `test/e2e/fault-boundaries.test.ts`, case `after_sse_write`:
+  `EBUSY: resource busy or locked, unlink ...\kernel.db`. Per the fix-round
+  instruction, the suite was not retried and no runner settings or timeouts were
+  changed.
+
+### Self-Review
+
+- Destruction checks the Secret CAS before revealing reference categories.
+- Both destructive and reference-creating paths serialize on the same SQLite writer
+  lock; the losing side observes either SQLite busy, the committed reference, or the
+  destroyed Secret.
+- Verification result codes cannot contain lifecycle/resource Problems at either
+  compile time or response serialization.
+- Unknown error codes, messages, details, Secret IDs, and reference-owner IDs are not
+  published by the new failure paths.
+- No migrations, worker lifecycle, test runner settings, timeouts, or unrelated
+  routes changed.
