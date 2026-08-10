@@ -6,6 +6,76 @@ import { createHttpApp } from "../../src/interfaces/http/app.js";
 import { startTestApp } from "../helpers/start-test-app.js";
 
 describe("HTTP authentication", () => {
+  it("rejects configuration that reuses the Run Token as the Admin Token", () => {
+    expect(() => createHttpApp({
+      bearerToken: "shared-token",
+      adminToken: "shared-token",
+    })).toThrowError("http_admin_token_must_differ");
+  });
+
+  it("requires the separate Admin Token and actual loopback peer for admin routes", async () => {
+    const app = createHttpApp({
+      bearerToken: "run-token",
+      adminToken: "admin-token",
+    });
+    try {
+      const runCredential = await app.inject({
+        method: "GET",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: { authorization: "Bearer run-token" },
+      });
+      expect(runCredential.statusCode).toBe(401);
+
+      const adminRootWithQuery = await app.inject({
+        method: "GET",
+        url: "/v1/admin?view=connections",
+        remoteAddress: "127.0.0.1",
+        headers: { authorization: "Bearer run-token" },
+      });
+      expect(adminRootWithQuery.statusCode).toBe(401);
+
+      const nonLoopback = await app.inject({
+        method: "GET",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "192.168.1.8",
+        headers: { authorization: "Bearer admin-token" },
+      });
+      expect(nonLoopback.statusCode).toBe(403);
+      expect(nonLoopback.json()).toEqual({
+        type: "about:blank",
+        title: "Forbidden",
+        status: 403,
+        code: "forbidden",
+        detail: "Access is forbidden.",
+        traceId: expect.any(String),
+      });
+
+      const forwardedNonLoopback = await app.inject({
+        method: "GET",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "::ffff:127.0.0.1",
+        headers: {
+          authorization: "Bearer admin-token",
+          forwarded: "for=8.8.8.8",
+          "x-forwarded-for": "8.8.8.8",
+          "x-real-ip": "8.8.8.8",
+        },
+      });
+      expect(forwardedNonLoopback.statusCode).toBe(404);
+
+      const hexadecimalMappedLoopback = await app.inject({
+        method: "GET",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "::ffff:7f00:1",
+        headers: { authorization: "Bearer admin-token" },
+      });
+      expect(hexadecimalMappedLoopback.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("leaves only health and readiness unauthenticated", async () => {
     const harness = await startTestApp();
     try {

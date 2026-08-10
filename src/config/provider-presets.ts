@@ -31,3 +31,20 @@ export const PROVIDER_PRESETS: Readonly<Record<ProviderKind, Readonly<ProviderPr
 export function providerPreset(kind: ProviderKind): Readonly<ProviderPreset> {
   return Object.freeze({ ...PROVIDER_PRESETS[kind] });
 }
+
+const MODEL_CONTEXT_PRESETS: Readonly<Record<string, number>> = Object.freeze({
+  "openai:gpt-4o": 128_000,
+  "openai:gpt-4o-mini": 128_000,
+  "openai:gpt-4.1": 1_047_576,
+  "openai:gpt-4.1-mini": 1_047_576,
+  "openai:gpt-4.1-nano": 1_047_576,
+  "deepseek:deepseek-chat": 64_000,
+  "deepseek:deepseek-reasoner": 64_000,
+});
+
+export function modelContextPreset(
+  providerKind: ProviderKind,
+  modelId: string,
+): number | undefined {
+  return MODEL_CONTEXT_PRESETS[`${providerKind}:${modelId}`];
+}

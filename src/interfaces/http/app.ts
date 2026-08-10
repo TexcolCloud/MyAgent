@@ -21,7 +21,7 @@ import type { ModelRegistryStore } from "../../ports/model-registry-store.js";
 import type { RunStore } from "../../ports/run-store.js";
 import type { SessionLookupStore } from "../../ports/session-store.js";
 import type { ReconciliationStore } from "../../ports/tool-store.js";
-import { isAuthorized } from "./auth.js";
+import { isAuthorized, isLoopbackPeer, tokensEqual } from "./auth.js";
 import { sendError, sendProblem } from "./problem.js";
 import { registerHealthRoutes, type ReadinessProbe } from "./routes/health.js";
 import { registerAgentRoutes } from "./routes/agents.js";
@@ -31,6 +31,8 @@ import { registerConfigRoutes } from "./routes/config.js";
 import { registerRunRoutes } from "./routes/runs.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerToolCallRoutes } from "./routes/tool-calls.js";
+import { registerProviderConnectionRoutes } from "./routes/provider-connections.js";
+import { registerModelProfileRoutes } from "./routes/model-profiles.js";
 import { serializeWithSchema } from "./schemas.js";
 import type { SseStreamOptions } from "./sse.js";
 
@@ -42,6 +44,7 @@ export interface ModelControlServices {
   readonly assignments: AssignModelService;
   readonly discovery: DiscoverModelsService;
   readonly verifications: VerifyModelService;
+  readonly now?: () => Date;
 }
 
 export interface HttpAppOptions {
@@ -69,6 +72,9 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
   if (options.bearerToken.length === 0) {
     throw new Error("http_bearer_token_required");
   }
+  if (options.adminToken !== undefined && tokensEqual(options.bearerToken, options.adminToken)) {
+    throw new Error("http_admin_token_must_differ");
+  }
 
   const app = Fastify({
     genReqId: () => randomUUID(),
@@ -85,12 +91,21 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
   app.setSerializerCompiler(({ schema }) => serializeWithSchema(schema));
   registerHealthRoutes(app, options.readiness ?? (() => true));
   app.addHook("onRequest", async (request, reply) => {
-    if (request.url === "/v1" || request.url.startsWith("/v1/")) {
-      const authorization = request.headers.authorization;
-      if (!isAuthorized(
-        typeof authorization === "string" ? authorization : undefined,
-        options.bearerToken,
-      )) {
+    const requestPath = request.url.split("?", 1)[0]!;
+    const authorization = typeof request.headers.authorization === "string"
+      ? request.headers.authorization
+      : undefined;
+    if (requestPath === "/v1/admin" || requestPath.startsWith("/v1/admin/")) {
+      if (options.adminToken === undefined || !isAuthorized(authorization, options.adminToken)) {
+        return sendProblem(reply, request, 401, "unauthorized", "Authentication is required.");
+      }
+      if (!isLoopbackPeer(request.raw.socket.remoteAddress)) {
+        return sendProblem(reply, request, 403, "forbidden", "Access is forbidden.");
+      }
+      return;
+    }
+    if (requestPath === "/v1" || requestPath.startsWith("/v1/")) {
+      if (!isAuthorized(authorization, options.bearerToken)) {
         return sendProblem(reply, request, 401, "unauthorized", "Authentication is required.");
       }
     }
@@ -128,6 +143,13 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
   }
   if (options.createBackups !== undefined) {
     app.register((api, _routeOptions, done) => { registerBackupRoutes(api, options.createBackups!); done(); }, { prefix: "/v1" });
+  }
+  if (options.modelControl !== undefined) {
+    app.register((api, _routeOptions, done) => {
+      registerProviderConnectionRoutes(api, options.modelControl!);
+      registerModelProfileRoutes(api, options.modelControl!);
+      done();
+    }, { prefix: "/v1/admin" });
   }
   app.setErrorHandler((error, request, reply) => sendError(error, request, reply));
   app.setNotFoundHandler((request, reply) =>
