@@ -496,6 +496,34 @@ describe("VerifyModelService", () => {
     },
   );
 
+  it.each([404, 405, 501])(
+    "does not treat unknown provider code at HTTP %i as endpoint absence",
+    async (status) => {
+      const fixture = createVerificationFixture();
+      fixture.model.script({
+        chunks: [],
+        error: new ModelProviderError({
+          code: "provider_made_up",
+          transient: false,
+          status,
+        }),
+      });
+
+      await fixture.service.runClaimed(
+        fixture.claimed,
+        new AbortController().signal,
+      );
+
+      expect(fixture.completed).toMatchObject({
+        outcome: "failed",
+        resultCode: "model_protocol_error",
+        safeStatus: status,
+      });
+      expect(fixture.completed?.fallback).toBeUndefined();
+      expect(fixture.profile.revisions).toHaveLength(1);
+    },
+  );
+
   it("uses trusted unsupported-endpoint evidence without persisting it", async () => {
     const fixture = createVerificationFixture();
     const evidence = validateUnsupportedEndpointCode("unsupported_endpoint");

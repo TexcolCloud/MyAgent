@@ -202,6 +202,64 @@ describe("ModelVerificationWorker", () => {
     expect(reported).toEqual([{ error: failure, verificationId: firstId }]);
   });
 
+  it("safely fails a SQLite unique-constraint job and continues the lane", async () => {
+    const firstId = modelVerificationIdFromUuid("constraint-first");
+    const secondId = modelVerificationIdFromUuid("constraint-second");
+    const claims = [
+      runningVerification(firstId, "worker-constraint:0"),
+      runningVerification(secondId, "worker-constraint:0"),
+    ];
+    const registry = {
+      claimVerification: () => claims.shift() ?? null,
+      renewVerificationLease: () => true,
+    } as unknown as Pick<
+      ModelRegistryStore,
+      "claimVerification" | "renewVerificationLease"
+    >;
+    const constraint = new Error(
+      "UNIQUE constraint failed: model_verifications.verification_id",
+    ) as Error & { code: string };
+    constraint.code = "SQLITE_CONSTRAINT_UNIQUE";
+    const safelyFailed: typeof firstId[] = [];
+    const reported: unknown[] = [];
+    let secondCompleted = false;
+    let fatal: unknown;
+    const verify = {
+      async runClaimed(verification: ModelVerification): Promise<ModelVerification> {
+        if (verification.verificationId === firstId) throw constraint;
+        secondCompleted = true;
+        return { ...verification, state: "passed" };
+      },
+      failClaimed(verification: ModelVerification): ModelVerification {
+        safelyFailed.push(verification.verificationId);
+        return { ...verification, state: "failed" };
+      },
+    };
+    const worker = new ModelVerificationWorker({
+      registry,
+      verify,
+      clock: new SystemClock(),
+      workerId: "worker-constraint",
+      idleDelayMs: 5,
+      onUnexpectedVerificationError(error) {
+        reported.push(error);
+      },
+      onFatalError(error) {
+        fatal = error;
+      },
+    });
+
+    worker.start();
+    await waitFor(() => secondCompleted || fatal !== undefined);
+    const stopError = await worker.stop().catch((error: unknown) => error);
+
+    expect(stopError).toBeUndefined();
+    expect(fatal).toBeUndefined();
+    expect(secondCompleted).toBe(true);
+    expect(safelyFailed).toEqual([firstId]);
+    expect(reported).toEqual([constraint]);
+  });
+
   it("backs off and retries a transient SQLite busy claim", async () => {
     const verificationId = modelVerificationIdFromUuid("busy-claim");
     const claimed = runningVerification(verificationId, "worker-busy:0");

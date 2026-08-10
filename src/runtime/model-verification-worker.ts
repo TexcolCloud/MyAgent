@@ -182,11 +182,22 @@ function isSqliteUnavailable(error: unknown): boolean {
     return false;
   }
   return (
-    (typeof details.code === "string" &&
-      (details.code.startsWith("SQLITE_") || details.code === "ERR_SQLITE_ERROR")) ||
-    /database (?:is )?closed|disk i\/o|not a database|database disk image is malformed|unable to open database/i
+    isSqliteUnavailableCode(details.code) ||
+    /database(?: connection)? (?:is )?(?:closed|not open)|disk i\/o|not a database|database disk image is malformed|unable to open database/i
       .test(error.message)
   );
+}
+
+function isSqliteUnavailableCode(code: unknown): boolean {
+  if (typeof code !== "string") return false;
+  return code === "SQLITE_MISUSE" ||
+    code === "SQLITE_NOTADB" ||
+    code === "SQLITE_IOERR" ||
+    code.startsWith("SQLITE_IOERR_") ||
+    code === "SQLITE_CORRUPT" ||
+    code.startsWith("SQLITE_CORRUPT_") ||
+    code === "SQLITE_CANTOPEN" ||
+    code.startsWith("SQLITE_CANTOPEN_");
 }
 
 function isSqliteBusy(error: unknown): boolean {

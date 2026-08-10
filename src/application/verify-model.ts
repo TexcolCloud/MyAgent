@@ -565,7 +565,7 @@ function safeProbeFailure(error: unknown): SafeProbeFailure | undefined {
     const status = safeStatus(providerError.status);
     const code = normalizedProviderCode(providerError.code);
     return {
-      code: isEndpointAbsenceProtocolError(code, status)
+      code: isEndpointAbsenceProtocolError(providerError.code, status)
         ? "invocation_protocol_unsupported"
         : code,
       ...(status === undefined ? {} : { status }),
@@ -610,7 +610,7 @@ function isProviderRuntimeErrorCode(code: string): code is ProviderRuntimeErrorC
 }
 
 function isEndpointAbsenceProtocolError(
-  code: ProviderRuntimeErrorCode,
+  code: string,
   status: number | undefined,
 ): boolean {
   return code === "model_protocol_error" &&
