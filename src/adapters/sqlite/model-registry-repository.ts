@@ -42,6 +42,7 @@ import type {
   PromoteProfileInput,
   PurgeConnectionInput,
   PurgeProfileInput,
+  QueueLegacyProfileVerificationRecord,
   QueueVerificationRecord,
   RecordDiscoveryInput,
   RecordProviderHealthInput,
@@ -487,6 +488,57 @@ export class SqliteModelRegistryRepository implements CoreModelRegistryStore {
       "SELECT profile_id FROM model_profiles ORDER BY profile_id",
     ).all() as unknown as Array<{ profile_id: string }>;
     return rows.map(({ profile_id }) => this.getProfile(profile_id as ModelProfileId));
+  }
+
+  queueLegacyProfileVerification(
+    input: QueueLegacyProfileVerificationRecord,
+  ): ModelVerification {
+    return this.immediate(() => {
+      this.assertMutableStableRevision(
+        "model_profiles",
+        "profile_id",
+        input.profileId,
+        input.expectedRevision,
+      );
+      const legacyRevision = this.getProfile(input.profileId).revisions.find(
+        (revision) => revision.revisionId === input.legacyProfileRevisionId,
+      );
+      if (legacyRevision === undefined) {
+        throw new DomainError("profile_revision_owner_mismatch");
+      }
+      if (legacyRevision.state !== "legacy_trusted") {
+        throw new DomainError("verification_required");
+      }
+      const candidate: ModelProfileRevision = {
+        ...legacyRevision,
+        revisionId: input.candidateRevisionId,
+        verifiedCapabilities: [],
+        state: "draft",
+        createdAt: input.now,
+      };
+      this.insertProfileRevision(candidate);
+      this.appendAudit(
+        input,
+        "model_profile",
+        input.profileId,
+        "profile.revision_created",
+        {
+          revisionId: candidate.revisionId,
+          sourceRevisionId: legacyRevision.revisionId,
+          previousRecordRevision: input.expectedRevision,
+          newRecordRevision: input.expectedRevision + 1,
+        },
+      );
+      return this.queueVerificationInTransaction({
+        verificationId: input.verificationId,
+        profileRevisionId: candidate.revisionId,
+        expectedRevision: input.expectedRevision,
+        capabilityBaseline: candidate.capabilityBaseline,
+        eventId: input.verificationEventId,
+        traceId: input.traceId,
+        now: input.now,
+      });
+    });
   }
 
   queueVerification(input: QueueVerificationRecord): ModelVerification {

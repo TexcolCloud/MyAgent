@@ -214,6 +214,130 @@ describe("SqliteModelRegistryRepository", () => {
     },
   );
 
+  it("rolls back an atomic legacy Verification queue when its final audit fails", () => {
+    usingFixture("legacy-verification-rollback", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile({
+        ...createProfileInput("profile-a", "mpr-legacy", "pcr-a"),
+        revision: profileRevision("mpr-legacy", "profile-a", "pcr-a", {
+          state: "legacy_trusted",
+        }),
+      });
+      db.prepare(
+        "UPDATE model_profiles SET active_revision_id = ? WHERE profile_id = ?",
+      ).run("mpr-legacy", "profile-a");
+      const before = repository.getProfile(profileId("profile-a"));
+      const auditCountBefore = count(db, "model_registry_events");
+      const verificationCountBefore = count(db, "model_verifications");
+
+      expect(() => repository.queueLegacyProfileVerification({
+        ...context("event-legacy-candidate", LATER),
+        profileId: profileId("profile-a"),
+        legacyProfileRevisionId: profileRevisionId("mpr-legacy"),
+        candidateRevisionId: profileRevisionId("mpr-candidate"),
+        verificationId: verificationId("ver-candidate"),
+        verificationEventId: "event-profile-a-mpr-legacy" as ModelRegistryEventId,
+        expectedRevision: before.recordRevision,
+      })).toThrow(/UNIQUE constraint failed: model_registry_events.event_id/);
+
+      expect(repository.getProfile(profileId("profile-a"))).toEqual(before);
+      expect(count(db, "model_verifications")).toBe(verificationCountBefore);
+      expect(count(db, "model_registry_events")).toBe(auditCountBefore);
+      expect(db.prepare(
+        "SELECT revision_id FROM model_profile_revisions WHERE revision_id = ?",
+      ).get("mpr-candidate")).toBeUndefined();
+    });
+  });
+
+  it("atomically copies legacy effective values into one queued Verification candidate", () => {
+    usingFixture("legacy-verification-success", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-a", "pcr-a"));
+      repository.createProfile({
+        ...createProfileInput("profile-a", "mpr-legacy", "pcr-a"),
+        revision: profileRevision("mpr-legacy", "profile-a", "pcr-a", {
+          state: "legacy_trusted",
+          providerModelId: "legacy-effective-model",
+          invocationProtocol: "chat_completions",
+          maxInputTokens: 65_536,
+          contextWindowSource: "assumed_32768",
+          verifiedCapabilities: ["streaming_text", "single_tool_call"],
+        }),
+      });
+      db.prepare(
+        "UPDATE model_profiles SET active_revision_id = ? WHERE profile_id = ?",
+      ).run("mpr-legacy", "profile-a");
+      const before = repository.getProfile(profileId("profile-a"));
+
+      const queued = repository.queueLegacyProfileVerification({
+        ...context("event-legacy-success-candidate", LATER),
+        profileId: profileId("profile-a"),
+        legacyProfileRevisionId: profileRevisionId("mpr-legacy"),
+        candidateRevisionId: profileRevisionId("mpr-candidate"),
+        verificationId: verificationId("ver-candidate"),
+        verificationEventId: "event-legacy-success-verification" as ModelRegistryEventId,
+        expectedRevision: before.recordRevision,
+      });
+
+      expect(queued).toMatchObject({
+        verificationId: "ver-candidate",
+        profileRevisionId: "mpr-candidate",
+        capabilityBaseline: "text_and_single_tool_call_v1",
+        state: "queued",
+        attemptCount: 0,
+      });
+      expect(repository.getProfile(profileId("profile-a"))).toMatchObject({
+        activeRevisionId: "mpr-legacy",
+        recordRevision: before.recordRevision + 1,
+        revisions: [
+          expect.objectContaining({
+            revisionId: "mpr-legacy",
+            state: "legacy_trusted",
+            verifiedCapabilities: ["streaming_text", "single_tool_call"],
+          }),
+          {
+            revisionId: "mpr-candidate",
+            profileId: "profile-a",
+            connectionRevisionId: "pcr-a",
+            providerModelId: "legacy-effective-model",
+            invocationProtocol: "chat_completions",
+            maxInputTokens: 65_536,
+            contextWindowSource: "assumed_32768",
+            capabilityBaseline: "text_and_single_tool_call_v1",
+            verifiedCapabilities: [],
+            state: "verifying",
+            createdAt: LATER,
+          },
+        ],
+      });
+      expect(db.prepare(
+        `SELECT event_id, resource_type, resource_id, action, trace_id, created_at
+         FROM model_registry_events
+         WHERE event_id IN (?, ?)
+         ORDER BY event_id`,
+      ).all(
+        "event-legacy-success-candidate",
+        "event-legacy-success-verification",
+      )).toEqual([
+        {
+          event_id: "event-legacy-success-candidate",
+          resource_type: "model_profile",
+          resource_id: "profile-a",
+          action: "profile.revision_created",
+          trace_id: "trace-test",
+          created_at: LATER.toISOString(),
+        },
+        {
+          event_id: "event-legacy-success-verification",
+          resource_type: "model_verification",
+          resource_id: "ver-candidate",
+          action: "verification.queued",
+          trace_id: "trace-test",
+          created_at: LATER.toISOString(),
+        },
+      ]);
+    });
+  });
+
   it("claims FIFO Verification work and reclaims expiry after restart without counting an attempt", () => {
     usingFixture("verification-claim", ({ db, repository }) => {
       repository.createConnection(createConnectionInput("connection-a", "pcr-a"));

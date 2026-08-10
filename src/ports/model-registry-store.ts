@@ -76,6 +76,15 @@ export interface QueueVerificationRecord extends MutationContext {
   readonly capabilityBaseline: ModelProfileRevision["capabilityBaseline"];
 }
 
+export interface QueueLegacyProfileVerificationRecord extends MutationContext {
+  readonly profileId: ModelProfileId;
+  readonly legacyProfileRevisionId: ModelProfileRevisionId;
+  readonly candidateRevisionId: ModelProfileRevisionId;
+  readonly verificationId: ModelVerificationId;
+  readonly verificationEventId: ModelRegistryEventId;
+  readonly expectedRevision: number;
+}
+
 export interface ClaimVerificationInput {
   readonly leaseOwner: string;
   readonly now: Date;
@@ -224,6 +233,9 @@ export interface ModelRegistryStore {
   createProfileRevision(input: CreateProfileRevisionRecord): ModelProfileView;
   getProfile(id: ModelProfileId): ModelProfileView;
   listProfiles(): readonly ModelProfileView[];
+  queueLegacyProfileVerification(
+    input: QueueLegacyProfileVerificationRecord,
+  ): ModelVerification;
   queueVerification(input: QueueVerificationRecord): ModelVerification;
   claimVerification(input: ClaimVerificationInput): ModelVerification | null;
   beginVerificationAttempt(input: BeginVerificationAttemptInput): ModelVerification;
@@ -258,6 +270,7 @@ export type CoreModelRegistryStore = Pick<
   | "createProfileRevision"
   | "getProfile"
   | "listProfiles"
+  | "queueLegacyProfileVerification"
   | "promoteConnection"
   | "promoteProfile"
   | "setDefaultProfile"
