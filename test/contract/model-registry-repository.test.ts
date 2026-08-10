@@ -1332,17 +1332,32 @@ describe("SqliteModelRegistryRepository", () => {
         source: "explicit",
         expectedRevision: 0,
       });
+      repository.setAssignment({
+        ...context("event-assignment-repeated", LATER),
+        agentId: agentId("researcher"),
+        profileRevisionId: profileRevisionId("mpr-a"),
+        source: "explicit",
+        expectedRevision: 0,
+      });
 
       expect(() => repository.purgeProfile({
         ...context("event-purge-profile", LATER),
         profileId: profileId("assistant"),
         expectedRevision: 1,
-      })).toThrowError(expect.objectContaining({ code: "resource_in_use" }));
+      })).toThrowError(expect.objectContaining({
+        code: "resource_in_use",
+        details: {
+          ownerCategories: ["default_model_profile", "model_assignment"],
+        },
+      }));
       expect(() => repository.purgeConnection({
         ...context("event-purge-connection", LATER),
         connectionId: connectionId("connection-a"),
         expectedRevision: 1,
-      })).toThrowError(expect.objectContaining({ code: "resource_in_use" }));
+      })).toThrowError(expect.objectContaining({
+        code: "resource_in_use",
+        details: { ownerCategories: ["model_profile"] },
+      }));
 
       db.prepare("DELETE FROM model_assignments").run();
       db.prepare("DELETE FROM default_model_profile").run();
@@ -1360,7 +1375,20 @@ describe("SqliteModelRegistryRepository", () => {
         ...context("event-purge-profile-run", LATER),
         profileId: profileId("assistant"),
         expectedRevision: 1,
-      })).toThrowError(expect.objectContaining({ code: "resource_in_use" }));
+      })).toThrowError(expect.objectContaining({
+        code: "resource_in_use",
+        details: { ownerCategories: ["retained_run_snapshot"] },
+      }));
+      expect(() => repository.purgeConnection({
+        ...context("event-purge-connection-run", LATER),
+        connectionId: connectionId("connection-a"),
+        expectedRevision: 1,
+      })).toThrowError(expect.objectContaining({
+        code: "resource_in_use",
+        details: {
+          ownerCategories: ["model_profile", "retained_run_snapshot"],
+        },
+      }));
 
       db.prepare("DELETE FROM agent_revisions WHERE revision_id = ?").run("retained-revision");
       repository.purgeProfile({

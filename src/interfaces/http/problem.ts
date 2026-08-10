@@ -10,7 +10,10 @@ interface Problem {
   code: string;
   detail: string;
   traceId: string;
+  ownerCategories?: readonly SafeOwnerCategory[];
 }
+
+type SafeOwnerCategory = typeof SAFE_OWNER_CATEGORIES[number];
 
 export function sendProblem(
   reply: FastifyReply,
@@ -18,6 +21,7 @@ export function sendProblem(
   status: number,
   code: string,
   detail: string,
+  ownerCategories?: readonly SafeOwnerCategory[],
 ): FastifyReply {
   const problem: Problem = {
     type: "about:blank",
@@ -26,6 +30,7 @@ export function sendProblem(
     code,
     detail,
     traceId: request.id,
+    ...(ownerCategories === undefined ? {} : { ownerCategories }),
   };
   return reply
     .code(status)
@@ -39,10 +44,24 @@ export function sendError(
   reply: FastifyReply,
 ): FastifyReply {
   if (error instanceof ApplicationError) {
-    return sendProblem(reply, request, error.status, error.code, publicDetail(error.code));
+    return sendProblem(
+      reply,
+      request,
+      error.status,
+      error.code,
+      publicDetail(error.code),
+      safeOwnerCategories(error),
+    );
   }
   if (error instanceof DomainError) {
-    return sendProblem(reply, request, domainStatus(error.code), error.code, publicDetail(error.code));
+    return sendProblem(
+      reply,
+      request,
+      domainStatus(error.code),
+      error.code,
+      publicDetail(error.code),
+      safeOwnerCategories(error),
+    );
   }
   if (error instanceof ModelProviderError && PROVIDER_INPUT_ERROR_CODES.includes(
     error.code as typeof PROVIDER_INPUT_ERROR_CODES[number],
@@ -82,6 +101,8 @@ const CONTROL_PLANE_NOT_FOUND_CODES = [
   "provider_connection_not_found",
   "provider_connection_revision_not_found",
   "model_profile_not_found",
+  "model_profile_revision_not_found",
+  "model_verification_not_found",
 ] as const;
 
 const MALFORMED_REQUEST_CODES = [
@@ -96,6 +117,14 @@ const PROVIDER_INPUT_ERROR_CODES = [
   "insecure_provider_url",
 ] as const;
 
+const SAFE_OWNER_CATEGORIES = [
+  "default_model_profile",
+  "model_assignment",
+  "model_profile",
+  "provider_connection_revision",
+  "retained_run_snapshot",
+] as const;
+
 function isSqliteUnavailable(error: unknown): boolean {
   return typeof error === "object" && error !== null && "errcode" in error && (error as { errcode?: unknown }).errcode === 5;
 }
@@ -108,8 +137,30 @@ function isMalformedRequest(error: unknown): boolean {
 
 function domainStatus(code: string): number {
   if (code.endsWith("_not_found")) return 404;
-  if (code.includes("already_resolved") || code.includes("conflict") || code === "session_has_running_run") return 409;
+  if (
+    code.includes("already_resolved") ||
+    code.includes("conflict") ||
+    code === "resource_in_use" ||
+    code === "session_has_running_run"
+  ) return 409;
   return 422;
+}
+
+function safeOwnerCategories(
+  error: ApplicationError | DomainError,
+): readonly SafeOwnerCategory[] | undefined {
+  if (error.code !== "resource_in_use") return undefined;
+  const details = error.details;
+  if (typeof details !== "object" || details === null || Array.isArray(details)) {
+    return undefined;
+  }
+  const categories = (details as { ownerCategories?: unknown }).ownerCategories;
+  if (!Array.isArray(categories) || categories.length === 0) return undefined;
+  const safe = categories.filter((value): value is SafeOwnerCategory =>
+    typeof value === "string" && SAFE_OWNER_CATEGORIES.includes(
+      value as SafeOwnerCategory,
+    ));
+  return safe.length === categories.length ? [...new Set(safe)] : undefined;
 }
 
 function publicDetail(code: string): string {

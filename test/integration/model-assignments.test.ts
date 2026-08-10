@@ -23,9 +23,108 @@ import {
 } from "../../src/domain/ids.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
+import { startTestApp } from "../helpers/start-test-app.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
 const NOW = new Date("2026-08-09T12:00:00.000Z");
+const adminHeaders = { authorization: "Bearer test-admin-token" } as const;
+
+describe("HTTP Model assignments", () => {
+  it("returns explicit and unassigned states with source semantics", async () => {
+    const harness = await startTestApp();
+    try {
+      const unassigned = await harness.app.inject({
+        method: "GET",
+        url: "/v1/admin/agents/http-unassigned/model-assignment",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+      });
+      expect(unassigned.statusCode).toBe(200);
+      expect(unassigned.json()).toEqual({
+        agentId: "http-unassigned",
+        state: "unassigned",
+        modelProfileRevisionId: null,
+        source: null,
+        recordRevision: null,
+        updatedAt: null,
+      });
+
+      const assigned = await harness.app.inject({
+        method: "PUT",
+        url: "/v1/admin/agents/http-unassigned/model-assignment",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          modelProfileRevisionId: "mpr_test-chat",
+          expectedRevision: 0,
+        },
+      });
+      expect(assigned.statusCode).toBe(200);
+      expect(assigned.json()).toMatchObject({
+        agentId: "http-unassigned",
+        state: "assigned",
+        modelProfileRevisionId: "mpr_test-chat",
+        source: "explicit",
+        recordRevision: 0,
+      });
+
+      const read = await harness.app.inject({
+        method: "GET",
+        url: "/v1/admin/agents/http-unassigned/model-assignment",
+        remoteAddress: "::1",
+        headers: adminHeaders,
+      });
+      expect(read.statusCode).toBe(200);
+      expect(read.json()).toEqual(assigned.json());
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("stores the default Profile without moving existing assignments", async () => {
+    const harness = await startTestApp();
+    try {
+      const before = harness.modelRegistry.getAssignment(parseAgentId("primary"));
+      const unset = await harness.app.inject({
+        method: "GET",
+        url: "/v1/admin/default-model-profile",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+      });
+      expect(unset.statusCode).toBe(200);
+      expect(unset.json()).toEqual({
+        state: "unset",
+        profileId: null,
+        recordRevision: null,
+      });
+
+      const stored = await harness.app.inject({
+        method: "PUT",
+        url: "/v1/admin/default-model-profile",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: { profileId: "test-chat", expectedRevision: 0 },
+      });
+      expect(stored.statusCode).toBe(200);
+      expect(stored.json()).toEqual({
+        state: "configured",
+        profileId: "test-chat",
+        recordRevision: 0,
+      });
+      expect(harness.modelRegistry.getAssignment(parseAgentId("primary"))).toEqual(before);
+
+      const read = await harness.app.inject({
+        method: "GET",
+        url: "/v1/admin/default-model-profile",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+      });
+      expect(read.json()).toEqual(stored.json());
+    } finally {
+      await harness.close();
+    }
+  });
+});
 
 describe("AssignModelService", () => {
   it("snapshots the current default only when an Agent is first synchronized", () => {

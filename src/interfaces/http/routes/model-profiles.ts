@@ -7,15 +7,19 @@ import { ApplicationError } from "../../../domain/errors.js";
 import { DomainError } from "../../../domain/errors.js";
 import {
   parseModelProfileId,
+  type ModelProfileRevisionId,
   type ProviderConnectionRevisionId,
 } from "../../../domain/ids.js";
 import type { ProviderKind } from "../../../domain/model-registry.js";
 import type { ModelProfileRevision, ModelProfileView } from "../../../domain/model-profile.js";
 import type { ModelRegistryStore } from "../../../ports/model-registry-store.js";
 import {
+  confirmedDestructionSchema,
   createModelProfileSchema,
+  expectedRevisionSchema,
   modelProfileResponseSchema,
   modelProfilesResponseSchema,
+  promoteModelProfileSchema,
 } from "../model-control-schemas.js";
 import { parseSchema } from "../schemas.js";
 
@@ -83,6 +87,80 @@ export function registerModelProfileRoutes(
       parseModelProfileId((request.params as { profileId: string }).profileId),
     )),
   );
+  app.post(
+    "/model-profiles/:profileId/promotions",
+    { schema: { response: { 200: modelProfileResponseSchema } } },
+    async (request) => {
+      const profileId = parseModelProfileId(
+        (request.params as { profileId: string }).profileId,
+      );
+      const body = parseSchema(promoteModelProfileSchema, request.body);
+      assertProfileConnectionActive(
+        services.registry,
+        profileId,
+        body.profileRevisionId as ModelProfileRevisionId,
+        body.expectedRevision,
+      );
+      return profileResponse(services.profiles.promote({
+        profileId,
+        profileRevisionId: body.profileRevisionId as ModelProfileRevisionId,
+        expectedRevision: body.expectedRevision,
+        traceId: request.id,
+      }));
+    },
+  );
+  app.post(
+    "/model-profiles/:profileId/retirement",
+    { schema: { response: { 200: modelProfileResponseSchema } } },
+    async (request) => {
+      const profileId = parseModelProfileId(
+        (request.params as { profileId: string }).profileId,
+      );
+      services.registry.getProfile(profileId);
+      const body = parseSchema(expectedRevisionSchema, request.body);
+      return profileResponse(services.profiles.retire({
+        profileId,
+        expectedRevision: body.expectedRevision,
+        traceId: request.id,
+      }));
+    },
+  );
+  app.post(
+    "/model-profiles/:profileId/purge",
+    async (request, reply) => {
+      const profileId = parseModelProfileId(
+        (request.params as { profileId: string }).profileId,
+      );
+      services.registry.getProfile(profileId);
+      const body = parseSchema(confirmedDestructionSchema, request.body);
+      services.profiles.purge({
+        profileId,
+        expectedRevision: body.expectedRevision,
+        traceId: request.id,
+      });
+      return reply.code(204).send();
+    },
+  );
+}
+
+function assertProfileConnectionActive(
+  registry: Pick<ModelRegistryStore, "getConnectionRevision" | "getProfile">,
+  profileId: ModelProfileView["profileId"],
+  revisionId: ModelProfileRevisionId,
+  expectedRevision: number,
+): void {
+  const profile = registry.getProfile(profileId);
+  if (profile.recordRevision !== expectedRevision) {
+    throw new ApplicationError("revision_conflict", 409);
+  }
+  const revision = profile.revisions.find((candidate) =>
+    candidate.revisionId === revisionId);
+  if (revision === undefined) throw new DomainError("profile_revision_owner_mismatch");
+  const connection = registry.getConnectionRevision(revision.connectionRevisionId);
+  if (connection === null) throw new Error("provider_connection_revision_not_found");
+  if (connection.revision.state !== "active") {
+    throw new DomainError("connection_revision_not_active");
+  }
 }
 
 function assertModelSelection(

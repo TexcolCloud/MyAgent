@@ -33,6 +33,9 @@ import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerToolCallRoutes } from "./routes/tool-calls.js";
 import { registerProviderConnectionRoutes } from "./routes/provider-connections.js";
 import { registerModelProfileRoutes } from "./routes/model-profiles.js";
+import { registerModelVerificationRoutes } from "./routes/model-verifications.js";
+import { registerModelAssignmentRoutes } from "./routes/model-assignments.js";
+import { registerManagedSecretRoutes } from "./routes/managed-secrets.js";
 import { serializeWithSchema } from "./schemas.js";
 import type { SseStreamOptions } from "./sse.js";
 
@@ -148,6 +151,9 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
     app.register((api, _routeOptions, done) => {
       registerProviderConnectionRoutes(api, options.modelControl!);
       registerModelProfileRoutes(api, options.modelControl!);
+      registerModelVerificationRoutes(api, options.modelControl!);
+      registerModelAssignmentRoutes(api, options.modelControl!);
+      registerManagedSecretRoutes(api, options.modelControl!);
       done();
     }, { prefix: "/v1/admin" });
   }

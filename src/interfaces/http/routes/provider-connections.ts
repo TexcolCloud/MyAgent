@@ -21,10 +21,13 @@ import type {
 import type { ModelRegistryStore } from "../../../ports/model-registry-store.js";
 import {
   createProviderConnectionSchema,
+  confirmedDestructionSchema,
   discoverModelsSchema,
   discoveryResponseSchema,
+  expectedRevisionSchema,
   providerConnectionResponseSchema,
   providerConnectionsResponseSchema,
+  promoteProviderConnectionSchema,
   reviseProviderConnectionSchema,
 } from "../model-control-schemas.js";
 import { parseSchema } from "../schemas.js";
@@ -115,6 +118,56 @@ export function registerProviderConnectionRoutes(
         protocolPreference: body.protocolPreference,
         traceId: request.id,
       }));
+    },
+  );
+  app.post(
+    "/provider-connections/:connectionId/promotions",
+    { schema: { response: { 200: providerConnectionResponseSchema } } },
+    async (request) => {
+      const connectionId = parseProviderConnectionId(
+        (request.params as { connectionId: string }).connectionId,
+      );
+      services.registry.getConnection(connectionId);
+      const body = parseSchema(promoteProviderConnectionSchema, request.body);
+      return connectionResponse(services.connections.promote({
+        connectionId,
+        connectionRevisionId: body.connectionRevisionId as
+          ProviderConnectionRevisionId,
+        expectedRevision: body.expectedRevision,
+        traceId: request.id,
+      }));
+    },
+  );
+  app.post(
+    "/provider-connections/:connectionId/retirement",
+    { schema: { response: { 200: providerConnectionResponseSchema } } },
+    async (request) => {
+      const connectionId = parseProviderConnectionId(
+        (request.params as { connectionId: string }).connectionId,
+      );
+      services.registry.getConnection(connectionId);
+      const body = parseSchema(expectedRevisionSchema, request.body);
+      return connectionResponse(services.connections.retire({
+        connectionId,
+        expectedRevision: body.expectedRevision,
+        traceId: request.id,
+      }));
+    },
+  );
+  app.post(
+    "/provider-connections/:connectionId/purge",
+    async (request, reply) => {
+      const connectionId = parseProviderConnectionId(
+        (request.params as { connectionId: string }).connectionId,
+      );
+      services.registry.getConnection(connectionId);
+      const body = parseSchema(confirmedDestructionSchema, request.body);
+      services.connections.purge({
+        connectionId,
+        expectedRevision: body.expectedRevision,
+        traceId: request.id,
+      });
+      return reply.code(204).send();
     },
   );
   app.post(

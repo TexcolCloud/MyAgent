@@ -127,6 +127,17 @@ interface VerificationEvidenceRow {
   capabilities_json: string;
 }
 
+interface ConnectionReferencePresenceRow {
+  model_profile: number;
+  retained_run_snapshot: number;
+}
+
+interface ProfileReferencePresenceRow {
+  default_model_profile: number;
+  model_assignment: number;
+  retained_run_snapshot: number;
+}
+
 interface DiscoveryGenerationRow {
   generation_id: string;
   connection_revision_id: string;
@@ -1232,8 +1243,11 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
         input.connectionId,
         input.expectedRevision,
       );
-      if (this.connectionReferenceCount(input.connectionId) > 0) {
-        throw new DomainError("resource_in_use");
+      const ownerCategories = this.connectionReferenceCategories(input.connectionId);
+      if (ownerCategories.length > 0) {
+        throw new DomainError("resource_in_use", "resource_in_use", {
+          ownerCategories,
+        });
       }
       this.appendAudit(input, "provider_connection", input.connectionId, "connection.purged", {
         previousRecordRevision: input.expectedRevision,
@@ -1256,8 +1270,11 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
         input.profileId,
         input.expectedRevision,
       );
-      if (this.profileReferenceCount(input.profileId) > 0) {
-        throw new DomainError("resource_in_use");
+      const ownerCategories = this.profileReferenceCategories(input.profileId);
+      if (ownerCategories.length > 0) {
+        throw new DomainError("resource_in_use", "resource_in_use", {
+          ownerCategories,
+        });
       }
       this.appendAudit(input, "model_profile", input.profileId, "profile.purged", {
         previousRecordRevision: input.expectedRevision,
@@ -1643,17 +1660,21 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
     if (eligible === undefined) throw new DomainError("verification_required");
   }
 
-  private connectionReferenceCount(connectionId: ProviderConnectionId): number {
+  private connectionReferenceCategories(
+    connectionId: ProviderConnectionId,
+  ): Array<"model_profile" | "retained_run_snapshot"> {
     const row = this.db.prepare(
       `SELECT
-         (SELECT COUNT(*)
+         EXISTS (
+          SELECT 1
           FROM model_profile_revisions
           WHERE connection_revision_id IN (
             SELECT revision_id FROM provider_connection_revisions
             WHERE connection_id = ?
-          ))
-         +
-         (SELECT COUNT(DISTINCT agent_revisions.revision_id)
+          )
+         ) AS model_profile,
+         EXISTS (
+          SELECT 1
           FROM agent_revisions,
                json_tree(
                  CASE WHEN json_valid(agent_revisions.content_json)
@@ -1666,25 +1687,35 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
                  SELECT revision_id FROM provider_connection_revisions
                  WHERE connection_id = ?
                )
-             )) AS reference_count`,
-    ).get(connectionId, connectionId, connectionId) as unknown as {
-      reference_count: number;
-    };
-    return row.reference_count;
+             )
+         ) AS retained_run_snapshot`,
+    ).get(connectionId, connectionId, connectionId) as unknown as
+      ConnectionReferencePresenceRow;
+    const categories: Array<"model_profile" | "retained_run_snapshot"> = [];
+    if (row.model_profile === 1) categories.push("model_profile");
+    if (row.retained_run_snapshot === 1) categories.push("retained_run_snapshot");
+    return categories;
   }
 
-  private profileReferenceCount(profileId: ModelProfileId): number {
+  private profileReferenceCategories(
+    profileId: ModelProfileId,
+  ): Array<
+    "default_model_profile" | "model_assignment" | "retained_run_snapshot"
+  > {
     const row = this.db.prepare(
       `SELECT
-         (SELECT COUNT(*) FROM default_model_profile WHERE profile_id = ?)
-         +
-         (SELECT COUNT(*)
+         EXISTS (
+          SELECT 1 FROM default_model_profile WHERE profile_id = ?
+         ) AS default_model_profile,
+         EXISTS (
+          SELECT 1
           FROM model_assignments
           WHERE model_profile_revision_id IN (
             SELECT revision_id FROM model_profile_revisions WHERE profile_id = ?
-          ))
-         +
-         (SELECT COUNT(DISTINCT agent_revisions.revision_id)
+          )
+         ) AS model_assignment,
+         EXISTS (
+          SELECT 1
           FROM agent_revisions,
                json_tree(
                  CASE WHEN json_valid(agent_revisions.content_json)
@@ -1696,11 +1727,17 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
                AND item.value IN (
                  SELECT revision_id FROM model_profile_revisions WHERE profile_id = ?
                )
-             )) AS reference_count`,
-    ).get(profileId, profileId, profileId, profileId) as unknown as {
-      reference_count: number;
-    };
-    return row.reference_count;
+             )
+         ) AS retained_run_snapshot`,
+    ).get(profileId, profileId, profileId, profileId) as unknown as
+      ProfileReferencePresenceRow;
+    const categories: Array<
+      "default_model_profile" | "model_assignment" | "retained_run_snapshot"
+    > = [];
+    if (row.default_model_profile === 1) categories.push("default_model_profile");
+    if (row.model_assignment === 1) categories.push("model_assignment");
+    if (row.retained_run_snapshot === 1) categories.push("retained_run_snapshot");
+    return categories;
   }
 
   private assignmentRow(agentId: AgentId): AssignmentRow | undefined {

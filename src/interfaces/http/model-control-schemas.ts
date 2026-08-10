@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { PROVIDER_RUNTIME_ERROR_CODES } from "../../domain/errors.js";
 import { agentIdSchema, identifierSchema } from "./schemas.js";
 
 export const invocationProtocolSchema = z.enum(["chat_completions", "responses"]);
@@ -144,4 +145,106 @@ export const modelProfileResponseSchema = z.strictObject({
 
 export const modelProfilesResponseSchema = z.strictObject({
   profiles: z.array(modelProfileResponseSchema),
+});
+
+export const queueModelVerificationSchema = z.strictObject({
+  expectedRevision: z.number().int().nonnegative(),
+  capabilityBaseline: z.literal("text_and_single_tool_call_v1"),
+});
+
+export const expectedRevisionSchema = z.strictObject({
+  expectedRevision: z.number().int().nonnegative(),
+});
+
+export const confirmedDestructionSchema = z.strictObject({
+  expectedRevision: z.number().int().nonnegative(),
+  confirm: z.literal(true),
+});
+
+export const promoteProviderConnectionSchema = z.strictObject({
+  connectionRevisionId: identifierSchema,
+  expectedRevision: z.number().int().nonnegative(),
+});
+
+export const promoteModelProfileSchema = z.strictObject({
+  profileRevisionId: identifierSchema,
+  expectedRevision: z.number().int().nonnegative(),
+});
+
+export const queuedModelVerificationResponseSchema = z.strictObject({
+  verificationId: identifierSchema,
+  profileRevisionId: identifierSchema,
+  capabilityBaseline: z.literal("text_and_single_tool_call_v1"),
+  status: z.literal("queued"),
+  recordRevision: z.number().int().nonnegative(),
+  operationUrl: z.string(),
+});
+
+export const modelVerificationResponseSchema = z.strictObject({
+  verificationId: identifierSchema,
+  profileRevisionId: identifierSchema,
+  capabilityBaseline: z.literal("text_and_single_tool_call_v1"),
+  status: z.enum(["queued", "running", "passed", "failed", "cancelled"]),
+  resultCode: z.enum(PROVIDER_RUNTIME_ERROR_CODES).nullable(),
+  safeStatus: z.number().int().min(400).max(599).nullable(),
+  capabilities: z.array(z.enum(["streaming_text", "single_tool_call"])),
+  usage: z.strictObject({
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+  }).optional(),
+  traceId: z.string(),
+  recordRevision: z.number().int().nonnegative(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  cancellationRequestedAt: z.string().nullable(),
+  fallbackProfileRevisionId: identifierSchema.nullable(),
+  fallbackVerificationId: identifierSchema.nullable(),
+});
+
+export const putModelAssignmentSchema = z.strictObject({
+  modelProfileRevisionId: identifierSchema,
+  expectedRevision: z.number().int().nonnegative(),
+});
+
+export const modelAssignmentResponseSchema = z.discriminatedUnion("state", [
+  z.strictObject({
+    agentId: agentIdSchema,
+    state: z.literal("unassigned"),
+    modelProfileRevisionId: z.null(),
+    source: z.null(),
+    recordRevision: z.null(),
+    updatedAt: z.null(),
+  }),
+  z.strictObject({
+    agentId: agentIdSchema,
+    state: z.literal("assigned"),
+    modelProfileRevisionId: identifierSchema,
+    source: z.enum(["explicit", "default", "legacy_import"]),
+    recordRevision: z.number().int().nonnegative(),
+    updatedAt: z.string(),
+  }),
+]);
+
+export const putDefaultModelProfileSchema = z.strictObject({
+  profileId: agentIdSchema,
+  expectedRevision: z.number().int().nonnegative(),
+});
+
+export const defaultModelProfileResponseSchema = z.discriminatedUnion("state", [
+  z.strictObject({
+    state: z.literal("unset"),
+    profileId: z.null(),
+    recordRevision: z.null(),
+  }),
+  z.strictObject({
+    state: z.literal("configured"),
+    profileId: agentIdSchema,
+    recordRevision: z.number().int().nonnegative(),
+  }),
+]);
+
+export const masterKeyRotationResponseSchema = z.strictObject({
+  reencrypted: z.number().int().nonnegative(),
+  currentKeyId: z.string(),
+  recordRevision: z.number().int().nonnegative(),
 });
