@@ -86,6 +86,8 @@ Task 16: complete (release gates pass, review clean, no production `src` changes
 Task 16: formal review reopened — Critical whole-system leakage proof is incomplete; Important gaps remain in Agent-specific Tool isolation, exact committed SSE replay, two-key rotation documentation, and startup-failure cleanup.
 Task 16: formal fix round 1/5 (5 addressed, 0 open — composed whole-system containment, dual Tool isolation, exact SSE replay, approved two-key semantics, and immediate partial-start cleanup; commits d3bcee3..d5e4bd9)
 Task 16: final complete (commits bad462d..d5e4bd9, formal review clean; release gates pass)
+Final review: 2 Important findings — recovered Runs re-query Registry because network policy is absent from the snapshot; CLI stops at the preferred failed Verification instead of following an automatic fallback candidate.
+Final review human ruling: registry-free recovery governs — snapshot `allowInsecureHttp` as immutable runtime authority and remove adapter Registry lookups, superseding the earlier exact field list omission.
 Task 16: supersession — the earlier completion line predates formal review and is superseded by Formal Fix Round 1 evidence below.
 Task 16: Formal Fix Round 1 Critical resolved — composed containment proves raw provider fields entered the boundary and scans managed plaintext, raw reasoning/body, actual ciphertext encodings, and the actual Key ID across every required public, observable, durable, raw SQLite, and backup surface.
 Task 16: Formal Fix Round 1 Important resolved — Chat and Responses use distinct real Tools, call IDs, arguments, results, and Approval/execution histories under the same Session key, with positive-own and negative-other assertions.
