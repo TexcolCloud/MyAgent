@@ -7,7 +7,7 @@ import {
   type ModelRequest,
 } from "../../ports/model.js";
 import type { ProviderEgressGateway } from "../provider-egress-gateway.js";
-import type { PiAiClient } from "./pi-ai-client.js";
+import { isValidPiContextInput, type PiAiClient } from "./pi-ai-client.js";
 
 export interface PiAiModelAdapterOptions {
   client: PiAiClient;
@@ -24,6 +24,7 @@ export class PiAiModelAdapter implements ModelPort {
     if (signal.aborted) throw abortError();
     const contract = request.model.piRuntime;
     if (contract === undefined) throw protocolError();
+    if (!isValidPiContextInput(request.input)) throw protocolError();
     const route = this.options.gateway.routeFor(request.model);
     let toolCall: { id: string; name: string; arguments: string } | undefined;
     let terminal: Extract<ModelChunk, { type: "completed" }> | undefined;
@@ -35,6 +36,7 @@ export class PiAiModelAdapter implements ModelPort {
         route,
         input: request.input,
         tools: request.tools,
+        toolChoice: request.toolChoice,
         signal,
       })) {
         if (terminal !== undefined) throw protocolError();

@@ -11,7 +11,7 @@ import {
 
 import type { JsonValue } from "../../domain/json.js";
 import type { PiRuntimeContract } from "../../domain/pi-runtime.js";
-import type { ModelInput, ModelRequest } from "../../ports/model.js";
+import { ModelProviderError, type ModelInput, type ModelRequest } from "../../ports/model.js";
 import type { PiGatewayRoute } from "../provider-egress-gateway.js";
 
 export type PiStreamEvent =
@@ -35,6 +35,7 @@ export interface PiAiClient {
     route: PiGatewayRoute;
     input: readonly ModelInput[];
     tools: ModelRequest["tools"];
+    toolChoice: ModelRequest["toolChoice"];
     signal: AbortSignal;
   }): AsyncIterable<PiStreamEvent>;
 }
@@ -61,6 +62,7 @@ export class PiAiSdkClient implements PiAiClient {
     route: PiGatewayRoute;
     input: readonly ModelInput[];
     tools: ModelRequest["tools"];
+    toolChoice: ModelRequest["toolChoice"];
     signal: AbortSignal;
   }): AsyncIterable<PiStreamEvent> {
     const model = piModel(input.contract, input.route);
@@ -72,6 +74,7 @@ export class PiAiSdkClient implements PiAiClient {
       ...(input.contract.maxOutputTokens === undefined
         ? {}
         : { maxTokens: input.contract.maxOutputTokens }),
+      ...(input.toolChoice === undefined ? {} : { toolChoice: input.toolChoice }),
       maxRetries: 0,
       onPayload: (payload) => disableParallelToolCalls(input.contract.api, payload),
       onResponse(response) {
@@ -95,16 +98,21 @@ export class PiAiSdkClient implements PiAiClient {
           type: "done",
           reason: event.reason,
           usage: {
-            inputTokens: event.message.usage.input,
+            inputTokens: totalInputTokens(event.message.usage),
             outputTokens: event.message.usage.output,
           },
         };
       } else if (event.type === "error") {
+        const metadata = gatewayErrorMetadata(event.error.errorMessage);
         yield {
           type: "error",
           reason: event.reason,
-          ...(status === undefined ? {} : { status }),
-          ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+          ...(status === undefined
+            ? metadata?.status === undefined ? {} : { status: metadata.status }
+            : { status }),
+          ...(retryAfterMs === undefined
+            ? metadata?.retryAfterMs === undefined ? {} : { retryAfterMs: metadata.retryAfterMs }
+            : { retryAfterMs }),
         };
       }
     }
@@ -132,6 +140,7 @@ function piContext(
   input: readonly ModelInput[],
   tools: ModelRequest["tools"],
 ): Context {
+  if (!isValidPiContextInput(input)) throw protocolError();
   const systemPrompts: string[] = [];
   const messages: Context["messages"] = [];
   for (const entry of input) {
@@ -172,6 +181,27 @@ function piContext(
           })),
         }),
   };
+}
+
+export function isValidPiContextInput(input: readonly ModelInput[]): boolean {
+  for (let index = 0; index < input.length; index += 1) {
+    const entry = input[index] as ModelInput;
+    if (entry.type === "message") continue;
+    if (entry.type === "tool_result") return false;
+    const result = input[index + 1];
+    if (
+      result === undefined ||
+      result.type !== "tool_result" ||
+      result.callId !== entry.callId ||
+      result.name !== entry.name ||
+      !isToolCallId(entry.callId) ||
+      !isRecord(entry.arguments)
+    ) {
+      return false;
+    }
+    index += 1;
+  }
+  return true;
 }
 
 function assistantMessage(
@@ -219,5 +249,54 @@ function parseRetryAfter(headers: Record<string, string>): number | undefined {
   if (value === undefined) return undefined;
   const seconds = Number(value);
   if (!Number.isFinite(seconds) || seconds < 0) return undefined;
-  return Math.round(seconds * 1_000);
+  const milliseconds = Math.round(seconds * 1_000);
+  return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
+}
+
+function totalInputTokens(usage: {
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+}): number {
+  if (!isTokenCount(usage.input) || !isTokenCount(usage.cacheRead) || !isTokenCount(usage.cacheWrite)) {
+    throw protocolError();
+  }
+  const total = usage.input + usage.cacheRead + usage.cacheWrite;
+  if (!Number.isSafeInteger(total)) throw protocolError();
+  return total;
+}
+
+function gatewayErrorMetadata(errorMessage: string | undefined): {
+  status?: number;
+  retryAfterMs?: number;
+} | undefined {
+  if (errorMessage === undefined) return undefined;
+  const match = /\bpi_gateway_error status=([1-5]\d{2})(?: retry_after_ms=(\d+))?\b/u.exec(
+    errorMessage,
+  );
+  if (match?.[1] === undefined) return undefined;
+  const status = Number(match[1]);
+  const retryAfterMs = match[2] === undefined ? undefined : Number(match[2]);
+  return {
+    status,
+    ...(retryAfterMs === undefined || !Number.isSafeInteger(retryAfterMs)
+      ? {}
+      : { retryAfterMs }),
+  };
+}
+
+function isToolCallId(value: string): boolean {
+  return /^[\x21-\x7e]{1,200}$/u.test(value);
+}
+
+function isRecord(value: JsonValue): value is Record<string, JsonValue> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function protocolError(): ModelProviderError {
+  return new ModelProviderError({ transient: false, code: "model_protocol_error" });
 }

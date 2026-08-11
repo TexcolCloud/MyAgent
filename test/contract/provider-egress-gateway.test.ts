@@ -249,6 +249,40 @@ describe("ProviderEgressGateway", () => {
     expect(requests[0]).not.toHaveProperty("x-forwarded-host");
   });
 
+  it("forwards retry-after while replacing a provider error body", async () => {
+    const provider = await startServer((_request, response) => {
+      response.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": "2",
+        "x-provider-secret": "must-not-forward",
+      });
+      response.end('{"error":{"message":"provider-body-secret"}}');
+    });
+    servers.push(provider.server);
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "unused" },
+      }),
+      randomBytes: () => Buffer.alloc(32, 0x32),
+    }).start();
+    gateways.push(gateway);
+    const route = gateway.routeFor(testModelRuntime({
+      baseUrl: `http://127.0.0.1:${String(provider.port)}/v1`,
+      providerAuth: { type: "none" },
+      allowInsecureHttp: true,
+    }));
+
+    const response = await fetch(`${route.baseUrl}/models`, {
+      headers: { authorization: `Bearer ${route.apiKey}` },
+    });
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("2");
+    expect(response.headers.get("content-type")).toBe("application/json");
+    expect(response.headers.get("x-provider-secret")).toBeNull();
+    await expect(response.text()).resolves.not.toContain("provider-body-secret");
+  });
+
   it("reuses transport redirect policy and never contacts a cross-origin target", async () => {
     let targetRequests = 0;
     const target = await startServer((_request, response) => {

@@ -43,7 +43,7 @@ const SAFE_REQUEST_HEADERS = new Set([
   "content-type",
   "user-agent",
 ]);
-const SAFE_RESPONSE_HEADERS = new Set(["content-type"]);
+const SAFE_RESPONSE_HEADERS = new Set(["content-type", "retry-after"]);
 
 type GatewayState = "new" | "starting" | "ready" | "unavailable" | "stopping" | "stopped";
 
@@ -208,6 +208,14 @@ export class ProviderEgressGateway {
           : {}),
       } as RequestInit);
       if (controller.signal.aborted) return;
+      if (!providerResponse.ok) {
+        sendGatewayError(
+          outgoing,
+          providerResponse.status,
+          retryAfterMilliseconds(providerResponse.headers),
+        );
+        return;
+      }
       outgoing.writeHead(
         providerResponse.status,
         Object.fromEntries(
@@ -224,6 +232,11 @@ export class ProviderEgressGateway {
     } catch (error) {
       if (controller.signal.aborted || outgoing.destroyed) {
         outgoing.destroy();
+        return;
+      }
+      const providerError = providerErrorMetadata(error);
+      if (providerError !== undefined) {
+        sendGatewayError(outgoing, providerError.status, providerError.retryAfterMs);
         return;
       }
       sendEmpty(outgoing, providerErrorStatus(error));
@@ -345,6 +358,49 @@ function sendEmpty(response: ServerResponse, status: number): void {
   }
   response.writeHead(status, { "content-length": "0" });
   response.end();
+}
+
+function sendGatewayError(
+  response: ServerResponse,
+  status: number,
+  retryAfterMs: number | undefined,
+): void {
+  response.writeHead(status, {
+    "content-type": "application/json",
+    ...retryAfterHeader(retryAfterMs),
+  });
+  response.end(JSON.stringify({
+    error: {
+      message: [
+        `pi_gateway_error status=${String(status)}`,
+        ...(retryAfterMs === undefined ? [] : [`retry_after_ms=${String(retryAfterMs)}`]),
+      ].join(" "),
+    },
+  }));
+}
+
+function retryAfterHeader(retryAfterMs: number | undefined): Record<string, string> {
+  return retryAfterMs === undefined ? {} : { "retry-after": String(retryAfterMs / 1_000) };
+}
+
+function retryAfterMilliseconds(headers: Headers): number | undefined {
+  const value = headers.get("retry-after");
+  if (value === null) return undefined;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  const milliseconds = Math.round(seconds * 1_000);
+  return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
+}
+
+function providerErrorMetadata(error: unknown): {
+  status: number;
+  retryAfterMs?: number;
+} | undefined {
+  if (!(error instanceof ModelProviderError) || error.status === undefined) return undefined;
+  return {
+    status: error.status,
+    ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+  };
 }
 
 function providerErrorStatus(error: unknown): number {
