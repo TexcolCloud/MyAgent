@@ -86,6 +86,9 @@ export class AgentResolver implements AgentResolverPort {
       maxInputTokens: profileRevision.maxInputTokens,
       verifiedCapabilities: profileRevision.verifiedCapabilities,
       compatibilityPresetVersion: connectionRevision.presetVersion,
+      ...(profileRevision.piRuntime === undefined
+        ? {}
+        : { piRuntime: profileRevision.piRuntime }),
     };
     const content = {
       ...definition,

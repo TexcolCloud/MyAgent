@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { AgentResolver } from "../../src/application/agent-resolver.js";
-import type { AgentDefinitionRevision } from "../../src/domain/agent-revision.js";
+import type {
+  AgentDefinitionRevision,
+  AgentRevisionSnapshot,
+} from "../../src/domain/agent-revision.js";
 import {
   managedSecretVersionIdFromUuid,
   modelProfileRevisionIdFromUuid,
@@ -44,6 +47,36 @@ describe("AgentResolver", () => {
     }).resolve(agentId);
 
     expect(snapshot.model.allowInsecureHttp).toBe(true);
+  });
+
+  it("snapshots a frozen Pi runtime while legacy serialized snapshots omit it", () => {
+    const piRuntime = {
+      kind: "pi_ai" as const,
+      piVersion: "0.73.1" as const,
+      driverId: "pi/openai" as const,
+      catalogProviderId: "openai",
+      api: "openai-completions",
+      modelId: "gpt-test-old",
+      contextWindow: 8_192,
+      compatibility: {},
+    };
+    const fixture = registryFixture({
+      piRuntime,
+    });
+    const snapshot = new AgentResolver({
+      catalog: { resolve: () => ({ id: agentId, definition }) },
+      registry: fixture.registry,
+      secrets: { resolve: () => "resolved-secret" },
+    }).resolve(agentId);
+    const pre0003ContentJson = JSON.stringify({
+      ...snapshot,
+      model: { ...snapshot.model, piRuntime: undefined },
+    });
+    const legacySnapshot = JSON.parse(pre0003ContentJson) as AgentRevisionSnapshot;
+
+    expect(snapshot.model.piRuntime).toEqual(piRuntime);
+    expect(Object.isFrozen(snapshot.model.piRuntime)).toBe(true);
+    expect(legacySnapshot.model.piRuntime).toBeUndefined();
   });
 
   it("rejects an Agent without an exact model assignment", () => {
@@ -218,6 +251,7 @@ function registryFixture(options: {
   profileState?: RegistryRevisionState;
   assignmentSource?: ModelAssignment["source"];
   providerAuth?: ProviderConnectionView["revisions"][number]["auth"];
+  piRuntime?: ModelProfileView["revisions"][number]["piRuntime"];
 } = {}): {
   registry: {
     getAssignment: () => ModelAssignment;
@@ -241,6 +275,7 @@ function registryFixture(options: {
       connectionRevisionId,
       providerModelId: "gpt-test-old",
       invocationProtocol: "chat_completions",
+      ...(options.piRuntime === undefined ? {} : { piRuntime: options.piRuntime }),
       maxInputTokens: 8_192,
       contextWindowSource: "operator",
       capabilityBaseline: "text_and_single_tool_call_v1",
@@ -254,6 +289,7 @@ function registryFixture(options: {
       connectionRevisionId,
       providerModelId: "gpt-test-new",
       invocationProtocol: "chat_completions",
+      ...(options.piRuntime === undefined ? {} : { piRuntime: options.piRuntime }),
       maxInputTokens: 16_384,
       contextWindowSource: "operator",
       capabilityBaseline: "text_and_single_tool_call_v1",

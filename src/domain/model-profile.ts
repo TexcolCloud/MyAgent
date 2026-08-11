@@ -9,6 +9,7 @@ import {
   type InvocationProtocol,
   type RegistryRevisionState,
 } from "./model-registry.js";
+import type { PiRuntimeContract } from "./pi-runtime.js";
 import type { ProviderConnectionRevision } from "./provider-connection.js";
 
 export type ModelCapability = "streaming_text" | "single_tool_call";
@@ -19,6 +20,7 @@ export interface ModelProfileRevision {
   readonly connectionRevisionId: ProviderConnectionRevisionId;
   readonly providerModelId: string;
   readonly invocationProtocol: InvocationProtocol;
+  readonly piRuntime?: PiRuntimeContract;
   readonly maxInputTokens: number;
   readonly contextWindowSource: "preset" | "operator" | "assumed_32768";
   readonly capabilityBaseline: typeof MODEL_CAPABILITY_BASELINE;

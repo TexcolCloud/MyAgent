@@ -9,6 +9,7 @@ import type {
   ProviderKind,
 } from "./model-registry.js";
 import type { ModelCapability } from "./model-profile.js";
+import type { PiRuntimeContract } from "./pi-runtime.js";
 import type { ProviderAuth } from "./provider-connection.js";
 import type { PolicyRule } from "./policy.js";
 
@@ -47,6 +48,7 @@ export interface EffectiveModelRuntime {
   maxInputTokens: number;
   verifiedCapabilities: readonly ModelCapability[];
   compatibilityPresetVersion: string;
+  piRuntime?: PiRuntimeContract;
 }
 
 export interface AgentRevisionSnapshot

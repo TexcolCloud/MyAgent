@@ -2,7 +2,7 @@ import type { ProviderConnectionRevisionId } from "./ids.js";
 
 export type ProviderKind = "openai" | "deepseek" | "openai_compatible";
 
-export type InvocationProtocol = "chat_completions" | "responses";
+export type InvocationProtocol = "chat_completions" | "responses" | "pi_ai";
 
 export type RegistryRevisionState =
   | "draft"
