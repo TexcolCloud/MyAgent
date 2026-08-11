@@ -26,6 +26,9 @@ export function migrate(db: DatabaseSync): void {
 }
 
 function applyNextMigration(db: DatabaseSync, migrations: readonly Migration[]): boolean {
+  const legacyAlterTable = (db.prepare("PRAGMA legacy_alter_table").get() as {
+    legacy_alter_table: number;
+  }).legacy_alter_table;
   db.exec("PRAGMA foreign_keys = OFF");
   let transactionStarted = false;
   try {
@@ -61,7 +64,11 @@ function applyNextMigration(db: DatabaseSync, migrations: readonly Migration[]):
     }
     throw error;
   } finally {
-    db.exec("PRAGMA foreign_keys = ON");
+    try {
+      db.exec(`PRAGMA legacy_alter_table = ${legacyAlterTable}`);
+    } finally {
+      db.exec("PRAGMA foreign_keys = ON");
+    }
   }
 }
 

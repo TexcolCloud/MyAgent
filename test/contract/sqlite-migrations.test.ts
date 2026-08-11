@@ -160,6 +160,29 @@ describe("SQLite migrations", () => {
     }
   });
 
+  it("restores migration PRAGMAs when version 3 fails after enabling legacy alter mode", () => {
+    const connection = openDatabase({
+      path: tempPath("pi-runtime-pragma-rollback.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrateThroughVersion2(connection.db);
+      connection.db.exec("CREATE TABLE model_profile_revisions_v2 (id TEXT PRIMARY KEY)");
+
+      expect(() => migrate(connection.db)).toThrow();
+
+      expect(connection.db.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+      expect(connection.db.prepare("PRAGMA legacy_alter_table").get())
+        .toEqual({ legacy_alter_table: 0 });
+      expect(connection.db.prepare("SELECT version FROM schema_migrations").all()).toEqual([
+        { version: 1 },
+        { version: 2 },
+      ]);
+    } finally {
+      connection.close();
+    }
+  });
+
   it("rejects a message linked to a Run from another Session", () => {
     const connection = openDatabase({
       path: tempPath("message-ownership.db"),

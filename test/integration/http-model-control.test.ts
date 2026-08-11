@@ -254,6 +254,75 @@ describe("HTTP model control plane", () => {
     }
   });
 
+  it("rejects a bearer-only native Driver Connection without its required credential", async () => {
+    const harness = await startTestApp();
+    try {
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "anthropic-without-bearer",
+          displayName: "Anthropic Without Bearer",
+          driverId: "pi/anthropic",
+          baseUrl: "https://api.anthropic.com/v1",
+          auth: { type: "none" },
+        },
+      });
+
+      expect(response.statusCode).toBe(422);
+      expect(response.json()).toMatchObject({ code: "invalid_provider_connection" });
+      expect(harness.modelRegistry.listConnections()).not.toContainEqual(
+        expect.objectContaining({ connectionId: "anthropic-without-bearer" }),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a bearer-only native Driver Connection revision without its required credential", async () => {
+    const harness = await startTestApp();
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "anthropic-revision-bearer",
+          displayName: "Anthropic Revision Bearer",
+          driverId: "pi/anthropic",
+          baseUrl: "https://api.anthropic.com/v1",
+          auth: { type: "environment", fromEnvironment: "ANTHROPIC_API_KEY" },
+        },
+      });
+      expect(created.statusCode).toBe(201);
+
+      const revised = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections/anthropic-revision-bearer/revisions",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          expectedRevision: 0,
+          displayName: "Anthropic Revision Bearer",
+          baseUrl: "https://api.anthropic.com/v1",
+          auth: { type: "none" },
+          allowInsecureHttp: false,
+          protocolPreference: "responses",
+        },
+      });
+
+      expect(revised.statusCode).toBe(422);
+      expect(revised.json()).toMatchObject({ code: "invalid_provider_connection" });
+      expect(harness.modelRegistry.getConnection("anthropic-revision-bearer" as never))
+        .toMatchObject({ recordRevision: 0 });
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("rejects a mismatched Driver on a Provider Connection revision", async () => {
     const harness = await startTestApp();
     try {
@@ -844,6 +913,69 @@ describe("HTTP model control plane", () => {
           expect.objectContaining({ profileId: "mismatched-candidate" }),
           expect.objectContaining({ profileId: "undiscovered-candidate" }),
         ]),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a catalog Candidate when an inconsistent native Connection has no bearer credential", async () => {
+    const harness = await startTestApp({
+      modelDiscovery: {
+        discover: async () => ({
+          state: "fresh",
+          models: [{ id: "gpt-4.1-mini", owner: "openai" }],
+          fetchedAt: new Date("2026-08-07T00:00:00.000Z"),
+        }),
+      },
+    });
+    try {
+      const connection = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "inconsistent-native-auth",
+          displayName: "Inconsistent Native Auth",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+      expect(connection.statusCode).toBe(201);
+      const connectionRevisionId = connection.json().revisions[0].revisionId as string;
+      harness.connection.db.exec(
+        "DROP TRIGGER provider_connection_revisions_content_immutable",
+      );
+      harness.connection.db.prepare(
+        "UPDATE provider_connection_revisions SET auth_json = ? WHERE revision_id = ?",
+      ).run('{"type":"none"}', connectionRevisionId);
+      const discovery = await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/provider-connection-revisions/${connectionRevisionId}/discover`,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: { expectedRevision: 0 },
+      });
+      expect(discovery.statusCode).toBe(200);
+
+      const profile = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/model-profiles",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "inconsistent-native-profile",
+          displayName: "Inconsistent Native Profile",
+          connectionRevisionId,
+          catalogCandidateId: "pi/openai:gpt-4.1-mini",
+        },
+      });
+
+      expect(profile.statusCode).toBe(422);
+      expect(profile.json()).toMatchObject({ code: "invalid_model_profile" });
+      expect(harness.modelRegistry.listProfiles()).not.toContainEqual(
+        expect.objectContaining({ profileId: "inconsistent-native-profile" }),
       );
     } finally {
       await harness.close();

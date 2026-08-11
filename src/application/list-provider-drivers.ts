@@ -49,9 +49,7 @@ export class ListProviderDriversService {
 
   resolveSupportedDriver(driverId: ProviderDriverId): ProviderDriverId {
     if (driverId === "pi/openai-compatible") return driverId;
-    const candidates = listProviderCatalogCandidates().filter(
-      (candidate) => candidate.driverId === driverId,
-    );
+    const candidates = this.candidatesForDriver(driverId);
     if (
       candidates.length === 0 ||
       candidates.every((candidate) => candidate.credentialSupport === "unsupported")
@@ -59,6 +57,18 @@ export class ListProviderDriversService {
       throw new DomainError("invalid_provider_connection");
     }
     return driverId;
+  }
+
+  assertDriverCredentialSupport(
+    driverId: ProviderDriverId,
+    credentialSupport: "bearer" | "none",
+  ): void {
+    if (driverId === "pi/openai-compatible") return;
+    if (!this.candidatesForDriver(driverId).some(
+      (candidate) => candidate.credentialSupport === credentialSupport,
+    )) {
+      throw new DomainError("invalid_provider_connection");
+    }
   }
 
   resolveSupportedCandidate(candidateId: string): ProviderCatalogCandidate {
@@ -69,5 +79,20 @@ export class ListProviderDriversService {
       throw new DomainError("invalid_model_profile");
     }
     return candidate;
+  }
+
+  assertCandidateCredentialSupport(
+    candidate: ProviderCatalogCandidate,
+    credentialSupport: "bearer" | "none",
+  ): void {
+    if (candidate.credentialSupport !== credentialSupport) {
+      throw new DomainError("invalid_model_profile");
+    }
+  }
+
+  private candidatesForDriver(driverId: ProviderDriverId): readonly ProviderCatalogCandidate[] {
+    return listProviderCatalogCandidates().filter(
+      (candidate) => candidate.driverId === driverId,
+    );
   }
 }

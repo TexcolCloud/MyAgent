@@ -60,6 +60,12 @@ export function registerProviderConnectionRoutes(
         : services.providerDrivers.resolveSupportedDriver(
           body.driverId as ProviderDriverId,
         );
+      if (providerDriver !== undefined) {
+        services.providerDrivers.assertDriverCredentialSupport(
+          providerDriver,
+          credentialSupport(body.auth),
+        );
+      }
       const result = createConnectionOrConflict(services, connectionId, () =>
         services.connections.create({
           connectionId,
@@ -111,14 +117,20 @@ export function registerProviderConnectionRoutes(
         (request.params as { connectionId: string }).connectionId,
       );
       const body = parseSchema(reviseProviderConnectionSchema, request.body);
+      const connection = services.registry.getConnection(connectionId);
       if (body.driverId !== undefined) {
         const driverId = services.providerDrivers.resolveSupportedDriver(
           body.driverId as ProviderDriverId,
         );
-        const connection = services.registry.getConnection(connectionId);
         if (connection.providerDriver !== driverId) {
           throw new DomainError("invalid_provider_connection");
         }
+      }
+      if (connection.providerDriver !== undefined) {
+        services.providerDrivers.assertDriverCredentialSupport(
+          connection.providerDriver,
+          credentialSupport(body.auth),
+        );
       }
       return connectionResponse(services.connections.revise({
         connectionId,
@@ -240,6 +252,12 @@ function credentialInput(
         managedSecretVersionId: auth.secretVersionId as ManagedSecretVersionId,
       };
   }
+}
+
+function credentialSupport(
+  auth: z.infer<typeof createProviderConnectionSchema>["auth"],
+): "bearer" | "none" {
+  return auth.type === "none" ? "none" : "bearer";
 }
 
 export function connectionResponse(connection: ProviderConnectionView) {

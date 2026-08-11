@@ -53,6 +53,7 @@ export function registerModelProfileRoutes(
         ? resolveCatalogSelection(
           services,
           target.providerDriver,
+          target.revision.auth.type,
           body,
         )
         : resolveManualSelection(
@@ -182,6 +183,7 @@ function assertModelSelection(
 function resolveCatalogSelection(
   services: { readonly providerDrivers: ListProviderDriversService },
   providerDriver: string | undefined,
+  credentialSupport: "bearer" | "none",
   body: {
     readonly catalogCandidateId: string;
     readonly maxInputTokens?: number | undefined;
@@ -194,6 +196,7 @@ function resolveCatalogSelection(
   if (providerDriver !== candidate.driverId) {
     throw new DomainError("invalid_model_profile");
   }
+  services.providerDrivers.assertCandidateCredentialSupport(candidate, credentialSupport);
   return {
     candidate,
     modelId: candidate.modelId,
