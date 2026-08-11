@@ -14,6 +14,7 @@ export interface RecordToolProposalInput {
   runId: RunId;
   leaseOwner: string;
   toolCallId: ToolCallId;
+  providerCallId: string;
   toolName: string;
   effect: ToolCall["effect"];
   arguments: JsonValue;
@@ -31,6 +32,7 @@ export interface RecordToolProposalInput {
 
 export interface ToolStore {
   getLatestForRun(runId: RunId): ToolCall | null;
+  listForRun(runId: RunId): readonly ToolCall[];
   recordProposal(input: RecordToolProposalInput): ToolCall;
   beginExecution(input: {
     runId: RunId;

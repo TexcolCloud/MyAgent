@@ -1,4 +1,4 @@
-import type { AgentRevisionSnapshot } from "../domain/agent-revision.js";
+import type { EffectiveModelRuntime } from "../domain/agent-revision.js";
 import type { JsonValue } from "../domain/json.js";
 
 export interface ModelUsage {
@@ -6,25 +6,57 @@ export interface ModelUsage {
   outputTokens: number;
 }
 
+export type ModelInput =
+  | {
+      type: "message";
+      role: "system" | "user" | "assistant";
+      name?: string;
+      content: string;
+    }
+  | {
+      type: "assistant_tool_call";
+      callId: string;
+      name: string;
+      arguments: JsonValue;
+    }
+  | {
+      type: "tool_result";
+      callId: string;
+      name: string;
+      output: JsonValue;
+    };
+
+export type ModelFinishReason =
+  | "completed"
+  | "tool_call"
+  | "length"
+  | "content_filter"
+  | "unknown";
+
 export interface ModelRequest {
-  purpose: "run" | "session_summary";
-  model: AgentRevisionSnapshot["model"];
-  messages: readonly {
-    role: "system" | "user" | "assistant" | "tool";
-    name: string;
-    content: string;
-  }[];
+  purpose:
+    | "run"
+    | "session_summary"
+    | "verification_text"
+    | "verification_tool";
+  model: EffectiveModelRuntime;
+  input: readonly ModelInput[];
   tools: readonly {
     name: string;
     description: string;
     inputSchema: JsonValue;
   }[];
+  toolChoice?: "required";
 }
 
 export type ModelChunk =
   | { type: "text_delta"; text: string }
-  | { type: "tool_call"; call: { name: string; arguments: JsonValue } }
-  | { type: "completed"; finishReason: string; usage: ModelUsage };
+  | { type: "tool_call"; callId: string; name: string; arguments: JsonValue }
+  | {
+      type: "completed";
+      finishReason: ModelFinishReason;
+      usage?: ModelUsage;
+    };
 
 export interface ModelPort {
   streamAttempt(

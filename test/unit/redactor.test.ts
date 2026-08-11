@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { createStructuredLogger } from "../../src/observability/logger.js";
-import { redact, secrets } from "../../src/observability/redactor.js";
+import {
+  MutableDynamicRedactionRegistry,
+  redact,
+  secrets,
+} from "../../src/observability/redactor.js";
 
 describe("redact", () => {
   it("redacts by key and known Secret value without mutating input", () => {
@@ -71,6 +75,37 @@ describe("redact", () => {
 });
 
 describe("createStructuredLogger", () => {
+  it("reads a fresh mutable Secret snapshot for every event", () => {
+    const lines: string[] = [];
+    const registry = new MutableDynamicRedactionRegistry(["initial-secret"]);
+    const logger = createStructuredLogger({
+      redactionRegistry: registry,
+      write: (line) => { lines.push(line); },
+    });
+
+    logger.info("first initial-secret later-secret");
+    const earlierSnapshot = registry.values();
+    registry.register("later-secret");
+    logger.info("second initial-secret later-secret");
+
+    expect(lines[0]).toContain("[REDACTED] later-secret");
+    expect(lines[0]).not.toContain("initial-secret");
+    expect(lines[1]).not.toContain("initial-secret");
+    expect(lines[1]).not.toContain("later-secret");
+    expect(earlierSnapshot).toEqual(["initial-secret"]);
+    expect(registry.values()).toEqual(["initial-secret", "later-secret"]);
+  });
+
+  it("deduplicates and ignores empty dynamic Secret registrations", () => {
+    const registry = new MutableDynamicRedactionRegistry();
+
+    registry.register("");
+    registry.register("provider-secret");
+    registry.register("provider-secret");
+
+    expect(registry.values()).toEqual(["provider-secret"]);
+  });
+
   it("writes redacted JSON with inherited trace and entity bindings", () => {
     const lines: string[] = [];
     const input = {

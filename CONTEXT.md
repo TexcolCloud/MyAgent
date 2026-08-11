@@ -12,6 +12,98 @@ _Avoid_: Tenant, account, end user
 A software collaborator that acts on behalf of the Operator within defined capabilities and permissions.
 _Avoid_: Chatbot, tenant bot
 
+**Model Provider**:
+An external or locally hosted service that exposes language models through one or more supported invocation protocols.
+_Avoid_: Model, Provider Connection
+
+**Invocation Protocol**:
+The provider-facing API contract fixed for a Model Profile, initially either Chat Completions or Responses.
+_Avoid_: Model Provider, automatic runtime fallback
+
+**Provider Connection**:
+An Operator-configured route to one Model Provider, consisting of a provider kind, Base URL, and Secret reference; one connection may expose many models.
+_Avoid_: Model, endpoint config
+
+**Model Profile**:
+An Agent-selectable configuration that binds one Provider Connection to a provider model identifier and an invocation protocol.
+_Avoid_: Provider Connection, model name
+
+**Model Profile Revision**:
+An immutable version of a Model Profile's effective connection, model identifier, Invocation Protocol, and verified capabilities that can be captured by a Run.
+_Avoid_: Mutable provider settings, discovery result
+
+**Active Model Profile Revision**:
+A verified Model Profile Revision eligible for new Model Assignments and Runs; a replacement becomes active only through explicit promotion.
+_Avoid_: Latest draft, discovered model
+
+**Legacy-Trusted Model Profile Revision**:
+A migrated pre-registry model configuration allowed only to continue its pre-existing Model Assignments until formal Model Verification replaces it.
+_Avoid_: Verified revision, generally assignable model
+
+**Model Assignment**:
+The Model Registry association that selects one verified Model Profile Revision for an Agent's future Runs without changing existing Runs.
+_Avoid_: Global model, per-Run override
+
+**Default Model Profile**:
+The verified Model Profile assigned explicitly when a newly registered Agent has no Model Assignment; changing the default does not alter existing assignments.
+_Avoid_: Dynamic Run fallback, global model switch
+
+**Model Registry**:
+The Operator-managed, versioned set of Provider Connections, Model Profiles, and their Agent assignments.
+_Avoid_: Model Discovery result, global model config
+
+**Model Control Plane**:
+The Operator-only local interface that manages the Model Registry, Secrets, discovery, verification, promotion, and assignment separately from Run ingress.
+_Avoid_: Run API, Channel
+
+**Model Capability**:
+A verified behavior of a Model Profile, such as streaming text or producing one structured Tool Call through its Invocation Protocol.
+_Avoid_: Provider claim, model metadata
+
+**Provider Health**:
+The latest operational observation for a Provider Connection or Model Profile; degraded health does not revoke prior verification or alter Model Assignments.
+_Avoid_: Model Verification, readiness
+
+**Model Discovery**:
+The enumeration of model identifiers advertised by a Provider Connection; discovery alone does not prove that a model can serve the required protocol or capabilities.
+_Avoid_: Model Verification, availability check
+
+**Model Verification**:
+A bounded live check that the Operator-selected Model Profile can serve its intended invocation protocol and required capabilities at that moment.
+_Avoid_: Model Discovery, permanent compatibility guarantee
+
+**Verification Record**:
+A durable, Secret-free result of one Model Verification against one exact Model Profile Revision.
+_Avoid_: Discovery cache, provider response body
+
+**Promotion**:
+The explicit atomic replacement of an Active Model Profile Revision with a verified draft revision.
+_Avoid_: Verification, implicit update
+
+**Locked Provider Connection**:
+A Provider Connection whose Secret cannot currently be resolved; its metadata remains manageable, but it cannot discover, verify, or serve models.
+_Avoid_: Deleted connection, invalid model
+
+**Retirement**:
+The reversible removal of a Provider Connection or Model Profile from new use while preserving revisions already assigned to Agents or captured by Runs.
+_Avoid_: Deletion, revocation
+
+**Secret Store**:
+A protected repository that accepts provider credentials and exposes them to adapters only through opaque Secret references at the moment of use.
+_Avoid_: Configuration file, plaintext credential field
+
+**Secret Version**:
+An immutable encrypted value in the Secret Store retained while referenced by an active or historical configuration revision.
+_Avoid_: Mutable API Key field, plaintext backup
+
+**Provider Auth**:
+The explicit authentication mode of a Provider Connection, initially Bearer Secret or no authentication.
+_Avoid_: HTTP server authentication, implicit local bypass
+
+**Provider Preset**:
+A versioned set of suggested connection defaults and protocol preferences used only when creating or explicitly updating a Provider Connection.
+_Avoid_: Provider Connection, automatic configuration override
+
 **Workspace**:
 The explicitly configured filesystem root in which a Personal Agent's file and command Tools operate; multiple Agents share one only by deliberate configuration.
 _Avoid_: Repository, current working directory

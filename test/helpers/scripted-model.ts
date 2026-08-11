@@ -45,7 +45,7 @@ export function completedText(
   return {
     chunks: [
       { type: "text_delta", text },
-      { type: "completed", finishReason: "stop", usage },
+      { type: "completed", finishReason: "completed", usage },
     ],
   };
 }

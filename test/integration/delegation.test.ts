@@ -15,6 +15,7 @@ import { loadCatalog, type CatalogSnapshot } from "../../src/config/catalog-load
 import { approvalIdFromUuid, attemptIdFromUuid, parseAgentId, runIdFromUuid, sessionIdFromUuid, toolCallIdFromUuid } from "../../src/domain/ids.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
+import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
 describe("delegation", () => {
@@ -37,16 +38,16 @@ describe("delegation", () => {
         toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000201")],
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000201")],
       });
-      const parent = new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      const parent = new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary", sessionKey: "delegation:parent", input: { type: "text", text: "parent secret must not be copied" }, idempotencyKey: "delegation-parent-0001", source: { kind: "http" },
       });
       clock.advanceBy(1_000);
       runs.claimNextEligible("parent-worker", clock.now(), new Date(clock.now().getTime() + 30_000));
       const call = tools.recordProposal({
-        runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), toolName: "delegate_agent", effect: "side_effect", arguments: { targetAgentId: "researcher", task: "research", context: { topic: "tests" } }, canonicalArguments: "{\"context\":{\"topic\":\"tests\"},\"targetAgentId\":\"researcher\",\"task\":\"research\"}", argumentsSha256: "a".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now(),
+        runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), providerCallId: "provider_delegate_parent", toolName: "delegate_agent", effect: "side_effect", arguments: { targetAgentId: "researcher", task: "research", context: { topic: "tests" } }, canonicalArguments: "{\"context\":{\"topic\":\"tests\"},\"targetAgentId\":\"researcher\",\"task\":\"research\"}", argumentsSha256: "a".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now(),
       });
       tools.beginExecution({ runId: parent.runId, toolCallId: call.toolCallId, leaseOwner: "parent-worker", occurredAt: clock.now() });
-      const delegate = new DelegateAgentService({ catalog: new CatalogService(snapshot), runs, clock, ids });
+      const delegate = new DelegateAgentService({ agents: resolvedAgents(new CatalogService(snapshot)), runs, clock, ids });
       const child = delegate.execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "research", context: { topic: "tests" }, leaseOwner: "parent-worker" });
 
       expect(runs.getRun(parent.runId).state).toBe("running");
@@ -55,7 +56,7 @@ describe("delegation", () => {
       expect(connection.db.prepare("SELECT content_json FROM messages WHERE session_id = ?").get(child.childSessionId)).toEqual({ content_json: "{\"text\":\"{\\\"task\\\":\\\"research\\\",\\\"context\\\":{\\\"topic\\\":\\\"tests\\\"}}\",\"type\":\"text\"}" });
 
       runs.beginModelAttempt({ runId: child.childRunId, leaseOwner: "child-worker", attemptId: ids.attemptId(), purpose: "run", consumeModelTurn: true, modelTurnLimit: 20, occurredAt: clock.now() });
-      runs.completeRun({ runId: child.childRunId, leaseOwner: "child-worker", attemptId: attemptIdFromUuid("00000000-0000-7000-8000-000000000201"), text: "child answer", finishReason: "stop", usage: { inputTokens: 1, outputTokens: 1 }, occurredAt: clock.now() });
+      runs.completeRun({ runId: child.childRunId, leaseOwner: "child-worker", attemptId: attemptIdFromUuid("00000000-0000-7000-8000-000000000201"), text: "child answer", finishReason: "completed", usage: { inputTokens: 1, outputTokens: 1 }, occurredAt: clock.now() });
 
       expect(runs.getRun(parent.runId).state).toBe("queued");
       expect(tools.getLatestForRun(parent.runId)).toMatchObject({ state: "succeeded" });
@@ -76,12 +77,12 @@ describe("delegation", () => {
         runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000211"), runIdFromUuid("00000000-0000-7000-8000-000000000212")],
         toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000211")],
       });
-      const parent = new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:cancel", input: { type: "text", text: "cancel" }, idempotencyKey: "delegation-cancel-0001", source: { kind: "http" } });
+      const parent = new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:cancel", input: { type: "text", text: "cancel" }, idempotencyKey: "delegation-cancel-0001", source: { kind: "http" } });
       clock.advanceBy(1_000);
       runs.claimNextEligible("parent-worker", clock.now(), new Date(clock.now().getTime() + 30_000));
-      const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "b".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
+      const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), providerCallId: "provider_delegate_cancel", toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "b".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
       tools.beginExecution({ runId: parent.runId, toolCallId: call.toolCallId, leaseOwner: "parent-worker", occurredAt: clock.now() });
-      const child = new DelegateAgentService({ catalog: new CatalogService(snapshot), runs, clock, ids }).execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "cancel", context: {}, leaseOwner: "parent-worker" });
+      const child = new DelegateAgentService({ agents: resolvedAgents(new CatalogService(snapshot)), runs, clock, ids }).execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "cancel", context: {}, leaseOwner: "parent-worker" });
 
       runs.cancel({ runId: parent.runId, occurredAt: clock.now() });
 
@@ -103,11 +104,11 @@ describe("delegation", () => {
         runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000241"), runIdFromUuid("00000000-0000-7000-8000-000000000242")],
         toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000241")],
       });
-      const parent = new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:child-cancel", input: { type: "text", text: "cancel child" }, idempotencyKey: "delegation-child-cancel-0001", source: { kind: "http" } });
+      const parent = new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:child-cancel", input: { type: "text", text: "cancel child" }, idempotencyKey: "delegation-child-cancel-0001", source: { kind: "http" } });
       runs.claimNextEligible("parent-worker", clock.now(), new Date(clock.now().getTime() + 30_000));
-      const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "d".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
+      const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), providerCallId: "provider_delegate_child_cancel", toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "d".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
       tools.beginExecution({ runId: parent.runId, toolCallId: call.toolCallId, leaseOwner: "parent-worker", occurredAt: clock.now() });
-      const child = new DelegateAgentService({ catalog: new CatalogService(snapshot), runs, clock, ids }).execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "cancel me", context: {}, leaseOwner: "parent-worker" });
+      const child = new DelegateAgentService({ agents: resolvedAgents(new CatalogService(snapshot)), runs, clock, ids }).execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "cancel me", context: {}, leaseOwner: "parent-worker" });
 
       runs.cancel({ runId: child.childRunId, occurredAt: clock.now() });
 
@@ -131,15 +132,31 @@ describe("delegation", () => {
         runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000251"), runIdFromUuid("00000000-0000-7000-8000-000000000252"), runIdFromUuid("00000000-0000-7000-8000-000000000253")],
         toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000251")],
       });
-      const parent = new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:idempotency", input: { type: "text", text: "delegate" }, idempotencyKey: "delegation-idempotency-0001", source: { kind: "http" } });
+      const parent = new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:idempotency", input: { type: "text", text: "delegate" }, idempotencyKey: "delegation-idempotency-0001", source: { kind: "http" } });
       runs.claimNextEligible("parent-worker", clock.now(), new Date(clock.now().getTime() + 30_000));
-      const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "e".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
+      const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), providerCallId: "provider_delegate_idempotency", toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "e".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
       tools.beginExecution({ runId: parent.runId, toolCallId: call.toolCallId, leaseOwner: "parent-worker", occurredAt: clock.now() });
-      const service = new DelegateAgentService({ catalog: new CatalogService(snapshot), runs, clock, ids });
+      const availableAgents = resolvedAgents(new CatalogService(snapshot));
+      let resolutionAvailable = true;
+      let resolutionCount = 0;
+      const service = new DelegateAgentService({
+        agents: {
+          resolve(agentId) {
+            resolutionCount += 1;
+            if (!resolutionAvailable) throw new Error("model_provider_locked");
+            return availableAgents.resolve(agentId);
+          },
+        },
+        runs,
+        clock,
+        ids,
+      });
       const command = { parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "once", context: {}, leaseOwner: "parent-worker" } as const;
 
       const first = service.execute(command);
+      resolutionAvailable = false;
       expect(service.execute(command)).toEqual(first);
+      expect(resolutionCount).toBe(1);
       expect(connection.db.prepare("SELECT child_run_count FROM runs WHERE run_id = ?").get(parent.runId)).toEqual({ child_run_count: 1 });
     } finally { connection.close(); }
 
@@ -151,13 +168,13 @@ describe("delegation", () => {
       const tools = new SqliteToolRepository(capped.db);
       const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
       const ids = new FakeIds({ sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000261"), sessionIdFromUuid("00000000-0000-7000-8000-000000000262")], runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000261"), runIdFromUuid("00000000-0000-7000-8000-000000000262")], toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000261")] });
-      const parent = new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:cap", input: { type: "text", text: "cap" }, idempotencyKey: "delegation-cap-0001", source: { kind: "http" } });
+      const parent = new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:cap", input: { type: "text", text: "cap" }, idempotencyKey: "delegation-cap-0001", source: { kind: "http" } });
       runs.claimNextEligible("parent-worker", clock.now(), new Date(clock.now().getTime() + 30_000));
-      const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "f".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
+      const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), providerCallId: "provider_delegate_cap", toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "f".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
       tools.beginExecution({ runId: parent.runId, toolCallId: call.toolCallId, leaseOwner: "parent-worker", occurredAt: clock.now() });
       capped.db.prepare("UPDATE runs SET child_run_count = 4 WHERE run_id = ?").run(parent.runId);
 
-      expect(() => new DelegateAgentService({ catalog: new CatalogService(snapshot), runs, clock, ids }).execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "too many", context: {}, leaseOwner: "parent-worker" })).toThrow(expect.objectContaining({ code: "delegation_count_exceeded" }));
+      expect(() => new DelegateAgentService({ agents: resolvedAgents(new CatalogService(snapshot)), runs, clock, ids }).execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "too many", context: {}, leaseOwner: "parent-worker" })).toThrow(expect.objectContaining({ code: "delegation_count_exceeded" }));
     } finally { capped.close(); }
   });
 
@@ -182,7 +199,7 @@ describe("delegation", () => {
       setup.runs.claimNextEligible("child-worker", setup.clock.now(), new Date(setup.clock.now().getTime() + 30_000));
       const childToolCallId = toolCallIdFromUuid("00000000-0000-7000-8000-000000000289");
       const approvalId = approvalIdFromUuid("00000000-0000-7000-8000-000000000289");
-      setup.tools.recordProposal({ runId: setup.child.childRunId, leaseOwner: "child-worker", toolCallId: childToolCallId, toolName: "write_file", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "9".repeat(64), policyFacts: {}, policyEffect: "ask", matchedRule: 0, toolCallLimit: 12, approvalId, approvalExpiresAt: new Date(setup.clock.now().getTime() + 86_400_000), occurredAt: setup.clock.now() });
+      setup.tools.recordProposal({ runId: setup.child.childRunId, leaseOwner: "child-worker", toolCallId: childToolCallId, providerCallId: "provider_child_approval", toolName: "write_file", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "9".repeat(64), policyFacts: {}, policyEffect: "ask", matchedRule: 0, toolCallLimit: 12, approvalId, approvalExpiresAt: new Date(setup.clock.now().getTime() + 86_400_000), occurredAt: setup.clock.now() });
 
       setup.runs.cancel({ runId: setup.parent.runId, occurredAt: setup.clock.now() });
 
@@ -212,7 +229,7 @@ describe("delegation", () => {
       setup.runs.claimNextEligible("child-worker", setup.clock.now(), new Date(setup.clock.now().getTime() + 30_000));
       const attemptId = attemptIdFromUuid("00000000-0000-7000-8000-000000000299");
       setup.runs.beginModelAttempt({ runId: setup.child.childRunId, leaseOwner: "child-worker", attemptId, purpose: "run", consumeModelTurn: true, modelTurnLimit: 20, occurredAt: setup.clock.now() });
-      setup.runs.completeRun({ runId: setup.child.childRunId, leaseOwner: "child-worker", attemptId, text: "汉".repeat(11_000), finishReason: "stop", usage: { inputTokens: 1, outputTokens: 1 }, occurredAt: setup.clock.now() });
+      setup.runs.completeRun({ runId: setup.child.childRunId, leaseOwner: "child-worker", attemptId, text: "汉".repeat(11_000), finishReason: "completed", usage: { inputTokens: 1, outputTokens: 1 }, occurredAt: setup.clock.now() });
 
       const row = connection.db.prepare("SELECT result_json FROM tool_calls WHERE run_id = ? AND tool_name = 'delegate_agent'").get(setup.parent.runId) as { result_json: string };
       const result = JSON.parse(row.result_json) as { content: { result: unknown } };
@@ -227,7 +244,7 @@ describe("delegation", () => {
       setup.runs.claimNextEligible("child-worker", setup.clock.now(), new Date(setup.clock.now().getTime() + 30_000));
       const attemptId = attemptIdFromUuid("00000000-0000-7000-8000-000000000309");
       setup.runs.beginModelAttempt({ runId: setup.child.childRunId, leaseOwner: "child-worker", attemptId, purpose: "run", consumeModelTurn: true, modelTurnLimit: 20, occurredAt: setup.clock.now() });
-      setup.runs.completeRun({ runId: setup.child.childRunId, leaseOwner: "child-worker", attemptId, text: "x".repeat(32_720), finishReason: "stop", usage: { inputTokens: 1, outputTokens: 1 }, occurredAt: setup.clock.now() });
+      setup.runs.completeRun({ runId: setup.child.childRunId, leaseOwner: "child-worker", attemptId, text: "x".repeat(32_720), finishReason: "completed", usage: { inputTokens: 1, outputTokens: 1 }, occurredAt: setup.clock.now() });
 
       const row = connection.db.prepare("SELECT result_json FROM tool_calls WHERE run_id = ? AND tool_name = 'delegate_agent'").get(setup.parent.runId) as { result_json: string };
       const result = JSON.parse(row.result_json) as { content: { result: unknown } };
@@ -244,9 +261,9 @@ describe("delegation", () => {
       const tools = new SqliteToolRepository(connection.db);
       const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
       const ids = new FakeIds({ sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000231")], runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000231")], toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000231")] });
-      const run = new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:recover", input: { type: "text", text: "recover" }, idempotencyKey: "delegation-recover-0001", source: { kind: "http" } });
+      const run = new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({ agentId: "primary", sessionKey: "delegation:recover", input: { type: "text", text: "recover" }, idempotencyKey: "delegation-recover-0001", source: { kind: "http" } });
       runs.claimNextEligible("worker-a", clock.now(), new Date(clock.now().getTime() + 1));
-      const call = tools.recordProposal({ runId: run.runId, leaseOwner: "worker-a", toolCallId: ids.toolCallId(), toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "c".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
+      const call = tools.recordProposal({ runId: run.runId, leaseOwner: "worker-a", toolCallId: ids.toolCallId(), providerCallId: "provider_delegate_recovery", toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "c".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
       tools.beginExecution({ runId: run.runId, toolCallId: call.toolCallId, leaseOwner: "worker-a", occurredAt: clock.now() });
       clock.advanceBy(2);
       runs.claimNextEligible("worker-b", clock.now(), new Date(clock.now().getTime() + 30_000));
@@ -275,11 +292,11 @@ function createBlockedDelegation(
     runIds: [runIdFromUuid(parentUuid), runIdFromUuid(childUuid)],
     toolCallIds: [toolCallIdFromUuid(parentUuid)],
   });
-  const parent = new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({ agentId: "primary", sessionKey, input: { type: "text", text: "delegate" }, idempotencyKey: `delegation-${String(idBase).padStart(8, "0")}`, source: { kind: "http" } });
+  const parent = new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({ agentId: "primary", sessionKey, input: { type: "text", text: "delegate" }, idempotencyKey: `delegation-${String(idBase).padStart(8, "0")}`, source: { kind: "http" } });
   runs.claimNextEligible("parent-worker", clock.now(), new Date(clock.now().getTime() + 30_000));
-  const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "8".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
+  const call = tools.recordProposal({ runId: parent.runId, leaseOwner: "parent-worker", toolCallId: ids.toolCallId(), providerCallId: "provider_delegate_blocked", toolName: "delegate_agent", effect: "side_effect", arguments: {}, canonicalArguments: "{}", argumentsSha256: "8".repeat(64), policyFacts: { targetAgentInDelegates: true }, policyEffect: "allow", matchedRule: 0, toolCallLimit: 12, occurredAt: clock.now() });
   tools.beginExecution({ runId: parent.runId, toolCallId: call.toolCallId, leaseOwner: "parent-worker", occurredAt: clock.now() });
-  const child = new DelegateAgentService({ catalog: new CatalogService(snapshot), runs, clock, ids }).execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "child", context: {}, leaseOwner: "parent-worker" });
+  const child = new DelegateAgentService({ agents: resolvedAgents(new CatalogService(snapshot)), runs, clock, ids }).execute({ parentRunId: parent.runId, parentToolCallId: call.toolCallId, targetAgentId: parseAgentId("researcher"), task: "child", context: {}, leaseOwner: "parent-worker" });
   return { runs, tools, clock, parent, child };
 }
 

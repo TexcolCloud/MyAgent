@@ -25,7 +25,7 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - id: redaction
-        run: npx vitest run test/integration/secret-leak.test.ts
+        run: npm run test:integration -- test/integration/secret-leak.test.ts
       - run: npm run test:unit -- --reporter=default --reporter=junit --outputFile.junit=test-results/unit.xml
       - run: npm run test:contract -- --reporter=default --reporter=junit --outputFile.junit=test-results/contract.xml
       - run: npm run test:integration -- --reporter=default --reporter=junit --outputFile.junit=test-results/integration.xml

@@ -3,6 +3,7 @@ import type { JsonValue } from "../domain/json.js";
 import type { Clock } from "../ports/clock.js";
 import {
   ModelProviderError,
+  type ModelFinishReason,
   type ModelPort,
   type ModelRequest,
   type ModelUsage,
@@ -36,14 +37,18 @@ export interface EnsureWithinBudgetResult {
 
 export interface SummaryAttemptLifecycle {
   onAttemptStarted(attemptNumber: number): void;
+  onAttemptSucceeded(attemptNumber: number): void | Promise<void>;
   onAttemptFailed(
     attemptNumber: number,
     error: unknown,
     willRetry: boolean,
   ): void | Promise<void>;
-  saveSummary(
-    input: Parameters<SessionStore["saveSummary"]>[0],
-  ): ReturnType<SessionStore["saveSummary"]> | Promise<ReturnType<SessionStore["saveSummary"]>>;
+  saveSummary(input: {
+    attemptNumber: number;
+    finishReason: ModelFinishReason;
+    usage?: ModelUsage;
+    summary: Parameters<SessionStore["saveSummary"]>[0];
+  }): ReturnType<SessionStore["saveSummary"]> | Promise<ReturnType<SessionStore["saveSummary"]>>;
 }
 
 export class SessionSummarizer {
@@ -68,14 +73,19 @@ export class SessionSummarizer {
     const currentSummary = this.options.sessionStore.getCurrentSummary(
       input.sessionId,
     );
-    const messages = this.options.sessionStore
+    const unsummarizedMessages = this.options.sessionStore
       .listMessagesThroughRun(input.sessionId, input.runFifoSequence)
       .filter(
         (message) =>
-          message.runId !== input.runId &&
-          (currentSummary === null ||
-            message.sequence > currentSummary.sourceMessageTo),
+          currentSummary === null ||
+          message.sequence > currentSummary.sourceMessageTo,
       );
+    const firstCurrentInput = unsummarizedMessages.findIndex(
+      (message) => message.runId === input.runId,
+    );
+    const messages = firstCurrentInput === -1
+      ? unsummarizedMessages
+      : unsummarizedMessages.slice(0, firstCurrentInput);
     if (messages.length === 0) {
       throw new DomainError("context_budget_exceeded");
     }
@@ -88,19 +98,27 @@ export class SessionSummarizer {
     if (firstMessage === undefined || lastMessage === undefined) {
       throw new Error("unreachable_empty_summary_source");
     }
-    const saveSummary = lifecycle?.saveSummary.bind(lifecycle) ??
-      this.options.sessionStore.saveSummary.bind(this.options.sessionStore);
-    await saveSummary({
+    const summary = {
       summaryId: `summary:${input.sessionId}:${String(lastMessage.sequence)}`,
       sessionId: input.sessionId,
       sourceMessageFrom:
         currentSummary?.sourceMessageFrom ?? firstMessage.sequence,
       sourceMessageTo: lastMessage.sequence,
       content: attempt.text,
-      modelProvider: input.revision.model.provider,
-      modelName: input.revision.model.model,
+      modelProvider: input.revision.model.providerKind,
+      modelName: input.revision.model.modelId,
       createdAt: this.options.clock.now(),
-    });
+    };
+    if (lifecycle === undefined) {
+      await this.options.sessionStore.saveSummary(summary);
+    } else {
+      await lifecycle.saveSummary({
+        attemptNumber: attempt.attempts,
+        finishReason: attempt.finishReason,
+        ...(attempt.usage === undefined ? {} : { usage: attempt.usage }),
+        summary,
+      });
+    }
 
     const reducedRequest = await this.options.assembler.build(input);
     if (!withinBudget(reducedRequest)) {
@@ -113,7 +131,7 @@ export class SessionSummarizer {
       modelTurnsUsed: 1,
       activeExecutionMilliseconds:
         this.options.clock.now().getTime() - startedAt,
-      usage: attempt.usage,
+      ...(attempt.usage === undefined ? {} : { usage: attempt.usage }),
     };
   }
 
@@ -123,12 +141,14 @@ export class SessionSummarizer {
     lifecycle?: SummaryAttemptLifecycle,
   ): Promise<{
     text: string;
-    usage: ModelUsage;
+    finishReason: ModelFinishReason;
+    usage?: ModelUsage;
     attempts: number;
   }> {
     for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt += 1) {
       let text = "";
       let usage: ModelUsage | undefined;
+      let finishReason: ModelFinishReason | undefined;
       lifecycle?.onAttemptStarted(attempt);
       try {
         for await (const chunk of this.options.model.streamAttempt(request, signal)) {
@@ -140,16 +160,22 @@ export class SessionSummarizer {
               code: "model_protocol_error",
             });
           } else {
+            if (finishReason !== undefined) {
+              throw new ModelProviderError({
+                transient: false,
+                code: "model_protocol_error",
+              });
+            }
+            finishReason = chunk.finishReason;
             usage = chunk.usage;
           }
         }
-        if (text.trim().length === 0 || usage === undefined) {
+        if (text.trim().length === 0 || finishReason === undefined) {
           throw new ModelProviderError({
             transient: false,
             code: "model_protocol_error",
           });
         }
-        return { text, usage, attempts: attempt };
       } catch (error) {
         const willRetry = error instanceof ModelProviderError &&
           error.transient && attempt < MAX_MODEL_ATTEMPTS;
@@ -163,7 +189,15 @@ export class SessionSummarizer {
           Math.max(configuredDelay, error.retryAfterMs ?? 0),
         );
         await this.options.clock.sleep(delay, signal);
+        continue;
       }
+      await lifecycle?.onAttemptSucceeded(attempt);
+      return {
+        text,
+        finishReason,
+        attempts: attempt,
+        ...(usage === undefined ? {} : { usage }),
+      };
     }
     throw new Error("unreachable_model_attempt_loop");
   }
@@ -172,7 +206,7 @@ export class SessionSummarizer {
 export function estimateModelRequestTokens(request: ModelRequest): number {
   return Math.ceil(
     Buffer.byteLength(
-      JSON.stringify({ messages: request.messages, tools: request.tools }),
+      JSON.stringify({ input: request.input, tools: request.tools }),
       "utf8",
     ) / 4,
   );
@@ -198,8 +232,9 @@ function buildSummaryRequest(
   return {
     purpose: "session_summary",
     model: input.revision.model,
-    messages: [
+    input: [
       {
+        type: "message",
         role: "system",
         name: "summary_instructions",
         content:
@@ -209,12 +244,14 @@ function buildSummaryRequest(
         ? []
         : [
             {
+              type: "message" as const,
               role: "user" as const,
               name: "session_summary",
               content: wrapUntrusted("session-summary", currentSummary.content),
             },
           ]),
       {
+        type: "message",
         role: "user",
         name: "session_history",
         content: wrapUntrusted("session-history", history),

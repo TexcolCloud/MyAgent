@@ -6,7 +6,7 @@ import canonicalizeModule from "canonicalize";
 import { parse as parseYaml } from "yaml";
 
 import type {
-  AgentRevisionSnapshot,
+  AgentDefinitionRevision,
   PolicyRule,
   SkillSnapshot,
 } from "../domain/agent-revision.js";
@@ -14,35 +14,44 @@ import { DomainError } from "../domain/errors.js";
 import { parseAgentId, type AgentId } from "../domain/ids.js";
 import { DEFAULT_RUN_LIMITS, type RunLimits } from "../domain/limits.js";
 import {
-  agentConfigSchema,
-  globalConfigSchema,
+  agentConfigV1Schema,
+  agentConfigV2Schema,
   policyConfigSchema,
-  type AgentConfig,
-  type GlobalConfig,
+  type AgentConfigV1,
+  type AgentConfigV2,
+  type GlobalConfigV2,
+  type LegacyGlobalConfigV1,
   type PolicyConfig,
 } from "./schemas.js";
+import { loadBootConfig, type BootConfig } from "./boot-config.js";
 import { loadSkillCatalog, type SkillCatalog } from "./skill-loader.js";
 
 const canonicalizeJson = canonicalizeModule as unknown as (
   input: unknown,
 ) => string | undefined;
 
-type DeepReadonly<T> = T extends readonly (infer Item)[]
-  ? readonly DeepReadonly<Item>[]
-  : T extends object
-    ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
-    : T;
+type DeepReadonly<T> = T extends string | number | boolean | bigint | symbol | null | undefined
+  ? T
+  : T extends readonly (infer Item)[]
+    ? readonly DeepReadonly<Item>[]
+    : T extends object
+      ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
+      : T;
 
-export type ResolvedGlobalConfig = DeepReadonly<
-  Omit<GlobalConfig, "agentRoots" | "skillRoots"> & {
+type ResolvedConfig<Config extends GlobalConfigV2 | LegacyGlobalConfigV1> =
+  Omit<Config, "agentRoots" | "skillRoots"> & {
     agentRoots: string[];
     skillRoots: string[];
-  }
+  };
+
+export type ResolvedGlobalConfig = DeepReadonly<
+  | ResolvedConfig<GlobalConfigV2>
+  | (ResolvedConfig<LegacyGlobalConfigV1> & Pick<BootConfig, "legacyModelImport">)
 >;
 
 export interface AvailableAgent {
   id: AgentId;
-  revision: AgentRevisionSnapshot;
+  definition: AgentDefinitionRevision;
   sources?: readonly CatalogSourceFile[];
 }
 
@@ -70,14 +79,14 @@ export async function loadCatalog(configPath: string): Promise<CatalogSnapshot> 
   const absoluteConfigPath = path.resolve(configPath);
   const configDirectory = path.dirname(absoluteConfigPath);
   const globalSource = await readGlobalConfig(absoluteConfigPath);
-  const global = loadGlobalConfig(globalSource, configDirectory);
+  const global = await loadGlobalConfig(absoluteConfigPath, configDirectory);
   const { skills, agentDirectories } = await loadGlobalResources(global);
   const available: AvailableAgent[] = [];
   const unavailable: UnavailableAgent[] = [];
 
   for (const directory of agentDirectories) {
     const result = await loadAgent(directory, global, skills);
-    if ("revision" in result) {
+    if ("definition" in result) {
       available.push(result);
     } else {
       unavailable.push(result);
@@ -94,7 +103,7 @@ export async function loadCatalog(configPath: string): Promise<CatalogSnapshot> 
   sourceFiles.set("myagent.yaml", Object.freeze({ relativePath: "myagent.yaml", content: globalSource }));
   for (const agent of isolated.available) {
     for (const source of agent.sources ?? []) sourceFiles.set(source.relativePath, source);
-    for (const skill of agent.revision.skills) {
+    for (const skill of agent.definition.skills) {
       const source = skills.sources.get(skill.name);
       if (source === undefined) throw new DomainError("active_skill_source_missing");
       const relativePath = `skills/${skill.name}/SKILL.md`;
@@ -189,12 +198,12 @@ function isolateDuplicateAgents(
   };
 }
 
-function loadGlobalConfig(
-  source: string,
+async function loadGlobalConfig(
+  configPath: string,
   configDirectory: string,
-): ResolvedGlobalConfig {
+): Promise<ResolvedGlobalConfig> {
   try {
-    const parsed = globalConfigSchema.parse(parseYaml(source));
+    const parsed = await loadBootConfig(configPath);
     return deepFreeze({
       ...parsed,
       database: {
@@ -242,12 +251,10 @@ async function loadAgent(
       fallbackId = raw.id;
     }
 
-    const config = agentConfigSchema.parse(raw);
+    const config = global.version === 1
+      ? agentConfigV1Schema.parse(raw)
+      : agentConfigV2Schema.parse(raw);
     const id = parseAgentId(config.id);
-    const model = global.models[config.model];
-    if (model === undefined) {
-      throw new Error(`unknown model: ${config.model}`);
-    }
 
     const promptPath = await confinedFile(directory, config.prompt);
     const policyPath = await confinedFile(directory, config.policy);
@@ -267,12 +274,11 @@ async function loadAgent(
       }
       return skill;
     });
-    const revision = buildRevision({
+    const definition = buildDefinition({
       id,
       config,
       prompt,
       rawPolicy: policy.rules,
-      model,
       directory,
       skills: selectedSkills,
     });
@@ -282,7 +288,7 @@ async function loadAgent(
       Object.freeze({ relativePath: `${sourcePrefix}/${relativeSourcePath(directory, promptPath)}`, content: prompt }),
       Object.freeze({ relativePath: `${sourcePrefix}/${relativeSourcePath(directory, policyPath)}`, content: policySource }),
     ];
-    return Object.freeze({ id, revision, sources: Object.freeze(sources) });
+    return Object.freeze({ id, definition, sources: Object.freeze(sources) });
   } catch (error) {
     return Object.freeze({
       sourceLabel: fallbackId,
@@ -311,18 +317,17 @@ async function confinedFile(root: string, candidate: string): Promise<string> {
   return canonicalCandidate;
 }
 
-interface BuildRevisionInput {
+interface BuildDefinitionInput {
   id: AgentId;
-  config: AgentConfig;
+  config: AgentConfigV1 | AgentConfigV2;
   prompt: string;
   rawPolicy: PolicyConfig["rules"];
-  model: ResolvedGlobalConfig["models"][string];
   directory: string;
   skills: readonly SkillSnapshot[];
 }
 
-function buildRevision(input: BuildRevisionInput): AgentRevisionSnapshot {
-  const { id, config, prompt, rawPolicy, model, directory, skills } = input;
+function buildDefinition(input: BuildDefinitionInput): AgentDefinitionRevision {
+  const { id, config, prompt, rawPolicy, directory, skills } = input;
   const policy: PolicyRule[] = rawPolicy.map((rule) => ({
     tool: rule.tool,
     effect: rule.effect,
@@ -336,7 +341,6 @@ function buildRevision(input: BuildRevisionInput): AgentRevisionSnapshot {
     agentId: id,
     displayName: config.displayName,
     prompt,
-    model,
     workspace: path.resolve(directory, config.workspace),
     skills: Object.freeze([...skills]),
     policy,
@@ -351,12 +355,14 @@ function buildRevision(input: BuildRevisionInput): AgentRevisionSnapshot {
   const contentSha256 = createHash("sha256").update(canonical).digest("hex");
   return deepFreeze({
     ...content,
-    revisionId: `rev_${contentSha256}`,
+    definitionRevisionId: `def_${contentSha256}`,
     contentSha256,
   });
 }
 
-function resolveRunLimits(overrides: AgentConfig["limits"]): RunLimits {
+function resolveRunLimits(
+  overrides: AgentConfigV1["limits"] | AgentConfigV2["limits"],
+): RunLimits {
   return {
     modelTurns: overrides.modelTurns ?? DEFAULT_RUN_LIMITS.modelTurns,
     toolCalls: overrides.toolCalls ?? DEFAULT_RUN_LIMITS.toolCalls,

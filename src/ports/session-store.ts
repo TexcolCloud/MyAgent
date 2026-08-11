@@ -1,5 +1,6 @@
-import type { RunId, SessionId } from "../domain/ids.js";
+import type { AttemptId, RunId, SessionId } from "../domain/ids.js";
 import type { JsonValue } from "../domain/json.js";
+import type { ModelFinishReason, ModelUsage } from "./model.js";
 
 export interface SessionMessage {
   messageId: string;
@@ -36,6 +37,9 @@ export type SaveSessionSummaryInput = SessionSummary;
 export interface SaveLeasedSessionSummaryInput {
   runId: RunId;
   leaseOwner: string;
+  attemptId: AttemptId;
+  finishReason: ModelFinishReason;
+  usage?: ModelUsage;
   occurredAt: Date;
   summary: SaveSessionSummaryInput;
 }

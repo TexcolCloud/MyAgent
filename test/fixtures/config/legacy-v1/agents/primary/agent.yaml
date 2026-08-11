@@ -1,0 +1,9 @@
+id: primary
+displayName: Primary
+prompt: ./not-read.md
+model: default
+workspace: ./workspace
+skills: []
+policy: ./not-read.yaml
+delegates: []
+limits: {}

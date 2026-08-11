@@ -1,0 +1,17 @@
+server:
+  bearerToken:
+    fromEnvironment: MYAGENT_BEARER_TOKEN
+  adminToken:
+    fromEnvironment: MYAGENT_ADMIN_TOKEN
+database:
+  path: ./data/kernel.db
+agentRoots:
+  - ./agents
+models:
+  default:
+    provider: openai
+    model: test-model
+    baseUrl: https://api.openai.com/v1
+    apiKey:
+      fromEnvironment: OPENAI_API_KEY
+    maxInputTokens: 32768

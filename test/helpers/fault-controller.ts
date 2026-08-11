@@ -1,18 +1,24 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import { DatabaseSync } from "node:sqlite";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
+import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
+import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { bootstrap, type BootstrappedService } from "../../src/bootstrap.js";
+import { parseAgentId } from "../../src/domain/ids.js";
 import type { JsonValue } from "../../src/domain/json.js";
 import type { FaultPoint } from "../../src/runtime/fault-injector.js";
+import { seedVerifiedChatAssignments } from "./verified-chat-model-registry.js";
 
 const EXAMPLES = fileURLToPath(new URL("../../examples", import.meta.url));
 const BEARER_TOKEN = "e2e-operator-secret";
@@ -131,9 +137,30 @@ export interface E2eFixture {
   cleanup(): Promise<void>;
 }
 
+export async function removeE2eFixtureRoot(
+  root: string,
+  options: {
+    releaseTimeoutMs?: number;
+    onClaimed?(claimedRoot: string): void | Promise<void>;
+  } = {},
+): Promise<void> {
+  const claimedRoot = await claimE2eFixtureRoot(
+    root,
+    options.releaseTimeoutMs ?? 5_000,
+  );
+  if (claimedRoot === undefined) return;
+  await options.onClaimed?.(claimedRoot);
+  await rm(claimedRoot, { recursive: true, force: true });
+}
+
 export async function prepareE2eFixture(
   baseUrl: string,
-  options: { allowRunCommand?: boolean; maxInputTokens?: number } = {},
+  options: {
+    allowRunCommand?: boolean;
+    maxInputTokens?: number;
+    modelId?: string;
+    providerApiKeyEnvironment?: string;
+  } = {},
 ): Promise<E2eFixture> {
   const root = await mkdtemp(path.join(os.tmpdir(), "myagent-e2e-"));
   const configRoot = path.join(root, "config");
@@ -145,26 +172,9 @@ export async function prepareE2eFixture(
   await Promise.all([
     mkdir(primaryWorkspace, { recursive: true }),
     mkdir(researcherWorkspace, { recursive: true }),
+    mkdir(path.dirname(databasePath), { recursive: true }),
   ]);
   await writeFile(path.join(primaryWorkspace, "evidence.txt"), "durable evidence\n", "utf8");
-
-  const config = parseYaml(await readFile(configPath, "utf8")) as {
-    models: Record<string, {
-      model: string;
-      baseUrl: string;
-      apiKey: { fromEnvironment: string };
-      maxInputTokens: number;
-    }>;
-  };
-  const model = config.models.default;
-  if (model === undefined) throw new Error("default_model_missing");
-  model.model = "test-model";
-  model.baseUrl = baseUrl;
-  model.apiKey = { fromEnvironment: "E2E_MODEL_API_KEY" };
-  if (options.maxInputTokens !== undefined) {
-    model.maxInputTokens = options.maxInputTokens;
-  }
-  await writeFile(configPath, stringifyYaml(config), "utf8");
 
   const policyPath = path.join(configRoot, "agents", "primary", "policy.yaml");
   const policy = parseYaml(await readFile(policyPath, "utf8")) as {
@@ -176,9 +186,34 @@ export async function prepareE2eFixture(
   await writeFile(policyPath, stringifyYaml(policy), "utf8");
 
   const previousBearer = process.env.MYAGENT_BEARER_TOKEN;
+  const previousAdmin = process.env.MYAGENT_ADMIN_TOKEN;
   const previousModel = process.env.E2E_MODEL_API_KEY;
   process.env.MYAGENT_BEARER_TOKEN = BEARER_TOKEN;
+  process.env.MYAGENT_ADMIN_TOKEN = "e2e-admin-token";
   process.env.E2E_MODEL_API_KEY = MODEL_SECRET;
+  const connection = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+  try {
+    migrate(connection.db);
+    seedVerifiedChatAssignments(
+      new SqliteModelRegistryRepository(connection.db),
+      [parseAgentId("primary"), parseAgentId("researcher")],
+      {
+        baseUrl,
+        providerAuth: {
+          type: "bearer",
+          secret: {
+            fromEnvironment: options.providerApiKeyEnvironment ?? "E2E_MODEL_API_KEY",
+          },
+        },
+        ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
+        ...(options.maxInputTokens === undefined
+          ? {}
+          : { maxInputTokens: options.maxInputTokens }),
+      },
+    );
+  } finally {
+    connection.close();
+  }
 
   return {
     root,
@@ -188,8 +223,9 @@ export async function prepareE2eFixture(
     researcherWorkspace,
     async cleanup(): Promise<void> {
       restoreEnvironment("MYAGENT_BEARER_TOKEN", previousBearer);
+      restoreEnvironment("MYAGENT_ADMIN_TOKEN", previousAdmin);
       restoreEnvironment("E2E_MODEL_API_KEY", previousModel);
-      await rm(root, { recursive: true, force: true });
+      await removeE2eFixtureRoot(root);
     },
   };
 }
@@ -371,10 +407,11 @@ export class FaultChildController {
 
   #child: ChildProcess | undefined;
   #completed: Promise<void> | undefined;
+  #termination: AbortController | undefined;
   #url: string | undefined;
 
   constructor(
-    private readonly fixture: Pick<E2eFixture, "configPath" | "root">,
+    private readonly fixture: Pick<E2eFixture, "configPath" | "databasePath" | "root">,
     readonly point: FaultPoint | undefined,
     private readonly modelAckMarker?: string,
   ) {
@@ -410,6 +447,7 @@ export class FaultChildController {
             `--require=${userInfoShim}`,
           ].filter(Boolean).join(" "),
           MYAGENT_FAULT_CONFIG: this.fixture.configPath,
+          MYAGENT_FAULT_DATABASE: this.fixture.databasePath,
           MYAGENT_FAULT_ARM: this.armPath,
           MYAGENT_FAULT_HIT: this.hitPath,
           MYAGENT_FAULT_READY: this.readyPath,
@@ -428,16 +466,17 @@ export class FaultChildController {
       },
     );
     this.#child = child;
+    const termination = new AbortController();
+    this.#termination = termination;
     const stderr: string[] = [];
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => stderr.push(chunk));
-    this.#completed = new Promise<void>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", (code, signal) => {
-        this.#child = undefined;
-        if (code === 0 || signal !== null) resolve();
-        else reject(new Error(`fault_child_exited:${String(code)}:${stderr.join("")}`));
-      });
+    child.once("close", () => {
+      if (this.#child === child) this.#child = undefined;
+      if (this.#termination === termination) this.#termination = undefined;
+    });
+    this.#completed = waitForFaultChildCompletion(child, this.fixture.root, stderr, {
+      terminationSignal: termination.signal,
     });
     await Promise.race([
       waitForPath(this.readyPath, 15_000),
@@ -464,14 +503,27 @@ export class FaultChildController {
   }
 
   async crash(): Promise<void> {
-    const child = this.#child;
-    if (child !== undefined) child.kill();
+    this.terminateChild();
     await this.#completed;
   }
 
   async stop(): Promise<void> {
-    if (this.#child !== undefined) this.#child.kill();
-    await this.#completed?.catch(() => undefined);
+    this.terminateChild();
+    try {
+      await this.#completed;
+    } catch (error) {
+      if (!(error instanceof FaultChildExitError)) throw error;
+    }
+  }
+
+  private terminateChild(): void {
+    const child = this.#child;
+    if (child === undefined) return;
+    try {
+      child.kill();
+    } finally {
+      this.#termination?.abort();
+    }
   }
 }
 
@@ -540,5 +592,175 @@ async function waitForPath(filePath: string, timeoutMs: number): Promise<void> {
   while (!existsSync(filePath)) {
     if (Date.now() >= deadline) throw new Error(`file_timeout:${filePath}`);
     await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+export function waitForFaultChildCompletion(
+  child: ChildProcess,
+  root: string,
+  stderr: readonly string[],
+  options: {
+    closeTimeoutMs?: number;
+    terminationSignal?: AbortSignal;
+  } = {},
+): Promise<void> {
+  const closeTimeoutMs = options.closeTimeoutMs ?? 5_000;
+  if (!Number.isSafeInteger(closeTimeoutMs) || closeTimeoutMs <= 0) {
+    return Promise.reject(new Error("invalid_fault_child_close_timeout"));
+  }
+
+  let processError: unknown;
+  return new Promise<void>((resolve, reject) => {
+    let closed = false;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+    const beginCloseDeadline = (): void => {
+      if (closed || closeTimer !== undefined) return;
+      closeTimer = setTimeout(() => {
+        options.terminationSignal?.removeEventListener("abort", beginCloseDeadline);
+        reject(new FaultChildCloseTimeoutError());
+      }, closeTimeoutMs);
+    };
+    child.once("error", (error) => {
+      processError = error;
+      beginCloseDeadline();
+    });
+    if (options.terminationSignal?.aborted === true) beginCloseDeadline();
+    else options.terminationSignal?.addEventListener("abort", beginCloseDeadline, { once: true });
+    child.once("close", (code, signal) => {
+      const terminationRequested = options.terminationSignal?.aborted === true;
+      closed = true;
+      if (closeTimer !== undefined) clearTimeout(closeTimer);
+      options.terminationSignal?.removeEventListener("abort", beginCloseDeadline);
+      void waitForE2eFixtureRootRelease(root).then(() => {
+        const requestedSigtermExit = terminationRequested &&
+          code === 128 + os.constants.signals.SIGTERM;
+        if (processError !== undefined) {
+          reject(processError);
+        } else if (code === 0 || signal !== null || requestedSigtermExit) {
+          resolve();
+        } else {
+          reject(new FaultChildExitError(code, stderr));
+        }
+      }, reject);
+    });
+  });
+}
+
+export async function waitForE2eFixtureRootRelease(
+  root: string,
+  options: {
+    releaseTimeoutMs?: number;
+    onProbed?(probeRoot: string): void | Promise<void>;
+  } = {},
+): Promise<void> {
+  if (process.platform !== "win32") return;
+  const timeoutMs = options.releaseTimeoutMs ?? 5_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("invalid_e2e_fixture_release_timeout");
+  }
+
+  const probe = `${root}.release-probe-${String(process.pid)}`;
+  if (!existsSync(root)) {
+    if (!existsSync(probe)) return;
+    await renameWithWindowsContentionRetry(
+      probe,
+      root,
+      timeoutMs,
+      "e2e_fixture_root_restore_timeout",
+      true,
+    );
+    return;
+  }
+  if (existsSync(probe)) throw new Error("e2e_fixture_release_probe_conflict");
+
+  await renameWithWindowsContentionRetry(
+    root,
+    probe,
+    timeoutMs,
+    "e2e_fixture_root_release_timeout",
+    false,
+  );
+  let probeError: unknown;
+  try {
+    await options.onProbed?.(probe);
+  } catch (error) {
+    probeError = error;
+  }
+  await renameWithWindowsContentionRetry(
+    probe,
+    root,
+    timeoutMs,
+    "e2e_fixture_root_restore_timeout",
+    true,
+  );
+  if (probeError !== undefined) throw probeError;
+}
+
+async function claimE2eFixtureRoot(
+  root: string,
+  timeoutMs: number,
+): Promise<string | undefined> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("invalid_e2e_fixture_release_timeout");
+  }
+  const claimedRoot = `${root}.cleanup-claim`;
+  if (existsSync(claimedRoot)) return claimedRoot;
+  if (!existsSync(root)) return undefined;
+  if (process.platform !== "win32") {
+    await rename(root, claimedRoot);
+    return claimedRoot;
+  }
+  await renameWithWindowsContentionRetry(
+    root,
+    claimedRoot,
+    timeoutMs,
+    "e2e_fixture_root_release_timeout",
+    false,
+  );
+  return claimedRoot;
+}
+
+async function renameWithWindowsContentionRetry(
+  source: string,
+  destination: string,
+  timeoutMs: number,
+  timeoutCode: string,
+  destinationMayExist: boolean,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await rename(source, destination);
+      return;
+    } catch (error) {
+      if (!isWindowsRenameContention(error, destinationMayExist)) throw error;
+      if (Date.now() >= deadline) throw new Error(timeoutCode, { cause: error });
+      await delay(Math.min(20, Math.max(1, deadline - Date.now())));
+    }
+  }
+}
+
+function isWindowsRenameContention(
+  error: unknown,
+  destinationMayExist: boolean,
+): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return error.code === "EPERM" ||
+    error.code === "EBUSY" ||
+    error.code === "EACCES" ||
+    (destinationMayExist && (error.code === "EEXIST" || error.code === "ENOTEMPTY"));
+}
+
+class FaultChildExitError extends Error {
+  constructor(code: number | null, stderr: readonly string[]) {
+    super(`fault_child_exited:${String(code)}:${stderr.join("")}`);
+    this.name = "FaultChildExitError";
+  }
+}
+
+class FaultChildCloseTimeoutError extends Error {
+  constructor() {
+    super("fault_child_close_timeout");
+    this.name = "FaultChildCloseTimeoutError";
   }
 }

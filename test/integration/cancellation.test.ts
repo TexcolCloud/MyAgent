@@ -29,6 +29,8 @@ import type { FaultPoint } from "../../src/runtime/fault-injector.js";
 import type { ModelChunk, ModelPort, ModelRequest } from "../../src/ports/model.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
+import { noOpProviderHealthSink } from "../helpers/provider-health.js";
+import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { completedText, ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
@@ -59,7 +61,7 @@ describe("Run cancellation", () => {
         sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000501")],
         runIds: [runId],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "cancel:running",
         input: { type: "text", text: "cancel before model I/O" },
@@ -94,6 +96,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             hookPoints.push(point);
@@ -136,7 +139,7 @@ describe("Run cancellation", () => {
         sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000502")],
         runIds: [runId],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "cancel:side-effect",
         input: { type: "text", text: "cancel the running command" },
@@ -173,6 +176,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
@@ -216,7 +220,7 @@ describe("Run cancellation", () => {
         sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000503")],
         runIds: [runId],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "cancel:read-only",
         input: { type: "text", text: "cancel the file read" },
@@ -249,6 +253,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.finalizeCancellation(runId, "cancel-worker")).toEqual({
@@ -294,7 +299,7 @@ describe("Run cancellation", () => {
         attemptIds: ["att_00000000-0000-7000-8000-000000000504" as never],
       });
       new CreateRunService(
-        new CatalogService(snapshot),
+        resolvedAgents(new CatalogService(snapshot)),
         runs,
         workerClock,
         ids,
@@ -317,6 +322,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock: workerClock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       worker = new RunWorker({
         runs,
@@ -361,7 +367,9 @@ describe("Run cancellation", () => {
     let worker: RunWorker | undefined;
     try {
       migrate(connection.db);
-      const limitedSnapshot = withModelInputLimit(snapshot, 2_000);
+      const limitedAgents = resolvedAgents(new CatalogService(snapshot), {
+        maxInputTokens: 2_000,
+      });
       const catalog = new SqliteCatalogRepository(connection.db);
       const runs = new SqliteRunRepository(connection.db, catalog);
       const sessions = new SqliteSessionRepository(connection.db);
@@ -377,7 +385,7 @@ describe("Run cancellation", () => {
         attemptIds: ["att_00000000-0000-7000-8000-000000000509" as never],
       });
       const create = new CreateRunService(
-        new CatalogService(limitedSnapshot),
+        limitedAgents,
         runs,
         workerClock,
         ids,
@@ -411,6 +419,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock: workerClock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       worker = new RunWorker({
         runs,
@@ -471,7 +480,7 @@ describe("Run cancellation", () => {
         sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000505")],
         runIds: [runId],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "cancel:known-side-effect",
         input: { type: "text", text: "cancel while the command finishes" },
@@ -486,10 +495,10 @@ describe("Run cancellation", () => {
       const occurredAt = clock.now().toISOString();
       connection.db.prepare(
         `INSERT INTO tool_calls (
-           tool_call_id, run_id, state, tool_name, effect, arguments_json,
+           tool_call_id, run_id, state, tool_name, provider_call_id, effect, arguments_json,
            canonical_arguments, arguments_sha256, policy_effect,
            policy_facts_json, created_at, updated_at
-         ) VALUES (?, ?, 'allowed', 'run_command', 'side_effect', '{}', '{}',
+         ) VALUES (?, ?, 'allowed', 'run_command', 'provider_cancel_505', 'side_effect', '{}', '{}',
            'cancel-digest', 'allow', '{}', ?, ?)`,
       ).run(toolCallId, runId, occurredAt, occurredAt);
       let startedResolve!: () => void;
@@ -526,6 +535,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids: new FakeIds(),
+        modelRegistry: noOpProviderHealthSink,
       });
       const executions = new ExecutionRegistry();
       const controller = new AbortController();
@@ -568,7 +578,7 @@ describe("Run cancellation", () => {
         runIds: [runId],
         attemptIds: ["att_00000000-0000-7000-8000-000000000506" as never],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "cancel:restart",
         input: { type: "text", text: "do not call the model after restart" },
@@ -600,6 +610,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.advance(
@@ -633,7 +644,7 @@ describe("Run cancellation", () => {
         runIds: [runId],
         attemptIds: ["att_00000000-0000-7000-8000-000000000507" as never],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "cancel:model-completion",
         input: { type: "text", text: "discard the late answer" },
@@ -662,6 +673,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             faultSnapshots.push({
@@ -736,7 +748,7 @@ describe("Run cancellation", () => {
         toolCallIds: [toolCallIdFromUuid("00000000-0000-7000-8000-000000000508")],
         attemptIds: ["att_00000000-0000-7000-8000-000000000508" as never],
       });
-      new CreateRunService(new CatalogService(snapshot), runs, clock, ids).execute({
+      new CreateRunService(resolvedAgents(new CatalogService(snapshot)), runs, clock, ids).execute({
         agentId: "primary",
         sessionKey: "cancel:normalization",
         input: { type: "text", text: "cancel while validating a tool" },
@@ -763,8 +775,13 @@ describe("Run cancellation", () => {
       const model = new ScriptedModel();
       model.script({
         chunks: [
-          { type: "tool_call", call: { name: "read_file", arguments: { path: "report.md" } } },
-          { type: "completed", finishReason: "tool_calls", usage: { inputTokens: 1, outputTokens: 1 } },
+          {
+            type: "tool_call",
+            callId: "provider_cancellation_normalization",
+            name: "read_file",
+            arguments: { path: "report.md" },
+          },
+          { type: "completed", finishReason: "tool_call", usage: { inputTokens: 1, outputTokens: 1 } },
         ],
       });
       const advance = new AdvanceRunService({
@@ -778,6 +795,7 @@ describe("Run cancellation", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await advance.advance(
@@ -820,29 +838,10 @@ class BlockingModel implements ModelPort {
     });
     yield {
       type: "completed",
-      finishReason: "stop",
+      finishReason: "completed",
       usage: { inputTokens: 0, outputTokens: 0 },
     };
   }
-}
-
-function withModelInputLimit(
-  snapshot: CatalogSnapshot,
-  maxInputTokens: number,
-): CatalogSnapshot {
-  const available = snapshot.available.map((agent) => ({
-    ...agent,
-    revision: {
-      ...agent.revision,
-      revisionId: `rev_model_input_${String(maxInputTokens)}`,
-      model: { ...agent.revision.model, maxInputTokens },
-    },
-  }));
-  return {
-    ...snapshot,
-    available,
-    byId: new Map(available.map((agent) => [agent.id, agent])),
-  };
 }
 
 class CompletingAfterAbortModel implements ModelPort {
@@ -869,7 +868,7 @@ class CompletingAfterAbortModel implements ModelPort {
     yield { type: "text_delta", text: "late answer" };
     yield {
       type: "completed",
-      finishReason: "stop",
+      finishReason: "completed",
       usage: { inputTokens: 10, outputTokens: 2 },
     };
   }

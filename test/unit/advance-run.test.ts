@@ -9,31 +9,43 @@ import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { SqliteRunRepository } from "../../src/adapters/sqlite/run-repository.js";
 import { SqliteSessionRepository } from "../../src/adapters/sqlite/session-repository.js";
 import { SqliteToolRepository } from "../../src/adapters/sqlite/tool-repository.js";
-import { AdvanceRunService } from "../../src/application/advance-run.js";
+import {
+  AdvanceRunService,
+  type AdvanceRunServiceOptions,
+} from "../../src/application/advance-run.js";
 import { CreateRunService } from "../../src/application/create-run.js";
 import { PolicyEngine } from "../../src/application/policy-engine.js";
 import { PromptAssembler } from "../../src/application/prompt-assembler.js";
 import { ToolRegistry } from "../../src/adapters/tools/registry.js";
 import { readFileTool } from "../../src/adapters/tools/read-file.js";
 import { loadCatalog, type CatalogSnapshot } from "../../src/config/catalog-loader.js";
-import { CatalogService } from "../../src/config/catalog-service.js";
+import type {
+  AgentDefinitionRevision,
+  AgentResolverPort,
+  AgentRevisionSnapshot,
+} from "../../src/domain/agent-revision.js";
 import {
   attemptIdFromUuid,
   approvalIdFromUuid,
+  modelProfileRevisionIdFromUuid,
+  providerConnectionRevisionIdFromUuid,
   runIdFromUuid,
   sessionIdFromUuid,
   toolCallIdFromUuid,
 } from "../../src/domain/ids.js";
 import {
   ModelProviderError,
+  type ModelChunk,
   type ModelPort,
   type ModelRequest,
 } from "../../src/ports/model.js";
+import type { RecordProviderHealthInput } from "../../src/ports/model-registry-store.js";
 import type { ToolStore } from "../../src/ports/tool-store.js";
 import type { FaultInjector, FaultPoint } from "../../src/runtime/fault-injector.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
+import { noOpProviderHealthSink } from "../helpers/provider-health.js";
 import { completedText, ScriptedModel, transientFailureAfter } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
@@ -43,6 +55,14 @@ describe("AdvanceRunService", () => {
   beforeAll(async () => {
     catalogSnapshot = await loadCatalog(
       path.resolve("test/fixtures/config/valid/myagent.yaml"),
+    );
+  });
+
+  it("requires a Provider Health sink at composition", () => {
+    expect(() => new AdvanceRunService({
+      modelRegistry: undefined,
+    } as unknown as AdvanceRunServiceOptions)).toThrow(
+      "provider_health_sink_required",
     );
   });
 
@@ -68,7 +88,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -86,6 +106,7 @@ describe("AdvanceRunService", () => {
         new Date(clock.now().getTime() + 30_000),
       )?.runId).toBe(created.runId);
       const model = new ScriptedModel();
+      const health: RecordProviderHealthInput[] = [];
       model.script(
         transientFailureAfter(
           "discard me",
@@ -108,6 +129,11 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: {
+          recordProviderHealth(input): void {
+            health.push(input);
+          },
+        },
       });
 
       const outcome = await service.advance(
@@ -128,6 +154,28 @@ describe("AdvanceRunService", () => {
           .listMessagesThroughRun(created.sessionId, 0)
           .filter((message) => message.role === "assistant"),
       ).toEqual([expect.objectContaining({ content: "final answer" })]);
+      expect(health).toEqual([
+        expect.objectContaining({
+          connectionRevisionId: providerConnectionRevisionIdFromUuid(
+            "00000000-0000-7000-8000-000000000001",
+          ),
+          profileRevisionId: modelProfileRevisionIdFromUuid(
+            "00000000-0000-7000-8000-000000000001",
+          ),
+          outcome: "failure",
+          code: "provider_overloaded",
+          safeStatus: 503,
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000001",
+          ),
+        }),
+        expect.objectContaining({
+          outcome: "success",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000002",
+          ),
+        }),
+      ]);
     } finally {
       connection.close();
     }
@@ -153,7 +201,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000011")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -183,11 +231,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "./report.md" } },
+            callId: "call_provider_11",
+            name: "read_file",
+            arguments: { path: "./report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 12, outputTokens: 4 },
           },
         ],
@@ -203,6 +253,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await service.advance(
@@ -212,12 +263,117 @@ describe("AdvanceRunService", () => {
       )).toEqual({ type: "advanced", runId: created.runId });
       expect(tools.getLatestForRun(created.runId)).toMatchObject({
         state: "allowed",
+        providerCallId: "call_provider_11",
         toolName: "read_file",
         arguments: { path: "report.md" },
       });
       expect(fakeTool.executions).toBe(0);
       expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
         .toEqual(expect.arrayContaining(["tool.proposed", "tool.policy_decided"]));
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("fails the provider attempt before recording health for a malformed call ID", async () => {
+    const connection = openDatabase({
+      path: tempPath("advance-malformed-provider-call-id.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const runs = new SqliteRunRepository(
+        connection.db,
+        new SqliteCatalogRepository(connection.db),
+      );
+      const sessions = new SqliteSessionRepository(connection.db);
+      const tools = new SqliteToolRepository(connection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const attemptId = attemptIdFromUuid(
+        "00000000-0000-7000-8000-000000000012",
+      );
+      const ids = new FakeIds({
+        sessionIds: [
+          sessionIdFromUuid("00000000-0000-7000-8000-000000000012"),
+        ],
+        runIds: [
+          runIdFromUuid("00000000-0000-7000-8000-000000000012"),
+        ],
+        attemptIds: [attemptId],
+      });
+      const created = new CreateRunService(
+        resolvedAgents(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:malformed-provider-call-id",
+        input: { type: "text", text: "propose a Tool" },
+        idempotencyKey: "advance-malformed-call-id-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const registry = new ToolRegistry();
+      registry.register(new FakeTool({
+        name: "read_file",
+        effect: "read_only",
+        normalizedArguments: { path: "report.md" },
+      }));
+      const model = new ScriptedModel();
+      model.script({
+        chunks: [
+          {
+            type: "tool_call",
+            callId: "call provider invalid",
+            name: "read_file",
+            arguments: { path: "report.md" },
+          },
+          { type: "completed", finishReason: "tool_call" },
+        ],
+      });
+      const health: RecordProviderHealthInput[] = [];
+      const service = new AdvanceRunService({
+        runs,
+        tools,
+        approvals: new SqliteApprovalRepository(connection.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        modelRegistry: {
+          recordProviderHealth(input): void {
+            health.push(input);
+          },
+        },
+      });
+
+      expect(await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).toEqual({ type: "terminal", runId: created.runId, state: "failed" });
+      expect(runs.getRun(created.runId)).toMatchObject({
+        state: "failed",
+        failure: { code: "model_protocol_error" },
+      });
+      expect(runs.getUnmatchedModelAttempt(created.runId)).toBeNull();
+      expect(tools.listForRun(created.runId)).toEqual([]);
+      expect(health).toEqual([
+        expect.objectContaining({
+          outcome: "failure",
+          code: "model_protocol_error",
+          traceId: attemptId,
+        }),
+      ]);
     } finally {
       connection.close();
     }
@@ -245,7 +401,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -270,11 +426,13 @@ describe("AdvanceRunService", () => {
           chunks: [
             {
               type: "tool_call",
-              call: { name: "read_file", arguments: { path: 42 } },
+              callId: "call_provider_181",
+              name: "read_file",
+              arguments: { path: 42 },
             },
             {
               type: "completed",
-              finishReason: "tool_calls",
+              finishReason: "tool_call",
               usage: { inputTokens: 10, outputTokens: 2 },
             },
           ],
@@ -292,6 +450,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await expect(service.advance(
@@ -313,10 +472,12 @@ describe("AdvanceRunService", () => {
         new AbortController().signal,
       )).resolves.toMatchObject({ type: "terminal", state: "completed" });
       expect(
-        model.requests[1]?.messages.find((message) =>
-          message.name === "tool_results"
-        )?.content,
-      ).toContain("invalid_tool_arguments");
+        model.requests[1]?.input.find((entry) => entry.type === "tool_result"),
+      ).toMatchObject({
+        callId: "call_provider_181",
+        name: "read_file",
+        output: { code: "invalid_tool_arguments" },
+      });
     } finally {
       connection.close();
     }
@@ -342,7 +503,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000021")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot), runs, clock, ids,
+        resolvedAgents(catalogSnapshot), runs, clock, ids,
       ).execute({
         agentId: "primary", sessionKey: "unit:allowed-execution",
         input: { type: "text", text: "read the report" },
@@ -358,12 +519,13 @@ describe("AdvanceRunService", () => {
       registry.register(fakeTool);
       const model = new ScriptedModel();
       model.script({ chunks: [
-        { type: "tool_call", call: { name: "read_file", arguments: { path: "report.md" } } },
-        { type: "completed", finishReason: "tool_calls", usage: { inputTokens: 12, outputTokens: 4 } },
+        { type: "tool_call", callId: "call_provider_31", name: "read_file", arguments: { path: "report.md" } },
+        { type: "completed", finishReason: "tool_call", usage: { inputTokens: 12, outputTokens: 4 } },
       ] });
       const service = new AdvanceRunService({
         runs, tools, approvals, sessions, model, prompts: new PromptAssembler(sessions),
         registry, policy: new PolicyEngine(), clock, ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(created.runId, "worker-unit", new AbortController().signal);
@@ -375,6 +537,119 @@ describe("AdvanceRunService", () => {
         .toEqual(expect.arrayContaining(["tool.started", "tool.completed"]));
     } finally {
       connection.close();
+    }
+  });
+
+  it("fails a pre-migration null root call ID before side effects and across restart", async () => {
+    const databasePath = tempPath("advance-null-root-preflight.db");
+    const runId = runIdFromUuid("00000000-0000-7000-8000-000000000031");
+    const fakeTool = new FakeTool({
+      name: "write_file",
+      effect: "side_effect",
+      normalizedArguments: { path: "report.md", content: "unsafe" },
+    });
+    const firstConnection = openDatabase({
+      path: databasePath,
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(firstConnection.db);
+      const catalog = new SqliteCatalogRepository(firstConnection.db);
+      const runs = new SqliteRunRepository(firstConnection.db, catalog);
+      const sessions = new SqliteSessionRepository(firstConnection.db);
+      const tools = new SqliteToolRepository(firstConnection.db);
+      const clock = new FakeClock(new Date("2026-08-07T00:00:00.000Z"));
+      const ids = new FakeIds({
+        sessionIds: [
+          sessionIdFromUuid("00000000-0000-7000-8000-000000000031"),
+        ],
+        runIds: [runId],
+        toolCallIds: [
+          toolCallIdFromUuid("00000000-0000-7000-8000-000000000031"),
+        ],
+      });
+      const created = new CreateRunService(
+        resolvedAgents(catalogSnapshot),
+        runs,
+        clock,
+        ids,
+      ).execute({
+        agentId: "primary",
+        sessionKey: "unit:null-root-preflight",
+        input: { type: "text", text: "must not execute" },
+        idempotencyKey: "advance-null-root-0001",
+        source: { kind: "http" },
+      });
+      clock.advanceBy(1_000);
+      runs.claimNextEligible(
+        "worker-unit",
+        clock.now(),
+        new Date(clock.now().getTime() + 30_000),
+      );
+      const toolCallId = ids.toolCallId();
+      firstConnection.db.prepare(
+        `INSERT INTO tool_calls (
+           tool_call_id, run_id, state, tool_name, provider_call_id, effect,
+           arguments_json, canonical_arguments, arguments_sha256,
+           policy_effect, matched_rule, policy_facts_json, created_at, updated_at
+         ) VALUES (?, ?, 'allowed', 'write_file', NULL, 'side_effect',
+           ?, ?, ?, 'allow', 0, '{}', ?, ?)`,
+      ).run(
+        toolCallId,
+        created.runId,
+        "{\"content\":\"unsafe\",\"path\":\"report.md\"}",
+        "{\"content\":\"unsafe\",\"path\":\"report.md\"}",
+        "3".repeat(64),
+        clock.now().toISOString(),
+        clock.now().toISOString(),
+      );
+      firstConnection.db.prepare(
+        "UPDATE runs SET tool_call_count = 1 WHERE run_id = ?",
+      ).run(created.runId);
+      const registry = new ToolRegistry();
+      registry.register(fakeTool);
+      const service = new AdvanceRunService({
+        runs,
+        tools,
+        approvals: new SqliteApprovalRepository(firstConnection.db),
+        sessions,
+        model: new ScriptedModel(),
+        prompts: new PromptAssembler(sessions),
+        registry,
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        modelRegistry: { recordProviderHealth(): void {} },
+      });
+
+      expect(await service.advance(
+        created.runId,
+        "worker-unit",
+        new AbortController().signal,
+      )).toEqual({ type: "terminal", runId: created.runId, state: "failed" });
+      expect(fakeTool.executions).toBe(0);
+      expect(runs.getRun(created.runId)).toMatchObject({
+        state: "failed",
+        failure: { code: "model_protocol_error" },
+      });
+    } finally {
+      firstConnection.close();
+    }
+
+    const restarted = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    try {
+      migrate(restarted.db);
+      const runs = new SqliteRunRepository(
+        restarted.db,
+        new SqliteCatalogRepository(restarted.db),
+      );
+      expect(runs.getRun(runId)).toMatchObject({
+        state: "failed",
+        failure: { code: "model_protocol_error" },
+      });
+      expect(fakeTool.executions).toBe(0);
+    } finally {
+      restarted.close();
     }
   });
 
@@ -395,7 +670,7 @@ describe("AdvanceRunService", () => {
         approvalIds: [approvalIdFromUuid("00000000-0000-7000-8000-000000000041")],
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000041")],
       });
-      const created = new CreateRunService(new CatalogService(catalogSnapshot), runs, clock, ids).execute({
+      const created = new CreateRunService(resolvedAgents(catalogSnapshot), runs, clock, ids).execute({
         agentId: "primary", sessionKey: "unit:approval", input: { type: "text", text: "run" },
         idempotencyKey: "advance-approval-0001", source: { kind: "http" },
       });
@@ -405,12 +680,13 @@ describe("AdvanceRunService", () => {
       registry.register(new FakeTool({ name: "run_command", effect: "side_effect", normalizedArguments: { command: "echo hi" } }));
       const model = new ScriptedModel();
       model.script({ chunks: [
-        { type: "tool_call", call: { name: "run_command", arguments: { command: "echo hi" } } },
-        { type: "completed", finishReason: "tool_calls", usage: { inputTokens: 10, outputTokens: 2 } },
+        { type: "tool_call", callId: "call_provider_41", name: "run_command", arguments: { command: "echo hi" } },
+        { type: "completed", finishReason: "tool_call", usage: { inputTokens: 10, outputTokens: 2 } },
       ] });
       const service = new AdvanceRunService({
         runs, tools, approvals, sessions, model, prompts: new PromptAssembler(sessions), registry,
         policy: new PolicyEngine(), clock, ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await service.advance(created.runId, "worker-unit", new AbortController().signal))
@@ -448,7 +724,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -478,14 +754,13 @@ describe("AdvanceRunService", () => {
           chunks: [
             {
               type: "tool_call",
-              call: {
-                name: "delete_everything",
-                arguments: { confirmed: true },
-              },
+              callId: "call_provider_61",
+              name: "delete_everything",
+              arguments: { confirmed: true },
             },
             {
               type: "completed",
-              finishReason: "tool_calls",
+              finishReason: "tool_call",
               usage: { inputTokens: 10, outputTokens: 2 },
             },
           ],
@@ -503,6 +778,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(
@@ -524,10 +800,12 @@ describe("AdvanceRunService", () => {
         state: "completed",
       });
       expect(
-        model.requests[1]?.messages.find(
-          (message) => message.name === "tool_results",
-        )?.content,
-      ).toContain("tool_denied");
+        model.requests[1]?.input.find((entry) => entry.type === "tool_result"),
+      ).toMatchObject({
+        callId: "call_provider_61",
+        name: "delete_everything",
+        output: { code: "tool_denied" },
+      });
       expect(deniedTool.executions).toBe(0);
     } finally {
       connection.close();
@@ -554,7 +832,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000071")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -585,6 +863,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       expect(await service.advance(
@@ -623,7 +902,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000081")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -653,11 +932,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_68",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -673,6 +954,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       await service.advance(
         created.runId,
@@ -716,7 +998,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000091")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -750,11 +1032,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_76",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -770,6 +1054,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             if (point === "after_model_attempt_commit") throw crash;
@@ -814,7 +1099,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000092")],
       });
       const created = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -850,11 +1135,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_86",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -870,6 +1157,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(
@@ -921,7 +1209,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000093")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -952,11 +1240,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_96",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -972,6 +1262,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(
@@ -1050,7 +1341,7 @@ describe("AdvanceRunService", () => {
           attemptIds: [attemptIdFromUuid(uuid)],
         });
         const created = new CreateRunService(
-          new CatalogService(catalogSnapshot),
+          resolvedAgents(catalogSnapshot),
           runs,
           clock,
           ids,
@@ -1086,11 +1377,13 @@ describe("AdvanceRunService", () => {
           chunks: [
             {
               type: "tool_call",
-              call: { name: "read_file", arguments: { path: "report.md" } },
+              callId: `call_provider_${startState}`,
+              name: "read_file",
+              arguments: { path: "report.md" },
             },
             {
               type: "completed",
-              finishReason: "tool_calls",
+              finishReason: "tool_call",
               usage: { inputTokens: 10, outputTokens: 2 },
             },
           ],
@@ -1106,6 +1399,7 @@ describe("AdvanceRunService", () => {
           policy: new PolicyEngine(),
           clock,
           ids,
+          modelRegistry: noOpProviderHealthSink,
         });
 
         await service.advance(
@@ -1151,7 +1445,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000101")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1180,14 +1474,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: {
-              name: "activate_skill",
-              arguments: { skillName: "research" },
-            },
+            callId: "call_provider_119",
+            name: "activate_skill",
+            arguments: { skillName: "research" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -1203,6 +1496,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await service.advance(
@@ -1237,6 +1531,7 @@ describe("AdvanceRunService", () => {
       const durableTools = new SqliteToolRepository(connection.db);
       const tools: ToolStore = {
         getLatestForRun: (runId) => durableTools.getLatestForRun(runId),
+        listForRun: (runId) => durableTools.listForRun(runId),
         recordProposal: (input) => durableTools.recordProposal(input),
         beginExecution: (input) => durableTools.beginExecution(input),
         completeExecution: () => {
@@ -1254,7 +1549,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000111")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1283,14 +1578,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: {
-              name: "activate_skill",
-              arguments: { skillName: "research" },
-            },
+            callId: "call_provider_130",
+            name: "activate_skill",
+            arguments: { skillName: "research" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -1306,6 +1600,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       await service.advance(
         created.runId,
@@ -1343,7 +1638,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000121")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1372,6 +1667,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       const advancing = service.advance(
@@ -1422,7 +1718,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const create = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -1451,6 +1747,7 @@ describe("AdvanceRunService", () => {
         new Date(clock.now().getTime() + 30_000),
       );
       const model = new ScriptedModel();
+      const health: RecordProviderHealthInput[] = [];
       model.script(
         {
           chunks: [],
@@ -1490,6 +1787,11 @@ describe("AdvanceRunService", () => {
         clock,
         ids,
         faults,
+        modelRegistry: {
+          recordProviderHealth(input): void {
+            health.push(input);
+          },
+        },
       });
 
       expect(await service.advance(
@@ -1535,6 +1837,31 @@ describe("AdvanceRunService", () => {
         .toHaveLength(3);
       expect(eventTypes.filter((type) => type === "model.attempt.failed"))
         .toHaveLength(1);
+      expect(health.map(({ outcome, code, traceId }) => ({
+        outcome,
+        ...(code === undefined ? {} : { code }),
+        traceId,
+      }))).toEqual([
+        {
+          outcome: "failure",
+          code: "provider_overloaded",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000131",
+          ),
+        },
+        {
+          outcome: "success",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000132",
+          ),
+        },
+        {
+          outcome: "success",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000133",
+          ),
+        },
+      ]);
     } finally {
       connection.close();
     }
@@ -1556,6 +1883,7 @@ describe("AdvanceRunService", () => {
       });
       const tools: ToolStore = {
         getLatestForRun: (runId) => durableTools.getLatestForRun(runId),
+        listForRun: (runId) => durableTools.listForRun(runId),
         recordProposal: () => {
           throw busyError;
         },
@@ -1572,7 +1900,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000151")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1601,11 +1929,13 @@ describe("AdvanceRunService", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "call_provider_161",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -1621,6 +1951,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
 
       await expect(service.advance(
@@ -1657,7 +1988,7 @@ describe("AdvanceRunService", () => {
         ],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1698,6 +2029,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             if (point !== "after_model_attempt_commit") return;
@@ -1747,7 +2079,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000145")],
       });
       const create = new CreateRunService(
-        new CatalogService(snapshot),
+        snapshot,
         runs,
         clock,
         ids,
@@ -1776,6 +2108,7 @@ describe("AdvanceRunService", () => {
         new Date(clock.now().getTime() + 30_000),
       );
       const model = new ScriptedModel();
+      const health: RecordProviderHealthInput[] = [];
       model.script({
         chunks: [],
         error: new ModelProviderError({
@@ -1796,6 +2129,11 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: {
+          recordProviderHealth(input): void {
+            health.push(input);
+          },
+        },
         faults: {
           async hit(point): Promise<void> {
             if (point === "after_model_attempt_commit") throw crash;
@@ -1814,6 +2152,15 @@ describe("AdvanceRunService", () => {
       expect(sessions.getCurrentSummary(created.sessionId)).toBeNull();
       expect(runs.listEventsAfter(created.runId, 0).map((event) => event.type))
         .toEqual(expect.arrayContaining(["model.attempt.failed", "run.failed"]));
+      expect(health).toEqual([
+        expect.objectContaining({
+          outcome: "failure",
+          code: "provider_request_invalid",
+          traceId: attemptIdFromUuid(
+            "00000000-0000-7000-8000-000000000145",
+          ),
+        }),
+      ]);
     } finally {
       connection.close();
     }
@@ -1836,7 +2183,7 @@ describe("AdvanceRunService", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000141")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(catalogSnapshot),
         runs,
         clock,
         ids,
@@ -1874,6 +2221,7 @@ describe("AdvanceRunService", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
         faults: {
           async hit(point): Promise<void> {
             if (point === "after_model_attempt_commit") throw crash;
@@ -1904,39 +2252,72 @@ describe("AdvanceRunService", () => {
 function withLimits(
   snapshot: CatalogSnapshot,
   revisionId: string,
-  limits: Partial<CatalogSnapshot["available"][number]["revision"]["limits"]>,
-): CatalogSnapshot {
-  const available = snapshot.available.map((agent) => ({
-    ...agent,
-    revision: {
-      ...agent.revision,
+  limits: Partial<AgentRevisionSnapshot["limits"]>,
+): Pick<AgentResolverPort, "resolve"> {
+  return resolvedAgents(snapshot, (revision) => ({
+      ...revision,
       revisionId: `rev_${revisionId}`,
-      limits: { ...agent.revision.limits, ...limits },
-    },
+      limits: { ...revision.limits, ...limits },
   }));
-  return {
-    ...snapshot,
-    available,
-    byId: new Map(available.map((agent) => [agent.id, agent])),
-  };
 }
 
 function withModelInputLimit(
   snapshot: CatalogSnapshot,
   maxInputTokens: number,
-): CatalogSnapshot {
-  const available = snapshot.available.map((agent) => ({
-    ...agent,
-    revision: {
-      ...agent.revision,
+): Pick<AgentResolverPort, "resolve"> {
+  return resolvedAgents(snapshot, (revision) => ({
+      ...revision,
       revisionId: `rev_model_input_${String(maxInputTokens)}`,
-      model: { ...agent.revision.model, maxInputTokens },
-    },
+      model: { ...revision.model, maxInputTokens },
   }));
+}
+
+function resolvedAgents(
+  snapshot: CatalogSnapshot,
+  transform: (revision: AgentRevisionSnapshot) => AgentRevisionSnapshot =
+    (revision) => revision,
+): Pick<AgentResolverPort, "resolve"> {
+  const revisions = new Map(snapshot.available.map(({ id, definition }) => [
+    id,
+    transform(resolvedRevision(definition)),
+  ]));
   return {
-    ...snapshot,
-    available,
-    byId: new Map(available.map((agent) => [agent.id, agent])),
+    resolve(agentId) {
+      const revision = revisions.get(agentId);
+      if (revision === undefined) throw new Error("agent_unavailable");
+      return revision;
+    },
+  };
+}
+
+function resolvedRevision(
+  definition: AgentDefinitionRevision,
+): AgentRevisionSnapshot {
+  return {
+    ...definition,
+    revisionId: `rev_${definition.agentId}`,
+    definitionRevisionId: definition.definitionRevisionId,
+    modelProfileRevisionId: modelProfileRevisionIdFromUuid(
+      "00000000-0000-7000-8000-000000000001",
+    ),
+    model: {
+      providerConnectionRevisionId: providerConnectionRevisionIdFromUuid(
+        "00000000-0000-7000-8000-000000000001",
+      ),
+      providerKind: "openai_compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      providerAuth: {
+        type: "bearer",
+        secret: { fromEnvironment: "MODEL_API_KEY" },
+      },
+      allowInsecureHttp: false,
+      modelId: "test-model",
+      invocationProtocol: "chat_completions",
+      maxInputTokens: 32_768,
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      compatibilityPresetVersion: "test-v1",
+    },
+    contentSha256: definition.contentSha256,
   };
 }
 
@@ -1963,14 +2344,7 @@ class PausedCompletionModel implements ModelPort {
   async *streamAttempt(
     request: ModelRequest,
     signal: AbortSignal,
-  ): AsyncIterable<
-    | { type: "text_delta"; text: string }
-    | {
-        type: "completed";
-        finishReason: string;
-        usage: { inputTokens: number; outputTokens: number };
-      }
-  > {
+  ): AsyncIterable<ModelChunk> {
     signal.throwIfAborted();
     this.requests.push(request);
     yield { type: "text_delta", text: "first chunk" };
@@ -1979,7 +2353,7 @@ class PausedCompletionModel implements ModelPort {
     signal.throwIfAborted();
     yield {
       type: "completed",
-      finishReason: "stop",
+      finishReason: "completed",
       usage: { inputTokens: 10, outputTokens: 2 },
     };
   }

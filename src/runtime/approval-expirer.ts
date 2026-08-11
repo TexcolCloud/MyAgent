@@ -8,23 +8,49 @@ export interface ExpiredApprovalStore {
   decide(input: { approvalId: ApprovalId; decision: "expire"; occurredAt: Date }): unknown;
 }
 
+export interface ApprovalExpirerOptions {
+  readonly approvals: ExpiredApprovalStore;
+  readonly clock: Clock;
+  readonly onFatalError?: (error: unknown) => void;
+}
+
 export class ApprovalExpirer {
   private controller: AbortController | undefined;
   private loop: Promise<void> | undefined;
+  private fatalFailures: unknown[] = [];
+  private running = false;
 
-  constructor(private readonly options: { approvals: ExpiredApprovalStore; clock: Clock }) {}
+  constructor(private readonly options: ApprovalExpirerOptions) {}
 
   start(): void {
     if (this.loop !== undefined) return;
+    this.running = true;
+    this.fatalFailures = [];
     this.controller = new AbortController();
-    this.loop = this.run(this.controller.signal);
+    this.loop = this.run(this.controller.signal).catch((error: unknown) => {
+      this.fatalFailures.push(error);
+      this.running = false;
+      try {
+        this.options.onFatalError?.(error);
+      } catch (reportingError) {
+        this.fatalFailures.push(reportingError);
+      }
+    });
+  }
+
+  isHealthy(): boolean {
+    return this.running && this.fatalFailures.length === 0;
   }
 
   async stop(): Promise<void> {
+    this.running = false;
     this.controller?.abort();
     await this.loop;
     this.controller = undefined;
     this.loop = undefined;
+    const failure = this.fatalFailures[0];
+    this.fatalFailures = [];
+    if (failure !== undefined) throw failure;
   }
 
   async scan(): Promise<void> {

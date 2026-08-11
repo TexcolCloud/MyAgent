@@ -1,6 +1,12 @@
 import type { FastifyBaseLogger, FastifyLogFn } from "fastify";
 
-import { redact, secrets, type RedactionPolicy } from "./redactor.js";
+import {
+  MutableDynamicRedactionRegistry,
+  redact,
+  secrets,
+  type DynamicRedactionRegistry,
+  type RedactionOptions,
+} from "./redactor.js";
 
 const PAYLOAD_KEYS = [
   "modelInput",
@@ -19,13 +25,16 @@ export const PRODUCT_TELEMETRY_ENABLED = false;
 
 export interface StructuredLoggerOptions {
   secretValues?: readonly string[];
+  redactionRegistry?: DynamicRedactionRegistry;
   sensitiveKeys?: readonly string[];
   write?: (line: string) => void;
   now?: () => Date;
 }
 
 interface LoggerSharedState {
-  policy: RedactionPolicy;
+  staticSecretValues: readonly string[];
+  redactionRegistry: DynamicRedactionRegistry;
+  redactionOptions: RedactionOptions;
   write: (line: string) => void;
   now: () => Date;
 }
@@ -34,9 +43,11 @@ export function createStructuredLogger(
   options: StructuredLoggerOptions = {},
 ): FastifyBaseLogger {
   const shared: LoggerSharedState = {
-    policy: secrets(options.secretValues ?? [], {
+    staticSecretValues: Object.freeze([...(options.secretValues ?? [])]),
+    redactionRegistry: options.redactionRegistry ?? new MutableDynamicRedactionRegistry(),
+    redactionOptions: {
       sensitiveKeys: [...PAYLOAD_KEYS, ...(options.sensitiveKeys ?? [])],
-    }),
+    },
     write: options.write ?? ((line) => { process.stdout.write(`${line}\n`); }),
     now: options.now ?? (() => new Date()),
   };
@@ -67,13 +78,17 @@ class StructuredLogger implements FastifyBaseLogger {
     return ((...argumentsList: unknown[]) => {
       try {
         const { fields, message } = normalizeArguments(argumentsList);
+        const policy = secrets([
+          ...this.shared.staticSecretValues,
+          ...this.shared.redactionRegistry.values(),
+        ], this.shared.redactionOptions);
         const event = redact({
           ...this.bindings,
           ...fields,
           level,
           time: this.shared.now().toISOString(),
           ...(message === undefined ? {} : { message }),
-        }, this.shared.policy);
+        }, policy);
         this.shared.write(JSON.stringify(event));
       } catch {
         // Logging must not change application control flow.

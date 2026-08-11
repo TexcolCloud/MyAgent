@@ -16,8 +16,8 @@ function agentsResponse(snapshot: CatalogSnapshot) {
   return agentsResponseSchema.parse({
     agents: snapshot.available.map((agent) => ({
       id: agent.id,
-      revisionId: agent.revision.revisionId,
-      displayName: agent.revision.displayName,
+      revisionId: agent.definition.definitionRevisionId,
+      displayName: agent.definition.displayName,
     })),
     unavailable: snapshot.unavailable.map((agent) => ({
       label: agent.sourceLabel,

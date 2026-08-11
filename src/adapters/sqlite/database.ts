@@ -10,6 +10,22 @@ export interface SqliteDatabase {
   close(): void;
 }
 
+export function withImmediateTransaction<Result>(
+  database: DatabaseSync,
+  operation: () => Result,
+): Result {
+  if (database.isTransaction) return operation();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = operation();
+    database.exec("COMMIT");
+    return result;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 export function openDatabase(options: OpenDatabaseOptions): SqliteDatabase {
   if (!Number.isSafeInteger(options.busyTimeoutMs) || options.busyTimeoutMs <= 0) {
     throw new Error("invalid_busy_timeout");

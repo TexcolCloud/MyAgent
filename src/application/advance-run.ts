@@ -1,17 +1,21 @@
 import type { RunId } from "../domain/ids.js";
 import { DomainError } from "../domain/errors.js";
+import type { AgentRevisionSnapshot } from "../domain/agent-revision.js";
 import type { JsonValue } from "../domain/json.js";
 import type { RunState } from "../domain/states.js";
+import { parseProviderCallId } from "../domain/tool-call.js";
 import type { ApprovalStore } from "../ports/approval-store.js";
 import type { Clock } from "../ports/clock.js";
 import type { IdGenerator } from "../ports/id-generator.js";
 import {
   ModelProviderError,
   type ModelChunk,
+  type ModelFinishReason,
   type ModelPort,
   type ModelRequest,
   type ModelUsage,
 } from "../ports/model.js";
+import type { ModelRegistryStore } from "../ports/model-registry-store.js";
 import type { RunStore } from "../ports/run-store.js";
 import type { SessionStore } from "../ports/session-store.js";
 import type { ToolStore } from "../ports/tool-store.js";
@@ -24,7 +28,10 @@ import type { ToolRegistry } from "../adapters/tools/registry.js";
 import { noFaults, type FaultInjector } from "../runtime/fault-injector.js";
 import { DeltaBuffer } from "./delta-buffer.js";
 import type { PolicyEngine } from "./policy-engine.js";
-import type { PromptAssembler } from "./prompt-assembler.js";
+import {
+  completedToolResults,
+  type PromptAssembler,
+} from "./prompt-assembler.js";
 import { SessionSummarizer } from "./session-summarizer.js";
 import {
   normalizeToolProposal,
@@ -59,14 +66,15 @@ export interface AdvanceRunServiceOptions {
   policy: PolicyEngine;
   clock: Clock;
   ids: IdGenerator;
+  modelRegistry: Pick<ModelRegistryStore, "recordProviderHealth">;
   faults?: FaultInjector;
 }
 
 interface CompletedAttempt {
   text: string;
-  finishReason: string;
-  usage: ModelUsage;
-  toolCall?: Extract<ModelChunk, { type: "tool_call" }>["call"];
+  finishReason: ModelFinishReason;
+  usage: ModelUsage | undefined;
+  toolCall?: Extract<ModelChunk, { type: "tool_call" }>;
 }
 
 export class AdvanceRunService {
@@ -74,6 +82,9 @@ export class AdvanceRunService {
   private readonly faults: FaultInjector;
 
   constructor(private readonly options: AdvanceRunServiceOptions) {
+    if (options.modelRegistry === undefined) {
+      throw new Error("provider_health_sink_required");
+    }
     this.faults = options.faults ?? noFaults;
   }
 
@@ -115,9 +126,6 @@ export class AdvanceRunService {
       if (cancellation === null) throw new DomainError("run_cancellation_not_requested");
       return cancellation;
     }
-    if (this.options.approvals.getPendingForRun(runId) !== null) {
-      return { type: "waiting", runId, state: "waiting_approval" };
-    }
     if (this.options.runs.getUnmatchedModelAttempt(runId) !== null) {
       const recovered = await this.commitModelAttempt(() =>
         this.options.runs.recoverUnmatchedModelAttempt({
@@ -128,7 +136,26 @@ export class AdvanceRunService {
       );
       if (recovered !== null) return { type: "advanced", runId };
     }
-    const latestTool = this.options.tools.getLatestForRun(runId);
+    const toolCalls = this.options.tools.listForRun(runId);
+    let toolResults: ReturnType<typeof completedToolResults>;
+    try {
+      toolResults = completedToolResults(toolCalls);
+    } catch (error) {
+      if (!(error instanceof DomainError) || error.code !== "model_protocol_error") {
+        throw error;
+      }
+      this.options.runs.failRun({
+        runId,
+        leaseOwner,
+        code: error.code,
+        occurredAt: this.options.clock.now(),
+      });
+      return { type: "terminal", runId, state: "failed" };
+    }
+    if (this.options.approvals.getPendingForRun(runId) !== null) {
+      return { type: "waiting", runId, state: "waiting_approval" };
+    }
+    const latestTool = toolCalls.at(-1) ?? null;
     if (latestTool?.state === "executing") {
       const recovered = this.options.tools.recoverExecuting({
         runId, toolCallId: latestTool.toolCallId, leaseOwner, occurredAt: this.options.clock.now(),
@@ -249,10 +276,7 @@ export class AdvanceRunService {
       runFifoSequence: context.run.fifoSequence,
       input: context.input,
       activatedSkillNames: this.options.runs.listActivatedSkillNames(runId),
-      toolResults: latestTool === null ? [] : [{
-        toolName: latestTool.toolName,
-        content: latestTool.result ?? { code: "tool_denied", toolName: latestTool.toolName },
-      }],
+      toolResults,
       tools: modelToolDefinitions(this.options.registry),
     };
     const summaryAttemptIds = new Map<number, Parameters<RunStore["appendModelDelta"]>[2]>();
@@ -295,6 +319,11 @@ export class AdvanceRunService {
             throw new Error("summary_attempt_checkpoint_missing");
           }
           const providerError = asProviderError(error);
+          this.recordProviderHealth(
+            context.revision,
+            attemptId,
+            providerError,
+          );
           await this.commitModelAttempt(() => {
             const failAttempt = willRetry
               ? this.options.runs.failModelAttempt.bind(this.options.runs)
@@ -309,13 +338,28 @@ export class AdvanceRunService {
             });
           });
         },
-        saveSummary: (summaryInput) =>
+        onAttemptSucceeded: (attemptNumber) => {
+          const attemptId = summaryAttemptIds.get(attemptNumber);
+          if (attemptId === undefined) {
+            throw new Error("summary_attempt_checkpoint_missing");
+          }
+          this.recordProviderHealth(context.revision, attemptId);
+        },
+        saveSummary: (completedSummary) =>
           this.commitModelAttempt(() =>
             this.options.sessions.saveSummaryWithLease({
               runId,
               leaseOwner,
+              attemptId: summaryAttemptId(
+                summaryAttemptIds,
+                completedSummary.attemptNumber,
+              ),
+              finishReason: completedSummary.finishReason,
+              ...(completedSummary.usage === undefined
+                ? {}
+                : { usage: completedSummary.usage }),
               occurredAt: this.options.clock.now(),
-              summary: summaryInput,
+              summary: completedSummary.summary,
             })
           ),
       });
@@ -335,6 +379,9 @@ export class AdvanceRunService {
         return { type: "terminal", runId, state: "failed" };
       }
       throw error;
+    }
+    if (request.purpose !== "run") {
+      throw new DomainError("model_protocol_error");
     }
 
     for (let attemptNumber = 1; attemptNumber <= MAX_MODEL_ATTEMPTS; attemptNumber += 1) {
@@ -379,6 +426,11 @@ export class AdvanceRunService {
           throw error;
         }
         const providerError = asProviderError(error);
+        this.recordProviderHealth(
+          attemptContext.revision,
+          attemptId,
+          providerError,
+        );
         const terminalFailure = !providerError.transient ||
           attemptNumber === MAX_MODEL_ATTEMPTS;
         await this.commitModelAttempt(() => {
@@ -403,6 +455,7 @@ export class AdvanceRunService {
         );
         continue;
       }
+      this.recordProviderHealth(attemptContext.revision, attemptId);
       const cancellation = await this.finalizeCancellation(runId, leaseOwner);
       if (cancellation !== null) return cancellation;
       if (completed.toolCall !== undefined) {
@@ -424,6 +477,7 @@ export class AdvanceRunService {
         try {
           proposal = await normalizeToolProposal({
             registry: this.options.registry,
+            providerCallId: completed.toolCall.callId,
             toolName: completed.toolCall.name,
             arguments: completed.toolCall.arguments,
             context: {
@@ -456,6 +510,7 @@ export class AdvanceRunService {
           if (error.code !== "invalid_tool_arguments") throw error;
           const rejected = preserveRejectedToolProposal({
             registry: this.options.registry,
+            providerCallId: completed.toolCall.callId,
             toolName: completed.toolCall.name,
             arguments: completed.toolCall.arguments,
           });
@@ -464,6 +519,7 @@ export class AdvanceRunService {
               runId,
               leaseOwner,
               toolCallId: this.options.ids.toolCallId(),
+              providerCallId: rejected.providerCallId,
               toolName: rejected.toolName,
               effect: rejected.effect,
               arguments: rejected.arguments,
@@ -497,6 +553,7 @@ export class AdvanceRunService {
             runId,
             leaseOwner,
             toolCallId: this.options.ids.toolCallId(),
+            providerCallId: proposal.providerCallId,
             toolName: proposal.toolName,
             effect: proposal.effect,
             arguments: proposal.arguments,
@@ -523,7 +580,9 @@ export class AdvanceRunService {
           runId,
           leaseOwner,
           attemptId,
-          ...completed,
+          text: completed.text,
+          finishReason: completed.finishReason,
+          ...(completed.usage === undefined ? {} : { usage: completed.usage }),
           occurredAt: this.options.clock.now(),
         })
       );
@@ -553,6 +612,22 @@ export class AdvanceRunService {
     return result;
   }
 
+  private recordProviderHealth(
+    revision: AgentRevisionSnapshot,
+    attemptId: Parameters<RunStore["appendModelDelta"]>[2],
+    error?: ModelProviderError,
+  ): void {
+    this.options.modelRegistry.recordProviderHealth({
+      connectionRevisionId: revision.model.providerConnectionRevisionId,
+      profileRevisionId: revision.modelProfileRevisionId,
+      outcome: error === undefined ? "success" : "failure",
+      ...(error === undefined ? {} : { code: error.code }),
+      ...(error?.status === undefined ? {} : { safeStatus: error.status }),
+      traceId: attemptId,
+      observedAt: this.options.clock.now(),
+    });
+  }
+
   private async collectAttempt(
     runId: RunId,
     leaseOwner: string,
@@ -567,7 +642,7 @@ export class AdvanceRunService {
     });
     let text = "";
     let completed: Extract<ModelChunk, { type: "completed" }> | undefined;
-    let toolCall: Extract<ModelChunk, { type: "tool_call" }>["call"] | undefined;
+    let toolCall: Extract<ModelChunk, { type: "tool_call" }> | undefined;
     const stream = this.options.model.streamAttempt(request, signal);
     const iterator = stream[Symbol.asyncIterator]();
     let pendingNext: Promise<IteratorResult<ModelChunk>> | undefined;
@@ -640,7 +715,11 @@ export class AdvanceRunService {
           if (toolCall !== undefined) {
             throw protocolError();
           }
-          toolCall = chunk.call;
+          try {
+            toolCall = { ...chunk, callId: parseProviderCallId(chunk.callId) };
+          } catch {
+            throw protocolError();
+          }
         } else if (completed === undefined) {
           completed = chunk;
         } else {
@@ -675,6 +754,17 @@ function assertOwnedLease(
   ) {
     throw new DomainError("run_lease_lost");
   }
+}
+
+function summaryAttemptId(
+  attempts: ReadonlyMap<number, Parameters<RunStore["appendModelDelta"]>[2]>,
+  attemptNumber: number,
+): Parameters<RunStore["appendModelDelta"]>[2] {
+  const attemptId = attempts.get(attemptNumber);
+  if (attemptId === undefined) {
+    throw new Error("summary_attempt_checkpoint_missing");
+  }
+  return attemptId;
 }
 
 function outcomeForState(runId: RunId, state: RunState): AdvanceOutcome {

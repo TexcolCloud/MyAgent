@@ -1,19 +1,22 @@
+version: 2
 server:
   bearerToken:
     fromEnvironment: MYAGENT_BEARER_TOKEN
+  adminToken:
+    fromEnvironment: MYAGENT_ADMIN_TOKEN
 database:
   path: ./data/kernel.db
 agentRoots:
   - ./agents
 skillRoots:
   - ./skills
-models:
-  default:
-    provider: openai-compatible
-    model: test-model
-    baseUrl: http://127.0.0.1:11434/v1
-    apiKey:
-      fromEnvironment: MODEL_API_KEY
-    maxInputTokens: 32768
+modelControl:
+  discoveryCacheSeconds: 600
+  discoveryTimeoutMs: 10000
+  verificationRequestTimeoutMs: 30000
+  verificationJobTimeoutMs: 120000
+  maxDiscoveredModels: 1000
+  maxDiscoveryResponseBytes: 2097152
+  verificationConcurrency: 1
 toolEnvironmentAllowlist:
   - PATH

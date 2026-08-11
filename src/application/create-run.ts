@@ -1,4 +1,4 @@
-import type { CatalogService } from "../config/catalog-service.js";
+import type { AgentResolverPort } from "../domain/agent-revision.js";
 import type { RunId, SessionId } from "../domain/ids.js";
 import {
   parseAgentId,
@@ -26,7 +26,7 @@ export interface CreateRunResult {
 
 export class CreateRunService {
   constructor(
-    private readonly catalog: Pick<CatalogService, "resolve">,
+    private readonly agents: Pick<AgentResolverPort, "resolve">,
     private readonly runs: RunStore,
     private readonly clock: Clock,
     private readonly ids: IdGenerator,
@@ -38,14 +38,13 @@ export class CreateRunService {
     const agentId = parseAgentId(command.agentId);
     const sessionKey = parseSessionKey(command.sessionKey);
     const idempotencyKey = parseIdempotencyKey(command.idempotencyKey);
-    const revision = this.catalog.resolve(agentId).revision;
     const result = this.runs.create({
       agentId,
       sessionKey,
       idempotencyKey,
       input: command.input,
       source: command.source,
-      revision,
+      resolveRevision: () => this.agents.resolve(agentId),
       occurredAt: this.clock.now(),
       allocateSessionId: () => this.ids.sessionId(),
       allocateRunId: () => this.ids.runId(),

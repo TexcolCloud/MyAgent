@@ -1,0 +1,653 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
+import { OpenAiResponsesModel } from "../../src/adapters/model/openai-responses.js";
+import { NodeProviderHttpTransport } from "../../src/adapters/provider-http-transport.js";
+import { providerConnectionRevisionIdFromUuid } from "../../src/domain/ids.js";
+import type { JsonValue } from "../../src/domain/json.js";
+import type { ModelChunk, ModelRequest } from "../../src/ports/model.js";
+
+const servers: Server[] = [];
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve, reject) => {
+    server.close((error) => error === undefined ? resolve() : reject(error));
+  })));
+});
+
+describe("OpenAiResponsesModel", () => {
+  it("executes from the stored runtime without a Model Registry", async () => {
+    const fake = await startServer([
+      { type: "response.output_text.delta", delta: "snapshot-authority" },
+      { type: "response.completed", response: completedResponse() },
+    ]);
+    servers.push(fake.server);
+    const model = new OpenAiResponsesModel({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" }),
+      }),
+    });
+
+    const chunks = await collect(model.streamAttempt(request(fake.baseUrl, {
+      input: [{ type: "message", role: "user", content: "Recover." }],
+    }), new AbortController().signal));
+
+    expect(chunks).toContainEqual({ type: "text_delta", text: "snapshot-authority" });
+    expect(fake.requests).toHaveLength(1);
+  });
+
+  it("reconstructs stateless function call history without previous response state", async () => {
+    const fake = await startServer([
+      { type: "response.output_text.delta", delta: "ok" },
+      { type: "response.completed", response: completedResponse() },
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(adapter().streamAttempt(request(fake.baseUrl, {
+      input: [
+        { type: "message", role: "user", content: "Inspect." },
+        { type: "assistant_tool_call", callId: "call_7", name: "read_file", arguments: { path: "a.txt" } },
+        { type: "tool_result", callId: "call_7", name: "read_file", output: { ok: true } },
+      ],
+    }), new AbortController().signal));
+
+    expect(chunks).toEqual([
+      { type: "text_delta", text: "ok" },
+      { type: "completed", finishReason: "completed" },
+    ]);
+    expect(fake.requests).toHaveLength(1);
+    const captured = fake.requests[0]?.body as Record<string, unknown>;
+    expect(captured).toMatchObject({
+      model: "deepseek-v4-flash",
+      store: false,
+      stream: true,
+      parallel_tool_calls: false,
+    });
+    expect(captured).not.toHaveProperty("previous_response_id");
+    expect(captured.input).toContainEqual({
+      type: "function_call_output",
+      call_id: "call_7",
+      output: '{"ok":true}',
+    });
+  });
+
+  it("assembles one streamed function call using the provider call ID", async () => {
+    const fake = await startServer([
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          id: "fc_1",
+          type: "function_call",
+          call_id: "call_9",
+          name: "read_file",
+          arguments: "",
+          status: "in_progress",
+        },
+      },
+      { type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_1", delta: '{"path":' },
+      { type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_1", delta: '"a.txt"}' },
+      { type: "response.function_call_arguments.done", output_index: 0, item_id: "fc_1", arguments: '{"path":"a.txt"}' },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          id: "fc_1",
+          type: "function_call",
+          call_id: "call_9",
+          name: "read_file",
+          arguments: '{"path":"a.txt"}',
+          status: "completed",
+        },
+      },
+      { type: "response.completed", response: completedResponse({
+        output: [{ id: "fc_1", type: "function_call", call_id: "call_9", name: "read_file", arguments: '{"path":"a.txt"}', status: "completed" }],
+      }) },
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Read." }] }),
+      new AbortController().signal,
+    ));
+
+    expect(chunks).toEqual([
+      { type: "tool_call", callId: "call_9", name: "read_file", arguments: { path: "a.txt" } },
+      { type: "completed", finishReason: "tool_call" },
+    ]);
+  });
+
+  it("maps optional terminal Responses usage to canonical usage", async () => {
+    const fake = await startServer([
+      { type: "response.output_text.delta", delta: "ok" },
+      { type: "response.completed", response: completedResponse({
+        usage: {
+          input_tokens: 12,
+          output_tokens: 7,
+          total_tokens: 19,
+          input_tokens_details: { cached_tokens: 0 },
+          output_tokens_details: { reasoning_tokens: 0 },
+        },
+      }) },
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ));
+
+    expect(chunks.at(-1)).toEqual({
+      type: "completed",
+      finishReason: "completed",
+      usage: { inputTokens: 12, outputTokens: 7 },
+    });
+  });
+
+  it("forces a required tool choice for verification-tool requests", async () => {
+    const fake = await startServer([
+      { type: "response.output_text.delta", delta: "verified" },
+      { type: "response.completed", response: completedResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await collect(adapter().streamAttempt(request(fake.baseUrl, {
+      purpose: "verification_tool",
+      toolChoice: "required",
+      input: [{ type: "message", role: "user", content: "Verify." }],
+    }), new AbortController().signal));
+
+    expect(fake.requests[0]?.body).toMatchObject({ tool_choice: "required" });
+  });
+
+  it("rejects a textless non-tool completion as a protocol error", async () => {
+    const fake = await startServer([{ type: "response.completed", response: completedResponse() }]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it.each(["response.failed", "response.incomplete"] as const)("treats %s as a normalized error", async (type) => {
+    const fake = await startServer([
+      { type: "response.output_text.delta", delta: "partial" },
+      {
+        type,
+        response: completedResponse({
+          status: type === "response.failed" ? "failed" : "incomplete",
+          error: { code: "raw_secret" },
+        }),
+      },
+      { type: "response.completed", response: completedResponse() },
+    ]);
+    servers.push(fake.server);
+
+    const error = await collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    )).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "model_protocol_error", transient: false });
+    expect(String(error)).not.toContain("raw_secret");
+  });
+
+  it("normalizes a 401 without leaking the provider error body", async () => {
+    const fake = await startServer([], {
+      status: 401,
+      body: { error: { message: "provider-body-secret", code: "raw-code" } },
+    });
+    servers.push(fake.server);
+
+    const error = await collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    )).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({
+      code: "provider_auth_failed",
+      transient: false,
+      status: 401,
+    });
+    expect(`${String(error)} ${JSON.stringify(error)}`).not.toContain("provider-body-secret");
+    expect(`${String(error)} ${JSON.stringify(error)}`).not.toContain("raw-code");
+  });
+
+  it("rejects an argument delta with a mismatched function-call output index", async () => {
+    const fake = await startServer([
+      { type: "response.output_item.added", output_index: 0, item: reasoningItem("reasoning_1") },
+      functionCallAdded(1),
+      functionCallDelta(0, '{"path":'),
+      functionCallDelta(1, '"a.txt"}'),
+      functionCallArgumentsDone(1),
+      functionCallDone(1),
+      { type: "response.completed", response: functionCallResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("assembles a function call after an omitted reasoning output item", async () => {
+    const fake = await startServer([
+      { type: "response.output_item.added", output_index: 0, item: reasoningItem("reasoning_1") },
+      functionCallAdded(1),
+      functionCallDelta(1, '{"path":'),
+      functionCallDelta(1, '"a.txt"}'),
+      functionCallArgumentsDone(1),
+      functionCallDone(1),
+      { type: "response.completed", response: functionCallResponse() },
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ));
+
+    expect(chunks).toEqual([
+      { type: "tool_call", callId: "call_2", name: "read_file", arguments: { path: "a.txt" } },
+      { type: "completed", finishReason: "tool_call" },
+    ]);
+  });
+
+  it("rejects a malformed declared function-call item instead of ignoring it", async () => {
+    const fake = await startServer([
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          id: "fc_bad",
+          type: "function_call",
+          call_id: "call bad",
+          name: "read_file",
+          arguments: "",
+          status: "in_progress",
+        },
+      },
+      { type: "response.output_text.delta", delta: "visible" },
+      { type: "response.completed", response: completedResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects an output-item done event with mismatched function-call identity", async () => {
+    const fake = await startServer([
+      { type: "response.output_item.added", output_index: 0, item: reasoningItem("reasoning_1") },
+      functionCallAdded(1),
+      functionCallDelta(1, '{"path":'),
+      functionCallDelta(1, '"a.txt"}'),
+      functionCallArgumentsDone(1),
+      {
+        type: "response.output_item.done",
+        output_index: 1,
+        item: { ...functionCallItem(), name: "other_file" },
+      },
+      { type: "response.completed", response: functionCallResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects an argument done event with a mismatched function-call output index", async () => {
+    const fake = await startServer([
+      { type: "response.output_item.added", output_index: 0, item: reasoningItem("reasoning_1") },
+      functionCallAdded(1),
+      functionCallDelta(1, '{"path":'),
+      functionCallDelta(1, '"a.txt"}'),
+      functionCallArgumentsDone(0),
+      functionCallDone(1),
+      { type: "response.completed", response: functionCallResponse() },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects terminal output whose function call does not match the streamed call", async () => {
+    const fake = await startServer([
+      functionCallAdded(0),
+      functionCallDelta(0, '{"path":'),
+      functionCallDelta(0, '"a.txt"}'),
+      functionCallArgumentsDone(0),
+      functionCallDone(0),
+      {
+        type: "response.completed",
+        response: completedResponse({
+          output: [{ ...functionCallItem(), call_id: "call_other" }],
+        }),
+      },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects multiple streamed function calls", async () => {
+    const fake = await startServer([
+      functionCallAdded(0),
+      { type: "response.output_item.added", output_index: 1, item: secondFunctionCallItem() },
+      {
+        type: "response.completed",
+        response: completedResponse({ output: [functionCallItem(), secondFunctionCallItem()] }),
+      },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects malformed function arguments with an otherwise valid terminal response", async () => {
+    const invalidArguments = '{"path":';
+    const fake = await startServer([
+      { ...functionCallAdded(0), item: { ...functionCallItem(), arguments: "", status: "in_progress" } },
+      { type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_2", delta: invalidArguments },
+      { type: "response.function_call_arguments.done", output_index: 0, item_id: "fc_2", arguments: invalidArguments },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { ...functionCallItem(), arguments: invalidArguments },
+      },
+      {
+        type: "response.completed",
+        response: completedResponse({ output: [{ ...functionCallItem(), arguments: invalidArguments }] }),
+      },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects extra function calls in terminal output", async () => {
+    const fake = await startServer([
+      functionCallAdded(0),
+      functionCallDelta(0, '{"path":'),
+      functionCallDelta(0, '"a.txt"}'),
+      functionCallArgumentsDone(0),
+      functionCallDone(0),
+      {
+        type: "response.completed",
+        response: completedResponse({ output: [functionCallItem(), secondFunctionCallItem()] }),
+      },
+    ]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("rejects a missing terminal event after visible text", async () => {
+    const fake = await startServer([{ type: "response.output_text.delta", delta: "partial" }]);
+    servers.push(fake.server);
+
+    await expect(collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("normalizes cancellation during a Responses stream", async () => {
+    const fake = await startServer([{ type: "response.output_text.delta", delta: "partial" }], { holdOpen: true });
+    servers.push(fake.server);
+    const controller = new AbortController();
+    const pending = collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      controller.signal,
+    ));
+    await fake.requestReceived;
+    controller.abort("secret-abort-reason");
+
+    const error = await pending.catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ name: "AbortError" });
+    expect(String(error)).not.toContain("secret-abort-reason");
+  });
+
+  it("omits provider reasoning events from canonical output", async () => {
+    const fake = await startServer([
+      { type: "response.reasoning_text.delta", delta: "provider-reasoning-secret" },
+      { type: "response.output_text.delta", delta: "visible" },
+      { type: "response.completed", response: completedResponse() },
+    ]);
+    servers.push(fake.server);
+
+    const chunks = await collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    ));
+
+    expect(chunks).toEqual([
+      { type: "text_delta", text: "visible" },
+      { type: "completed", finishReason: "completed" },
+    ]);
+    expect(JSON.stringify(chunks)).not.toContain("provider-reasoning-secret");
+  });
+
+  it.each([
+    {
+      status: 429,
+      headers: { "retry-after": "2" },
+      expected: { code: "provider_rate_limited", transient: true, status: 429, retryAfterMs: 2_000 },
+    },
+    {
+      status: 500,
+      headers: { "retry-after": "3" },
+      expected: { code: "provider_unavailable", transient: true, status: 500, retryAfterMs: 3_000 },
+    },
+  ])("normalizes safe HTTP $status fields", async ({ status, headers, expected }) => {
+    const fake = await startServer([], { status, headers, body: { error: { message: "provider-body-secret" } } });
+    servers.push(fake.server);
+
+    const error = await collect(adapter().streamAttempt(
+      request(fake.baseUrl, { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      new AbortController().signal,
+    )).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject(expected);
+    expect(`${String(error)} ${JSON.stringify(error)}`).not.toContain("provider-body-secret");
+  });
+
+  it("normalizes an arbitrary pre-abort reason", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("secret-abort-reason"));
+
+    const error = await collect(adapter().streamAttempt(
+      request("http://127.0.0.1:1/v1", { input: [{ type: "message", role: "user", content: "Hello" }] }),
+      controller.signal,
+    )).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ name: "AbortError" });
+    expect(String(error)).not.toContain("secret-abort-reason");
+  });
+});
+
+function adapter(): OpenAiResponsesModel {
+  return new OpenAiResponsesModel({
+    transport: new NodeProviderHttpTransport({
+      secretResolver: new EnvironmentSecretResolver({ TEST_API_KEY: "test-key" }),
+    }),
+  });
+}
+
+function request(
+  baseUrl: string,
+  options: Pick<ModelRequest, "input"> & Partial<Pick<ModelRequest, "purpose" | "toolChoice">>,
+): ModelRequest {
+  return {
+    purpose: options.purpose ?? "run",
+    model: {
+      providerConnectionRevisionId: providerConnectionRevisionIdFromUuid("00000000-0000-7000-8000-000000000401"),
+      providerKind: "openai_compatible",
+      baseUrl,
+      providerAuth: { type: "bearer", secret: { fromEnvironment: "TEST_API_KEY" } },
+      allowInsecureHttp: true,
+      modelId: "deepseek-v4-flash",
+      invocationProtocol: "responses",
+      maxInputTokens: 8_192,
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      compatibilityPresetVersion: "openai-responses-v1",
+    },
+    input: options.input,
+    tools: [{ name: "read_file", description: "Read one file", inputSchema: { type: "object" } }],
+    ...(options.toolChoice === undefined ? {} : { toolChoice: options.toolChoice }),
+  };
+}
+
+async function startServer(
+  events: readonly JsonValue[],
+  options: {
+    status?: number;
+    body?: JsonValue;
+    headers?: Record<string, string>;
+    holdOpen?: boolean;
+  } = {},
+): Promise<{
+  server: Server;
+  baseUrl: string;
+  requests: { body: JsonValue }[];
+  requestReceived: Promise<void>;
+}> {
+  const requests: { body: JsonValue }[] = [];
+  let markRequestReceived: (() => void) | undefined;
+  const requestReceived = new Promise<void>((resolve) => {
+    markRequestReceived = resolve;
+  });
+  const server = createServer((incoming, response) => {
+    const chunks: Buffer[] = [];
+    incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+    incoming.on("end", () => {
+      requests.push({ body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as JsonValue });
+      markRequestReceived?.();
+      if (options.status !== undefined) {
+        response.writeHead(options.status, {
+          "content-type": "application/json",
+          ...options.headers,
+        });
+        response.end(JSON.stringify(options.body ?? {}));
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of events) response.write(`data: ${JSON.stringify(event)}\n\n`);
+      if (!options.holdOpen) response.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${String(address.port)}/v1`,
+    requests,
+    requestReceived,
+  };
+}
+
+function completedResponse(overrides: Record<string, JsonValue> = {}): JsonValue {
+  return {
+    id: "resp_test",
+    object: "response",
+    created_at: 0,
+    model: "deepseek-v4-flash",
+    status: "completed",
+    output: [{ id: "msg_1", type: "message", role: "assistant", status: "completed", content: [] }],
+    ...overrides,
+  };
+}
+
+function reasoningItem(id: string): Record<string, JsonValue> {
+  return { id, type: "reasoning", summary: [] };
+}
+
+function functionCallItem(): Record<string, JsonValue> {
+  return {
+    id: "fc_2",
+    type: "function_call",
+    call_id: "call_2",
+    name: "read_file",
+    arguments: '{"path":"a.txt"}',
+    status: "completed",
+  };
+}
+
+function functionCallAdded(outputIndex: number): Record<string, JsonValue> {
+  return {
+    type: "response.output_item.added",
+    output_index: outputIndex,
+    item: { ...functionCallItem(), arguments: "", status: "in_progress" },
+  };
+}
+
+function functionCallDelta(outputIndex: number, delta: string): JsonValue {
+  return {
+    type: "response.function_call_arguments.delta",
+    output_index: outputIndex,
+    item_id: "fc_2",
+    delta,
+  };
+}
+
+function functionCallArgumentsDone(outputIndex: number): JsonValue {
+  return {
+    type: "response.function_call_arguments.done",
+    output_index: outputIndex,
+    item_id: "fc_2",
+    arguments: '{"path":"a.txt"}',
+  };
+}
+
+function functionCallDone(outputIndex: number): JsonValue {
+  return {
+    type: "response.output_item.done",
+    output_index: outputIndex,
+    item: functionCallItem(),
+  };
+}
+
+function functionCallResponse(): JsonValue {
+  return completedResponse({ output: [reasoningItem("reasoning_1"), functionCallItem()] });
+}
+
+function secondFunctionCallItem(): Record<string, JsonValue> {
+  return {
+    id: "fc_3",
+    type: "function_call",
+    call_id: "call_3",
+    name: "other_file",
+    arguments: "{}",
+    status: "completed",
+  };
+}
+
+async function collect(stream: AsyncIterable<ModelChunk>): Promise<ModelChunk[]> {
+  const chunks: ModelChunk[] = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return chunks;
+}

@@ -62,7 +62,14 @@ describe("HTTP Runs", () => {
         payload: { agentId: "missing", sessionKey: "session:missing", input: { type: "text", text: "hello" } },
       });
       expect(unavailable.statusCode).toBe(422);
-      expect(unavailable.json()).toMatchObject({ code: "agent_unavailable" });
+      expect(unavailable.json()).toEqual({
+        type: "about:blank",
+        title: "Unprocessable Content",
+        status: 422,
+        code: "agent_unavailable",
+        detail: "The requested Agent is unavailable.",
+        traceId: expect.any(String),
+      });
 
       const created = await harness.app.inject({
         method: "POST",
@@ -109,7 +116,7 @@ describe("HTTP Runs", () => {
         leaseOwner: "http-completed-worker",
         attemptId: "attempt-http-completed" as AttemptId,
         text: "durable terminal output",
-        finishReason: "stop",
+        finishReason: "completed",
         usage: { inputTokens: 4, outputTokens: 3 },
         occurredAt,
       });

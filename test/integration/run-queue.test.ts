@@ -14,6 +14,7 @@ import { CatalogService } from "../../src/config/catalog-service.js";
 import { runIdFromUuid, sessionIdFromUuid } from "../../src/domain/ids.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
+import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
 const claimWorkerOptions = process.env.MYAGENT_CLAIM_WORKER_OPTIONS;
@@ -279,7 +280,7 @@ if (claimWorkerOptions === undefined) {
       const first = create(harness.service, "session:a", "request-a001");
       migrate(reopened.db);
       const retryService = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         new SqliteRunRepository(
           reopened.db,
           new SqliteCatalogRepository(reopened.db),
@@ -365,7 +366,7 @@ function createQueueHarness(
     new SqliteCatalogRepository(connection.db),
   );
   const service = new CreateRunService(
-    new CatalogService(snapshot),
+    resolvedAgents(new CatalogService(snapshot)),
     store,
     new FakeClock(new Date("2026-08-07T00:00:00.000Z")),
     new FakeIds(ids),

@@ -1,0 +1,25 @@
+version: 2
+server:
+  host: 127.0.0.1
+  port: 8787
+  bearerToken:
+    fromEnvironment: MYAGENT_BEARER_TOKEN
+  adminToken:
+    fromEnvironment: MYAGENT_ADMIN_TOKEN
+database:
+  path: ./data/kernel.db
+  busyTimeoutMs: 5000
+agentRoots:
+  - ./agents
+skillRoots:
+  - ./skills
+toolEnvironmentAllowlist:
+  - PATH
+modelControl:
+  discoveryCacheSeconds: 600
+  discoveryTimeoutMs: 10000
+  verificationRequestTimeoutMs: 30000
+  verificationJobTimeoutMs: 120000
+  maxDiscoveredModels: 1000
+  maxDiscoveryResponseBytes: 2097152
+  verificationConcurrency: 1

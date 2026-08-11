@@ -3,6 +3,7 @@ import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { SqliteApprovalRepository } from "../../src/adapters/sqlite/approval-repository.js";
+import { OpenAiChatCompletionsModel } from "../../src/adapters/model/openai-chat-completions.js";
 import { SqliteCatalogRepository } from "../../src/adapters/sqlite/catalog-repository.js";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
@@ -27,6 +28,7 @@ import type { JsonValue } from "../../src/domain/json.js";
 import type { Run } from "../../src/domain/run.js";
 import type { Clock } from "../../src/ports/clock.js";
 import type { ModelChunk, ModelPort, ModelRequest } from "../../src/ports/model.js";
+import type { ProviderHttpTransport } from "../../src/ports/provider-http-transport.js";
 import type { RunStore } from "../../src/ports/run-store.js";
 import type {
   ToolDefinition,
@@ -37,6 +39,8 @@ import { RunWorker } from "../../src/runtime/run-worker.js";
 import { SystemClock } from "../../src/adapters/system-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { FakeTool } from "../helpers/fake-tool.js";
+import { noOpProviderHealthSink } from "../helpers/provider-health.js";
+import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { completedText, ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
@@ -60,7 +64,7 @@ describe("RunWorker", () => {
         runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000031")],
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000031")],
       });
-      const created = new CreateRunService(new CatalogService(catalogSnapshot), runs, clock, ids).execute({
+      const created = new CreateRunService(resolvedAgents(new CatalogService(catalogSnapshot)), runs, clock, ids).execute({
         agentId: "primary", sessionKey: "integration:worker", input: { type: "text", text: "hello" },
         idempotencyKey: "run-worker-0001", source: { kind: "http" },
       });
@@ -69,7 +73,7 @@ describe("RunWorker", () => {
       const advance = new AdvanceRunService({
         runs, tools: new SqliteToolRepository(connection.db), approvals: new SqliteApprovalRepository(connection.db),
         sessions, model, prompts: new PromptAssembler(sessions), registry: new ToolRegistry(),
-        policy: new PolicyEngine(), clock, ids,
+        policy: new PolicyEngine(), clock, ids, modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({ runs, advance, clock, workerId: "worker-integration", concurrency: 1, leaseDurationMs: 1_000, idleDelayMs: 5 });
 
@@ -81,6 +85,97 @@ describe("RunWorker", () => {
       expect(model.requests).toHaveLength(1);
     } finally {
       connection.close();
+    }
+  });
+
+  it("recovers a persisted Run from its stored runtime without a Model Registry", async () => {
+    const databasePath = tempPath("run-worker-snapshot-recovery.db");
+    const clock = new SystemClock();
+    const ids = new FakeIds({
+      sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000041")],
+      runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000041")],
+      attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000041")],
+    });
+    const initial = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    const created = (() => {
+      try {
+        migrate(initial.db);
+        const catalog = new SqliteCatalogRepository(initial.db);
+        return new CreateRunService(
+          resolvedAgents(new CatalogService(catalogSnapshot), {
+            baseUrl: "https://stored-provider.example/v1",
+            providerAuth: { type: "none" },
+            allowInsecureHttp: true,
+            modelId: "stored-model",
+          }),
+          new SqliteRunRepository(initial.db, catalog),
+          clock,
+          ids,
+        ).execute({
+          agentId: "primary",
+          sessionKey: "integration:snapshot-recovery",
+          input: { type: "text", text: "recover from the stored snapshot" },
+          idempotencyKey: "run-worker-snapshot-recovery-0001",
+          source: { kind: "http" },
+        });
+      } finally {
+        initial.close();
+      }
+    })();
+
+    const restarted = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    try {
+      const observedConnections: Array<{
+        baseUrl: string;
+        auth: unknown;
+        allowInsecureHttp: boolean;
+      }> = [];
+      const transport: ProviderHttpTransport = {
+        createFetch(input) {
+          observedConnections.push(input.connection);
+          return (async () => successfulChatResponse()) as typeof fetch;
+        },
+      };
+      const catalog = new SqliteCatalogRepository(restarted.db);
+      const runs = new SqliteRunRepository(restarted.db, catalog);
+      const sessions = new SqliteSessionRepository(restarted.db);
+      const advance = new AdvanceRunService({
+        runs,
+        tools: new SqliteToolRepository(restarted.db),
+        approvals: new SqliteApprovalRepository(restarted.db),
+        sessions,
+        model: new OpenAiChatCompletionsModel({ transport }),
+        prompts: new PromptAssembler(sessions),
+        registry: new ToolRegistry(),
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        modelRegistry: noOpProviderHealthSink,
+      });
+      const worker = new RunWorker({
+        runs,
+        advance,
+        clock,
+        workerId: "worker-snapshot-recovery",
+        concurrency: 1,
+        leaseDurationMs: 1_000,
+        idleDelayMs: 5,
+      });
+
+      worker.start();
+      try {
+        await waitFor(() => runs.getRun(created.runId).state === "completed");
+      } finally {
+        await worker.stop();
+      }
+
+      expect(observedConnections).toEqual([{
+        baseUrl: "https://stored-provider.example/v1",
+        auth: { type: "none" },
+        allowInsecureHttp: true,
+      }]);
+    } finally {
+      restarted.close();
     }
   });
 
@@ -101,7 +196,7 @@ describe("RunWorker", () => {
           attemptIdFromUuid("00000000-0000-7000-8000-000000000033"),
         ],
       });
-      const created = new CreateRunService(new CatalogService(catalogSnapshot), runs, clock, ids).execute({
+      const created = new CreateRunService(resolvedAgents(new CatalogService(catalogSnapshot)), runs, clock, ids).execute({
         agentId: "primary", sessionKey: "integration:tool-loop", input: { type: "text", text: "read" },
         idempotencyKey: "run-worker-0002", source: { kind: "http" },
       });
@@ -114,13 +209,18 @@ describe("RunWorker", () => {
       }));
       const model = new ScriptedModel();
       model.script({ chunks: [
-        { type: "tool_call", call: { name: "read_file", arguments: { path: "report.md" } } },
-        { type: "completed", finishReason: "tool_calls", usage: { inputTokens: 10, outputTokens: 2 } },
+        {
+          type: "tool_call",
+          callId: "provider_tool_loop",
+          name: "read_file",
+          arguments: { path: "report.md" },
+        },
+        { type: "completed", finishReason: "tool_call", usage: { inputTokens: 10, outputTokens: 2 } },
       ] }, completedText("final after tool"));
       const advance = new AdvanceRunService({
         runs, tools: new SqliteToolRepository(connection.db), approvals: new SqliteApprovalRepository(connection.db),
         sessions, model, prompts: new PromptAssembler(sessions), registry,
-        policy: new PolicyEngine(), clock, ids,
+        policy: new PolicyEngine(), clock, ids, modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({ runs, advance, clock, workerId: "worker-tool", concurrency: 1, leaseDurationMs: 1_000, idleDelayMs: 5 });
 
@@ -128,8 +228,18 @@ describe("RunWorker", () => {
       await waitFor(() => runs.getRun(created.runId).state === "completed");
       await worker.stop();
 
-      expect(model.requests[1]?.messages.find((message) => message.name === "tool_results")?.content)
-        .toContain("report body");
+      expect(model.requests[1]?.input).toContainEqual({
+        type: "assistant_tool_call",
+        callId: "provider_tool_loop",
+        name: "read_file",
+        arguments: { path: "report.md" },
+      });
+      expect(model.requests[1]?.input).toContainEqual({
+        type: "tool_result",
+        callId: "provider_tool_loop",
+        name: "read_file",
+        output: expect.objectContaining({ content: { contents: "report body" } }),
+      });
     } finally {
       connection.close();
     }
@@ -161,7 +271,7 @@ describe("RunWorker", () => {
         ],
       });
       const create = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         runs,
         clock,
         ids,
@@ -192,6 +302,7 @@ describe("RunWorker", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({
         runs,
@@ -298,6 +409,8 @@ describe("RunWorker", () => {
     await waitFor(() => reported !== undefined).catch(() => undefined);
 
     expect(reported).toBe(failure);
+    expect((worker as RunWorker & { isHealthy?: () => boolean }).isHealthy?.())
+      .toBe(false);
     await expect(worker.stop()).rejects.toBe(failure);
   });
 
@@ -319,7 +432,7 @@ describe("RunWorker", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000034")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         runs,
         clock,
         ids,
@@ -338,11 +451,13 @@ describe("RunWorker", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "provider_side_effect_stop",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -359,6 +474,7 @@ describe("RunWorker", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({
         runs,
@@ -404,7 +520,7 @@ describe("RunWorker", () => {
         attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000035")],
       });
       const created = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         runs,
         clock,
         ids,
@@ -423,11 +539,13 @@ describe("RunWorker", () => {
         chunks: [
           {
             type: "tool_call",
-            call: { name: "read_file", arguments: { path: "report.md" } },
+            callId: "provider_read_only_stop",
+            name: "read_file",
+            arguments: { path: "report.md" },
           },
           {
             type: "completed",
-            finishReason: "tool_calls",
+            finishReason: "tool_call",
             usage: { inputTokens: 10, outputTokens: 2 },
           },
         ],
@@ -444,6 +562,7 @@ describe("RunWorker", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({
         runs,
@@ -637,7 +756,7 @@ describe("RunWorker", () => {
         ],
       });
       const create = new CreateRunService(
-        new CatalogService(catalogSnapshot),
+        resolvedAgents(new CatalogService(catalogSnapshot)),
         runs,
         clock,
         ids,
@@ -681,6 +800,7 @@ describe("RunWorker", () => {
         policy: new PolicyEngine(),
         clock,
         ids,
+        modelRegistry: noOpProviderHealthSink,
       });
       const worker = new RunWorker({
         runs,
@@ -708,6 +828,22 @@ describe("RunWorker", () => {
   });
 });
 
+function successfulChatResponse(): Response {
+  const frame = (delta: Record<string, unknown>, finishReason: string | null) =>
+    `data: ${JSON.stringify({
+      id: "chatcmpl-snapshot-recovery",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "stored-model",
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+      usage: null,
+    })}\n\n`;
+  return new Response(
+    `${frame({ content: "recovered" }, null)}${frame({}, "stop")}data: [DONE]\n\n`,
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+}
+
 async function waitFor(condition: () => boolean): Promise<void> {
   const deadline = Date.now() + 2_000;
   while (!condition()) {
@@ -724,9 +860,7 @@ class RoutingModel implements ModelPort {
     signal: AbortSignal,
   ): AsyncIterable<ModelChunk> {
     signal.throwIfAborted();
-    const input = request.messages.find(
-      (message) => message.name === "current_operator_input",
-    )?.content ?? "";
+    const input = currentOperatorInput(request);
     const text = input.includes("approval request")
       ? "approval request"
       : input.includes("must stay queued")
@@ -736,14 +870,13 @@ class RoutingModel implements ModelPort {
     if (text === "approval request") {
       yield {
         type: "tool_call",
-        call: {
-          name: "run_command",
-          arguments: { program: "node", args: [] },
-        },
+        callId: "provider_approval_request",
+        name: "run_command",
+        arguments: { program: "node", args: [] },
       };
       yield {
         type: "completed",
-        finishReason: "tool_calls",
+        finishReason: "tool_call",
         usage: { inputTokens: 10, outputTokens: 2 },
       };
       return;
@@ -751,7 +884,7 @@ class RoutingModel implements ModelPort {
     yield { type: "text_delta", text: "independent answer" };
     yield {
       type: "completed",
-      finishReason: "stop",
+      finishReason: "completed",
       usage: { inputTokens: 10, outputTokens: 2 },
     };
   }
@@ -765,17 +898,17 @@ class UnknownToolRoutingModel implements ModelPort {
     signal: AbortSignal,
   ): AsyncIterable<ModelChunk> {
     signal.throwIfAborted();
-    const input = request.messages.find(
-      (message) => message.name === "current_operator_input",
-    )?.content ?? "";
+    const input = currentOperatorInput(request);
     if (input.includes("propose the unknown Tool")) {
       yield {
         type: "tool_call",
-        call: { name: "not_registered", arguments: {} },
+        callId: "provider_unknown_tool",
+        name: "not_registered",
+        arguments: {},
       };
       yield {
         type: "completed",
-        finishReason: "tool_calls",
+        finishReason: "tool_call",
         usage: { inputTokens: 10, outputTokens: 2 },
       };
       return;
@@ -784,10 +917,19 @@ class UnknownToolRoutingModel implements ModelPort {
     yield { type: "text_delta", text: "later answer" };
     yield {
       type: "completed",
-      finishReason: "stop",
+      finishReason: "completed",
       usage: { inputTokens: 10, outputTokens: 2 },
     };
   }
+}
+
+function currentOperatorInput(request: ModelRequest): string {
+  for (const entry of request.input) {
+    if (entry.type === "message" && entry.name === "current_operator_input") {
+      return entry.content;
+    }
+  }
+  return "";
 }
 
 class PausingTool implements ToolDefinition {

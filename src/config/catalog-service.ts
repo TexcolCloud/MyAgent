@@ -54,12 +54,20 @@ function assertReloadableGlobal(
 
 function staticGlobalFields(snapshot: CatalogSnapshot): object {
   return {
+    version: snapshot.global.version,
     server: {
       host: snapshot.global.server.host,
       port: snapshot.global.server.port,
       bearerToken: snapshot.global.server.bearerToken,
+      adminToken: snapshot.global.server.adminToken,
     },
     database: snapshot.global.database,
     toolEnvironmentAllowlist: snapshot.global.toolEnvironmentAllowlist,
+    ...(snapshot.global.version === 2
+      ? { modelControl: snapshot.global.modelControl }
+      : {
+          legacyModelImportSourceSha256:
+            snapshot.global.legacyModelImport?.sourceSha256 ?? null,
+        }),
   };
 }

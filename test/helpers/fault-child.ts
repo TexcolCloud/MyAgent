@@ -2,6 +2,7 @@ import { existsSync, writeFileSync } from "node:fs";
 
 import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
 import { OpenAiChatCompletionsModel } from "../../src/adapters/model/openai-chat-completions.js";
+import { NodeProviderHttpTransport } from "../../src/adapters/provider-http-transport.js";
 import { bootstrap } from "../../src/bootstrap.js";
 import type { ModelPort } from "../../src/ports/model.js";
 import type { FaultInjector, FaultPoint } from "../../src/runtime/fault-injector.js";
@@ -27,7 +28,9 @@ const faults: FaultInjector = {
 };
 
 const innerModel = new OpenAiChatCompletionsModel({
-  secretResolver: new EnvironmentSecretResolver(),
+  transport: new NodeProviderHttpTransport({
+    secretResolver: new EnvironmentSecretResolver(),
+  }),
 });
 const model = modelAckMarker === undefined || modelAckPath === undefined
   ? innerModel

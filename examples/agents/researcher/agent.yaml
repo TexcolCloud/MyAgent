@@ -1,7 +1,6 @@
 id: researcher
 displayName: Researcher Agent
 prompt: ./AGENT.md
-model: default
 workspace: ./workspace
 skills:
   - research

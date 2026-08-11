@@ -7,10 +7,33 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { describe, expect, it, vi } from "vitest";
 
 import { bootstrap } from "../../src/bootstrap.js";
+import { FakeOpenAiProvider } from "../helpers/fake-openai-provider.js";
 
 const VALID_FIXTURE = fileURLToPath(new URL("../fixtures/config/valid", import.meta.url));
 
 describe("network defaults", () => {
+  it("closes delayed fake-provider responses without retaining timers or sockets", async () => {
+    const provider = await FakeOpenAiProvider.start({ models: ["delayed-model"] });
+    try {
+      provider.delayResponses(5_000);
+      const pending = fetch(`${provider.baseUrl}/models`).catch((error: unknown) => error);
+      const deadline = Date.now() + 1_000;
+      while (provider.requests.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(provider.requests).toHaveLength(1);
+
+      const close = provider.close().then(() => "closed" as const);
+      expect(await Promise.race([
+        close,
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 250)),
+      ])).toBe("closed");
+      expect(await pending).toBeInstanceOf(Error);
+    } finally {
+      await provider.close();
+    }
+  });
+
   it("defaults to loopback with no Channel route or unauthenticated v1 route", async () => {
     const fixture = await prepareConfig();
     const logs: string[] = [];
@@ -100,13 +123,16 @@ async function prepareConfig(host?: string): Promise<{ configPath: string; clean
   await writeFile(configPath, stringifyYaml(config));
 
   const previousBearer = process.env.MYAGENT_BEARER_TOKEN;
+  const previousAdmin = process.env.MYAGENT_ADMIN_TOKEN;
   const previousModel = process.env.MODEL_API_KEY;
   process.env.MYAGENT_BEARER_TOKEN = "network-operator-secret";
+  process.env.MYAGENT_ADMIN_TOKEN = "network-admin-secret";
   process.env.MODEL_API_KEY = "network-provider-secret";
   return {
     configPath,
     async cleanup(): Promise<void> {
       restoreEnvironment("MYAGENT_BEARER_TOKEN", previousBearer);
+      restoreEnvironment("MYAGENT_ADMIN_TOKEN", previousAdmin);
       restoreEnvironment("MODEL_API_KEY", previousModel);
       await rm(root, { recursive: true, force: true });
     },

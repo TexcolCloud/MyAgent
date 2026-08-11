@@ -16,6 +16,28 @@ describe("ApprovalExpirer", () => {
 
     expect(approvals.decisions).toEqual([approvalId]);
   });
+
+  it("latches and reports a fatal loop failure", async () => {
+    const failure = new Error("clock_failed");
+    let reportFailure!: (error: unknown) => void;
+    const reported = new Promise<unknown>((resolve) => {
+      reportFailure = resolve;
+    });
+    const expirer = new ApprovalExpirer({
+      approvals: { listExpired: () => [], decide: () => undefined },
+      clock: {
+        now: () => new Date("2026-08-07T00:00:00.000Z"),
+        sleep: () => Promise.reject(failure),
+      },
+      onFatalError: reportFailure,
+    });
+
+    expirer.start();
+
+    expect(await reported).toEqual(new Error("approval_expirer_sleep_failed"));
+    expect(expirer.isHealthy()).toBe(false);
+    await expect(expirer.stop()).rejects.toThrow("approval_expirer_sleep_failed");
+  });
 });
 
 class FakeApprovalStore {

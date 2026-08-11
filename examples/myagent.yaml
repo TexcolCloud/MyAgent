@@ -1,21 +1,25 @@
+version: 2
 server:
+  # Keep Run and Admin credentials separate and the control plane on loopback.
   host: 127.0.0.1
   port: 8787
   bearerToken:
     fromEnvironment: MYAGENT_BEARER_TOKEN
+  adminToken:
+    fromEnvironment: MYAGENT_ADMIN_TOKEN
 database:
   path: ./data/kernel.db
 agentRoots:
   - ./agents
 skillRoots:
   - ./skills
-models:
-  default:
-    provider: openai-compatible
-    model: gpt-4.1-mini
-    baseUrl: https://api.openai.com/v1
-    apiKey:
-      fromEnvironment: OPENAI_API_KEY
-    maxInputTokens: 32768
+modelControl:
+  discoveryCacheSeconds: 600
+  discoveryTimeoutMs: 10000
+  verificationRequestTimeoutMs: 30000
+  verificationJobTimeoutMs: 120000
+  maxDiscoveredModels: 1000
+  maxDiscoveryResponseBytes: 2097152
+  verificationConcurrency: 1
 toolEnvironmentAllowlist:
   - PATH

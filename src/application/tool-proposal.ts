@@ -4,6 +4,7 @@ import canonicalizeModule from "canonicalize";
 
 import { DomainError } from "../domain/errors.js";
 import type { JsonValue } from "../domain/json.js";
+import { parseProviderCallId } from "../domain/tool-call.js";
 import type {
   ToolDefinition,
   ToolNormalizeContext,
@@ -20,12 +21,14 @@ export interface ToolLookup {
 
 export interface NormalizeToolProposalInput {
   registry: ToolLookup;
+  providerCallId: string;
   toolName: string;
   arguments: JsonValue;
   context: ToolNormalizeContext;
 }
 
 export interface NormalizedToolProposal {
+  providerCallId: string;
   toolName: string;
   arguments: JsonValue;
   canonicalArguments: string;
@@ -37,6 +40,7 @@ export interface NormalizedToolProposal {
 export async function normalizeToolProposal(
   input: NormalizeToolProposalInput,
 ): Promise<NormalizedToolProposal> {
+  const providerCallId = parseProviderCallId(input.providerCallId);
   const tool = input.registry.get(input.toolName);
   if (tool === undefined) {
     throw new DomainError("tool_not_found");
@@ -50,7 +54,12 @@ export async function normalizeToolProposal(
   }
 
   try {
-    return buildProposal(tool, normalized.arguments, normalized.policyFacts);
+    return buildProposal(
+      providerCallId,
+      tool,
+      normalized.arguments,
+      normalized.policyFacts,
+    );
   } catch {
     throw invalidArguments();
   }
@@ -59,18 +68,20 @@ export async function normalizeToolProposal(
 export function preserveRejectedToolProposal(
   input: Omit<NormalizeToolProposalInput, "context">,
 ): NormalizedToolProposal {
+  const providerCallId = parseProviderCallId(input.providerCallId);
   const tool = input.registry.get(input.toolName);
   if (tool === undefined) {
     throw new DomainError("tool_not_found");
   }
   try {
-    return buildProposal(tool, input.arguments, {});
+    return buildProposal(providerCallId, tool, input.arguments, {});
   } catch {
     throw invalidArguments();
   }
 }
 
 function buildProposal(
+  providerCallId: string,
   tool: ToolDefinition,
   argumentsValue: unknown,
   policyFactsValue: ToolPolicyFacts,
@@ -83,6 +94,7 @@ function buildProposal(
   }
 
   return Object.freeze({
+    providerCallId,
     toolName: tool.name,
     arguments: argumentsCopy,
     canonicalArguments,

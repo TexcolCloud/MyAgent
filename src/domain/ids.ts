@@ -12,6 +12,14 @@ export type RunId = Branded<string, "RunId">;
 export type ToolCallId = Branded<string, "ToolCallId">;
 export type ApprovalId = Branded<string, "ApprovalId">;
 export type AttemptId = Branded<string, "AttemptId">;
+export type ProviderConnectionId = Branded<string, "ProviderConnectionId">;
+export type ModelProfileId = Branded<string, "ModelProfileId">;
+export type ProviderConnectionRevisionId = Branded<string, "ProviderConnectionRevisionId">;
+export type ModelProfileRevisionId = Branded<string, "ModelProfileRevisionId">;
+export type ModelVerificationId = Branded<string, "ModelVerificationId">;
+export type ManagedSecretVersionId = Branded<string, "ManagedSecretVersionId">;
+export type ModelRegistryEventId = Branded<string, "ModelRegistryEventId">;
+export type DiscoveryGenerationId = Branded<string, "DiscoveryGenerationId">;
 
 function brand<T, Name extends string>(value: T): Branded<T, Name> {
   return value as Branded<T, Name>;
@@ -27,6 +35,22 @@ export function parseAgentId(value: string): AgentId {
   }
 
   return brand<string, "AgentId">(value);
+}
+
+export function parseProviderConnectionId(value: string): ProviderConnectionId {
+  if (!AGENT_ID_PATTERN.test(value)) {
+    throw new Error("invalid_provider_connection_id");
+  }
+
+  return brand<string, "ProviderConnectionId">(value);
+}
+
+export function parseModelProfileId(value: string): ModelProfileId {
+  if (!AGENT_ID_PATTERN.test(value)) {
+    throw new Error("invalid_model_profile_id");
+  }
+
+  return brand<string, "ModelProfileId">(value);
 }
 
 export function parseSessionKey(value: string): SessionKey {
@@ -63,4 +87,28 @@ export function approvalIdFromUuid(value: string): ApprovalId {
 
 export function attemptIdFromUuid(value: string): AttemptId {
   return brand<string, "AttemptId">(`att_${value}`);
+}
+
+export function providerConnectionRevisionIdFromUuid(value: string): ProviderConnectionRevisionId {
+  return brand<string, "ProviderConnectionRevisionId">(`pcr_${value}`);
+}
+
+export function modelProfileRevisionIdFromUuid(value: string): ModelProfileRevisionId {
+  return brand<string, "ModelProfileRevisionId">(`mpr_${value}`);
+}
+
+export function modelVerificationIdFromUuid(value: string): ModelVerificationId {
+  return brand<string, "ModelVerificationId">(`ver_${value}`);
+}
+
+export function managedSecretVersionIdFromUuid(value: string): ManagedSecretVersionId {
+  return brand<string, "ManagedSecretVersionId">(`msv_${value}`);
+}
+
+export function modelRegistryEventIdFromUuid(value: string): ModelRegistryEventId {
+  return brand<string, "ModelRegistryEventId">(`mre_${value}`);
+}
+
+export function discoveryGenerationIdFromUuid(value: string): DiscoveryGenerationId {
+  return brand<string, "DiscoveryGenerationId">(`dgn_${value}`);
 }

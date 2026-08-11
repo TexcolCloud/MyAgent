@@ -11,6 +11,7 @@ import type {
 } from "../domain/ids.js";
 import type { Run } from "../domain/run.js";
 import type { JsonValue } from "../domain/json.js";
+import type { ModelFinishReason, ModelUsage } from "./model.js";
 
 export interface CreateStoredRunInput {
   agentId: AgentId;
@@ -18,7 +19,7 @@ export interface CreateStoredRunInput {
   idempotencyKey: IdempotencyKey;
   input: { type: "text"; text: string };
   source: { kind: "http"; externalId?: string };
-  revision: AgentRevisionSnapshot;
+  resolveRevision(): AgentRevisionSnapshot;
   occurredAt: Date;
   allocateSessionId(): SessionId;
   allocateRunId(): RunId;
@@ -63,8 +64,8 @@ export interface CompleteRunInput {
   leaseOwner: string;
   attemptId: AttemptId;
   text: string;
-  finishReason: string;
-  usage: { inputTokens: number; outputTokens: number };
+  finishReason: ModelFinishReason;
+  usage?: ModelUsage;
   occurredAt: Date;
 }
 
@@ -77,10 +78,10 @@ export interface StartDelegationInput {
   parentChildRunLimit: number;
   parentDelegationDepthLimit: number;
   targetAgentId: AgentId;
-  targetRevision: AgentRevisionSnapshot;
+  resolveTargetRevision(): AgentRevisionSnapshot;
   childSessionKey: SessionKey;
-  childSessionId: SessionId;
-  childRunId: RunId;
+  allocateChildSessionId(): SessionId;
+  allocateChildRunId(): RunId;
   input: { type: "text"; text: string };
   occurredAt: Date;
 }
