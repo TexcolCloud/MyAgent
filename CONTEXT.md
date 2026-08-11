@@ -16,13 +16,21 @@ _Avoid_: Chatbot, tenant bot
 An external or locally hosted service that exposes language models through one or more supported invocation protocols.
 _Avoid_: Model, Provider Connection
 
+**Provider Driver**:
+A project-owned stable identity for the runtime family that reaches a Model Provider, independent of names used by an underlying library catalog.
+_Avoid_: Library provider name, Provider Connection
+
 **Invocation Protocol**:
-The provider-facing API contract fixed for a Model Profile, initially either Chat Completions or Responses.
+The provider-facing API contract fixed for a Model Profile and captured by a Run; it identifies one resolved provider invocation form without runtime selection or fallback.
 _Avoid_: Model Provider, automatic runtime fallback
 
 **Provider Connection**:
 An Operator-configured route to one Model Provider, consisting of a provider kind, Base URL, and Secret reference; one connection may expose many models.
 _Avoid_: Model, endpoint config
+
+**Provider Egress Gateway**:
+The sole local route through which a Personal Agent reaches a Model Provider, enforcing credential authority and outbound network policy.
+_Avoid_: Direct provider request, SDK bypass
 
 **Model Profile**:
 An Agent-selectable configuration that binds one Provider Connection to a provider model identifier and an invocation protocol.
@@ -56,6 +64,10 @@ _Avoid_: Model Discovery result, global model config
 The Operator-only local interface that manages the Model Registry, Secrets, discovery, verification, promotion, and assignment separately from Run ingress.
 _Avoid_: Run API, Channel
 
+**TUI Client**:
+A local terminal interface through which the Operator uses the Model Control Plane and observes Runs without directly owning the database or Secrets.
+_Avoid_: Server dashboard, database console
+
 **Model Capability**:
 A verified behavior of a Model Profile, such as streaming text or producing one structured Tool Call through its Invocation Protocol.
 _Avoid_: Provider claim, model metadata
@@ -67,6 +79,10 @@ _Avoid_: Model Verification, readiness
 **Model Discovery**:
 The enumeration of model identifiers advertised by a Provider Connection; discovery alone does not prove that a model can serve the required protocol or capabilities.
 _Avoid_: Model Verification, availability check
+
+**Catalog Model Candidate**:
+A model configuration published by a runtime library as a possible Provider choice; it does not represent a live discovery result from a Provider Connection.
+_Avoid_: Discovered model, verified model
 
 **Model Verification**:
 A bounded live check that the Operator-selected Model Profile can serve its intended invocation protocol and required capabilities at that moment.
