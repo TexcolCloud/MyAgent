@@ -54,6 +54,48 @@ describe("PiAiModelAdapter", () => {
     ]);
   });
 
+  it("preserves the provider call ID when Pi adds Responses item metadata", async () => {
+    const model = new PiAiModelAdapter({
+      client: scriptedPiClient([
+        {
+          type: "tool_call",
+          id: "responses-call-17|fc_responses-call-17",
+          name: "read_file",
+          arguments: '{"path":"a.txt"}',
+        },
+        {
+          type: "done",
+          reason: "toolUse",
+          usage: { inputTokens: 3, outputTokens: 2 },
+        },
+      ]),
+      gateway: gatewayRoute(),
+    });
+    const request = piRequest({
+      model: {
+        ...piRequest().model,
+        piRuntime: {
+          ...piRequest().model.piRuntime!,
+          api: "openai-responses",
+        },
+      },
+    });
+
+    await expect(collect(model.streamAttempt(request, signal()))).resolves.toEqual([
+      {
+        type: "tool_call",
+        callId: "responses-call-17",
+        name: "read_file",
+        arguments: { path: "a.txt" },
+      },
+      {
+        type: "completed",
+        finishReason: "tool_call",
+        usage: { inputTokens: 3, outputTokens: 2 },
+      },
+    ]);
+  });
+
   it("passes a tool continuation with its original provider call ID", async () => {
     let capturedInput: ModelRequest["input"] | undefined;
     const client: PiAiClient = {

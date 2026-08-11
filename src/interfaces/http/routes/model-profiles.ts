@@ -3,6 +3,10 @@ import type { FastifyInstance } from "fastify";
 import type { ListProviderDriversService } from "../../../application/list-provider-drivers.js";
 import { manualModelEntryAllowed } from "../../../application/discover-models.js";
 import type { ManageModelProfilesService } from "../../../application/manage-model-profiles.js";
+import {
+  PI_RUNTIME_VERSION,
+  resolveProviderCatalogCandidate,
+} from "../../../config/pi-runtime-catalog.js";
 import { modelContextPreset } from "../../../config/provider-presets.js";
 import { ApplicationError } from "../../../domain/errors.js";
 import { DomainError } from "../../../domain/errors.js";
@@ -71,9 +75,9 @@ export function registerModelProfileRoutes(
           connectionRevisionId,
           providerModelId: resolved.modelId,
           invocationProtocol: resolved.invocationProtocol,
-          ...(resolved.candidate === undefined
+          ...(resolved.piRuntime === undefined
             ? {}
-            : { piRuntime: { kind: "pi_ai" as const, ...resolved.candidate.invocation } }),
+            : { piRuntime: resolved.piRuntime }),
           ...resolved.context,
           traceId: request.id,
         }));
@@ -198,7 +202,7 @@ function resolveCatalogSelection(
   }
   services.providerDrivers.assertCandidateCredentialSupport(candidate, credentialSupport);
   return {
-    candidate,
+    piRuntime: { kind: "pi_ai" as const, ...candidate.invocation },
     modelId: candidate.modelId,
     invocationProtocol: "pi_ai" as const,
     manualEntryAcknowledged: false,
@@ -260,19 +264,30 @@ function resolveManualSelection(
     throw new DomainError("invalid_model_profile");
   }
   const manualEntryAcknowledged = body.manualEntryAcknowledged === true;
+  const invocationProtocol = body.protocol === "auto"
+    ? protocolPreference
+    : body.protocol;
+  const context = resolveContext(
+    providerKind,
+    body.modelId,
+    body.maxInputTokens,
+    body.contextWindowSource,
+  );
   return {
-    candidate: undefined,
+    piRuntime: {
+      kind: "pi_ai" as const,
+      piVersion: PI_RUNTIME_VERSION,
+      driverId: "pi/openai-compatible" as const,
+      catalogProviderId: "openai-compatible",
+      api: invocationProtocol === "responses" ? "openai-responses" : "openai-completions",
+      modelId: body.modelId,
+      contextWindow: context.maxInputTokens,
+      compatibility: {},
+    },
     modelId: body.modelId,
-    invocationProtocol: body.protocol === "auto"
-      ? protocolPreference
-      : body.protocol,
+    invocationProtocol,
     manualEntryAcknowledged,
-    context: resolveContext(
-      providerKind,
-      body.modelId,
-      body.maxInputTokens,
-      body.contextWindowSource,
-    ),
+    context,
   };
 }
 
@@ -307,12 +322,15 @@ function profileResponse(profile: ModelProfileView) {
     recordRevision: profile.recordRevision,
     revisions: profile.revisions.map((revision) => {
       const { piRuntime, ...safeRevision } = revision;
+      const catalogCandidate = piRuntime === undefined
+        ? undefined
+        : resolveProviderCatalogCandidate(piRuntime.driverId, piRuntime.modelId);
       return {
         ...safeRevision,
-        ...(piRuntime === undefined
+        ...(catalogCandidate === undefined
           ? {}
           : {
-              catalogCandidateId: `${piRuntime.driverId}:${piRuntime.modelId}`,
+              catalogCandidateId: catalogCandidate.candidateId,
             }),
         createdAt: revision.createdAt.toISOString(),
       };

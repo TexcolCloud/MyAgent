@@ -259,6 +259,49 @@ describe("multi-provider model registry release isolation", () => {
     }
   }, 30_000);
 
+  it("runs a manually selected OpenAI-compatible Profile through the Pi gateway", async () => {
+    const gatewayRequests: string[] = [];
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["manual-compatible-model"],
+        chat: [
+          { type: "verification_text", text: "Manual verification passed" },
+          { type: "verification_tool", callId: "verify-manual-compatible" },
+          { type: "text", text: "Manual Pi gateway run completed" },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp({
+        providerGateway: {
+          listen: captureGatewayTraffic(gatewayRequests),
+        },
+      }), (active) => active.close());
+      await service.setupVerifiedModel({
+        connectionSlug: "manual-pi-gateway",
+        profileSlug: "manual-pi-gateway",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "manual-compatible-model",
+        protocol: "chat_completions",
+        agentId: "primary",
+      });
+      const run = await service.createRun({
+        agentId: "primary",
+        sessionKey: "release:manual-pi-gateway",
+        text: "Use the persisted Pi runtime.",
+        idempotencyKey: "manual-pi-gateway-run",
+      });
+
+      await service.waitForRunStatus(run.runId, "completed");
+
+      expect(gatewayRequests).toHaveLength(3);
+      expect(gatewayRequests.every((requestPath) => requestPath.startsWith("/pi/")))
+        .toBe(true);
+      expect(provider.chatRequests).toHaveLength(3);
+    } finally {
+      await cleanup.dispose();
+    }
+  }, 30_000);
+
   it("cleans partial service startup before closing an earlier provider", async () => {
     const cleanup = createAsyncCleanupStack();
     let providerModelsUrl = "";
@@ -927,7 +970,7 @@ describe("multi-provider model registry release isolation", () => {
       );
       expect(redirectFailure).toMatchObject({
         status: "failed",
-        resultCode: "model_protocol_error",
+        resultCode: "provider_unavailable",
       });
       expect(redirectSource.responsesRequests.length).toBeGreaterThan(0);
       expect(redirectTarget.requests).toEqual([]);

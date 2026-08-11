@@ -44,11 +44,12 @@ export class PiAiModelAdapter implements ModelPort {
           sawText = true;
           yield { type: "text_delta", text: event.text };
         } else if (event.type === "tool_call") {
+          const id = providerToolCallId(contract.api, event.id);
           if (toolCall === undefined) {
-            if (!validToolIdentity(event.id, event.name)) throw protocolError();
-            toolCall = { id: event.id, name: event.name, arguments: event.arguments };
+            if (!validToolIdentity(id, event.name)) throw protocolError();
+            toolCall = { id, name: event.name, arguments: event.arguments };
           } else {
-            if (toolCall.id !== event.id || toolCall.name !== event.name) {
+            if (toolCall.id !== id || toolCall.name !== event.name) {
               throw protocolError();
             }
             toolCall.arguments += event.arguments;
@@ -105,6 +106,13 @@ function parseToolCall(event: {
 
 function validToolIdentity(id: string, name: string): boolean {
   return /^[\x21-\x7e]{1,200}$/u.test(id) && name.length > 0;
+}
+
+function providerToolCallId(api: string, id: string): string {
+  if (api !== "openai-responses") return id;
+  const separator = id.lastIndexOf("|");
+  if (separator === -1 || !id.slice(separator + 1).startsWith("fc_")) return id;
+  return id.slice(0, separator);
 }
 
 function finishReasonFromPi(reason: "stop" | "length" | "toolUse"): ModelFinishReason {

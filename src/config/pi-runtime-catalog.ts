@@ -8,13 +8,7 @@ import type {
 
 export const PI_RUNTIME_VERSION = "0.73.1" as const;
 
-const UNSUPPORTED_CATALOG_PROVIDERS = new Set([
-  "amazon-bedrock",
-  "azure-openai-responses",
-  "github-copilot",
-  "google-vertex",
-  "openai-codex",
-]);
+const BEARER_HEADER_CATALOG_PROVIDERS = new Set(["openai", "deepseek"]);
 
 const providerCatalogCandidates = freezeCandidates(buildCandidates());
 
@@ -47,9 +41,9 @@ function buildCandidates(): ProviderCatalogCandidate[] {
   for (const provider of getProviders()) {
     const catalogProviderId = String(provider);
     const driverId = `pi/${catalogProviderId}` as ProviderDriverId;
-    const credentialSupport = UNSUPPORTED_CATALOG_PROVIDERS.has(catalogProviderId)
-      ? "unsupported"
-      : "bearer";
+    const credentialSupport = BEARER_HEADER_CATALOG_PROVIDERS.has(catalogProviderId)
+      ? "bearer"
+      : "unsupported";
 
     for (const listedModel of getModels(provider)) {
       const model = getModel(provider, listedModel.id as never);

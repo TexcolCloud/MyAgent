@@ -30,7 +30,7 @@ describe("HTTP provider Driver catalog", () => {
             ]),
           }),
           expect.objectContaining({
-            driverId: "pi/github-copilot",
+            driverId: "pi/anthropic",
             candidates: expect.arrayContaining([
               expect.objectContaining({ credentialSupport: "unsupported" }),
             ]),
@@ -45,7 +45,7 @@ describe("HTTP provider Driver catalog", () => {
     }
   });
 
-  it("blocks an unsupported catalog Driver from creating a Connection", async () => {
+  it("blocks a native Driver whose credential headers the gateway cannot represent", async () => {
     const harness = await startTestApp();
     try {
       const response = await harness.app.inject({
@@ -54,17 +54,18 @@ describe("HTTP provider Driver catalog", () => {
         remoteAddress: "127.0.0.1",
         headers: adminHeaders,
         payload: {
-          slug: "unsupported-copilot",
-          displayName: "Unsupported Copilot",
-          driverId: "pi/github-copilot",
-          auth: { type: "environment", fromEnvironment: "COPILOT_TOKEN" },
+          slug: "unsupported-anthropic",
+          displayName: "Unsupported Anthropic",
+          driverId: "pi/anthropic",
+          baseUrl: "https://api.anthropic.com",
+          auth: { type: "environment", fromEnvironment: "ANTHROPIC_API_KEY" },
         },
       });
 
       expect(response.statusCode).toBe(422);
       expect(response.json()).toMatchObject({ code: "invalid_provider_connection" });
       expect(harness.modelRegistry.listConnections()).not.toContainEqual(
-        expect.objectContaining({ connectionId: "unsupported-copilot" }),
+        expect.objectContaining({ connectionId: "unsupported-anthropic" }),
       );
     } finally {
       await harness.close();

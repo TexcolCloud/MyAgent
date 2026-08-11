@@ -306,18 +306,32 @@ function responsesEvents(
             : { raw_provider_body: turn.rawBody }),
         }]
       : [];
+    const item = {
+      id: "msg_fake",
+      type: "message" as const,
+      role: "assistant" as const,
+      status: "completed" as const,
+      content: [{ type: "output_text" as const, text: turn.text, annotations: [] }],
+    };
     return [
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { ...item, status: "in_progress", content: [] },
+      },
+      {
+        type: "response.content_part.added",
+        item_id: item.id,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "", annotations: [] },
+      },
       ...rawEvents,
       { type: "response.output_text.delta", delta: turn.text },
+      { type: "response.output_item.done", output_index: 0, item },
       {
         type: "response.completed",
-        response: completedResponse([{
-          id: "msg_fake",
-          type: "message",
-          role: "assistant",
-          status: "completed",
-          content: [],
-        }]),
+        response: completedResponse([item]),
       },
     ];
   }

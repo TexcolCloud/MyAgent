@@ -263,10 +263,9 @@ describe("HTTP model control plane", () => {
         remoteAddress: "127.0.0.1",
         headers: adminHeaders,
         payload: {
-          slug: "anthropic-without-bearer",
-          displayName: "Anthropic Without Bearer",
-          driverId: "pi/anthropic",
-          baseUrl: "https://api.anthropic.com/v1",
+          slug: "deepseek-without-bearer",
+          displayName: "DeepSeek Without Bearer",
+          driverId: "pi/deepseek",
           auth: { type: "none" },
         },
       });
@@ -274,7 +273,7 @@ describe("HTTP model control plane", () => {
       expect(response.statusCode).toBe(422);
       expect(response.json()).toMatchObject({ code: "invalid_provider_connection" });
       expect(harness.modelRegistry.listConnections()).not.toContainEqual(
-        expect.objectContaining({ connectionId: "anthropic-without-bearer" }),
+        expect.objectContaining({ connectionId: "deepseek-without-bearer" }),
       );
     } finally {
       await harness.close();
@@ -290,24 +289,23 @@ describe("HTTP model control plane", () => {
         remoteAddress: "127.0.0.1",
         headers: adminHeaders,
         payload: {
-          slug: "anthropic-revision-bearer",
-          displayName: "Anthropic Revision Bearer",
-          driverId: "pi/anthropic",
-          baseUrl: "https://api.anthropic.com/v1",
-          auth: { type: "environment", fromEnvironment: "ANTHROPIC_API_KEY" },
+          slug: "deepseek-revision-bearer",
+          displayName: "DeepSeek Revision Bearer",
+          driverId: "pi/deepseek",
+          auth: { type: "environment", fromEnvironment: "DEEPSEEK_API_KEY" },
         },
       });
       expect(created.statusCode).toBe(201);
 
       const revised = await harness.app.inject({
         method: "POST",
-        url: "/v1/admin/provider-connections/anthropic-revision-bearer/revisions",
+        url: "/v1/admin/provider-connections/deepseek-revision-bearer/revisions",
         remoteAddress: "127.0.0.1",
         headers: adminHeaders,
         payload: {
           expectedRevision: 0,
-          displayName: "Anthropic Revision Bearer",
-          baseUrl: "https://api.anthropic.com/v1",
+          displayName: "DeepSeek Revision Bearer",
+          baseUrl: "https://api.deepseek.com/v1",
           auth: { type: "none" },
           allowInsecureHttp: false,
           protocolPreference: "responses",
@@ -316,7 +314,7 @@ describe("HTTP model control plane", () => {
 
       expect(revised.statusCode).toBe(422);
       expect(revised.json()).toMatchObject({ code: "invalid_provider_connection" });
-      expect(harness.modelRegistry.getConnection("anthropic-revision-bearer" as never))
+      expect(harness.modelRegistry.getConnection("deepseek-revision-bearer" as never))
         .toMatchObject({ recordRevision: 0 });
     } finally {
       await harness.close();
@@ -1143,6 +1141,21 @@ describe("HTTP model control plane", () => {
           contextWindowSource: "assumed_32768",
         })],
       });
+      expect(assumed.json().revisions[0]).not.toHaveProperty("catalogCandidateId");
+      expect(harness.modelRegistry.getProfile("manual-profile" as never)).toMatchObject({
+        revisions: [expect.objectContaining({
+          piRuntime: {
+            kind: "pi_ai",
+            piVersion: "0.73.1",
+            driverId: "pi/openai-compatible",
+            catalogProviderId: "openai-compatible",
+            api: "openai-completions",
+            modelId: "custom-model",
+            contextWindow: 32_768,
+            compatibility: {},
+          },
+        })],
+      });
 
       const operator = await harness.app.inject({
         method: "POST",
@@ -1165,6 +1178,21 @@ describe("HTTP model control plane", () => {
           invocationProtocol: "responses",
           maxInputTokens: 12_345,
           contextWindowSource: "operator",
+        })],
+      });
+      expect(operator.json().revisions[0]).not.toHaveProperty("catalogCandidateId");
+      expect(harness.modelRegistry.getProfile("operator-profile" as never)).toMatchObject({
+        revisions: [expect.objectContaining({
+          piRuntime: {
+            kind: "pi_ai",
+            piVersion: "0.73.1",
+            driverId: "pi/openai-compatible",
+            catalogProviderId: "openai-compatible",
+            api: "openai-responses",
+            modelId: "custom-model",
+            contextWindow: 12_345,
+            compatibility: {},
+          },
         })],
       });
     } finally {

@@ -47,19 +47,19 @@ describe("Pi runtime catalog", () => {
     expect(projection).not.toContain('"authorization"');
   });
 
-  it.each([
-    "pi/amazon-bedrock",
-    "pi/azure-openai-responses",
-    "pi/github-copilot",
-    "pi/google-vertex",
-    "pi/openai-codex",
-  ] as const)("keeps %s catalog candidates unsupported", (driverId) => {
-    const candidates = listProviderCatalogCandidates().filter(
-      (candidate) => candidate.driverId === driverId,
-    );
+  it("admits bearer credentials only for native OpenAI and DeepSeek catalog Drivers", () => {
+    const candidates = listProviderCatalogCandidates();
 
-    expect(candidates).not.toHaveLength(0);
-    expect(candidates.every((candidate) => candidate.credentialSupport === "unsupported"))
-      .toBe(true);
+    expect(candidates.filter((candidate) => candidate.driverId === "pi/openai"))
+      .not.toHaveLength(0);
+    expect(candidates.filter((candidate) => candidate.driverId === "pi/deepseek"))
+      .not.toHaveLength(0);
+    for (const candidate of candidates) {
+      expect(candidate.credentialSupport).toBe(
+        candidate.driverId === "pi/openai" || candidate.driverId === "pi/deepseek"
+          ? "bearer"
+          : "unsupported",
+      );
+    }
   });
 });
