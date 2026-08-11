@@ -50,7 +50,7 @@ The first release admits only bearer API-key and explicit no-auth connections. E
 
 ## TUI Workbench
 
-`myagent tui` starts only with an interactive TTY. It authenticates to the existing local HTTP control plane using the established administrative credential supplied through the environment or hidden terminal input; it never writes that credential to disk. In a non-TTY, redirected, or CI process it returns a stable error and leaves the regular CLI and `--json` interface unchanged.
+`myagent tui` starts only with an interactive TTY. It accepts the separate existing Run Token and Admin Token through the environment or hidden terminal input, keeps both only in process memory, and never writes either credential to disk. Run Token authorizes chat, Run state, SSE, and Approval operations; Admin Token authorizes Model Control Plane operations. In a non-TTY, redirected, or CI process it returns a stable error and leaves the regular CLI and `--json` interface unchanged.
 
 The Pi-TUI workbench has three stable regions:
 
@@ -85,7 +85,7 @@ Add the TTY-only TUI entrypoint, authenticated HTTP/SSE client views, setup wiza
 
 Phase 1 must cover fake Pi streams for every supported invocation contract, one-Tool-Call continuation, cancellation, gateway Secret authority, SSRF/redirect/timeout/size policy, static-catalog versus remote-discovery semantics, verification/promotion immutability, and pre-migration snapshot recovery.
 
-Phase 2 must cover TTY startup and cleanup, hidden Secret input, authenticated API use, SSE cursor reconnection, redacted rendering, exact Approval decisions, configuration-wizard lifecycle, and optimistic-concurrency conflicts. Windows and Linux CI run without real provider credentials. Real-provider checks remain opt-in smoke tests and do not assert generated prose.
+Phase 2 must cover TTY startup and cleanup, hidden Secret input, separate Run/Admin credential handling, authenticated API use, SSE cursor reconnection, redacted rendering, exact Approval decisions, configuration-wizard lifecycle, and optimistic-concurrency conflicts. Windows and Linux CI run without real provider credentials. Real-provider checks remain opt-in smoke tests and do not assert generated prose.
 
 ## Decisions Recorded Elsewhere
 
