@@ -291,3 +291,56 @@ its working directory and was discarded; the direct worktree rerun exited 0.
 ### Round 1 Concerns
 
 - No implementation concerns remain for the Round 1 findings.
+
+## Round 2 Review Fixes
+
+### Finding
+
+The Round 1 compatibility allowlist constrained `maxTokensField` and
+`thinkingFormat` to strings but did not constrain their values. That allowed
+URL- and Secret-shaped strings to enter immutable runtime contract JSON.
+
+### RED Evidence
+
+```powershell
+npm run test:contract -- test/contract/model-registry-repository.test.ts
+```
+
+Result before the Round 2 production change: exit 1; 2 failed and 48 passed.
+The repository accepted `maxTokensField: "secret"` and
+`thinkingFormat: "https://provider.example/v1"` instead of throwing
+`DomainError("invalid_model_profile")`. The same run confirmed all seven
+documented Pi 0.73.1 enum values still round-tripped before hardening.
+
+### GREEN Evidence
+
+```powershell
+npm run test:contract -- test/contract/model-registry-repository.test.ts
+npm run typecheck
+git diff --check
+```
+
+Results: all exit 0. The focused contract file passed all 50 tests, including
+rejection of the URL/Secret-shaped values and persistence of each allowed
+enum value. TypeScript compilation and whitespace validation both passed.
+
+### Implementation
+
+- `maxTokensField` is now restricted to Pi's 0.73.1
+  `max_completion_tokens | max_tokens` enum.
+- `thinkingFormat` is now restricted to Pi's 0.73.1
+  `openai | deepseek | zai | qwen | qwen-chat-template` enum.
+- The contract tests exercise every accepted enum value at the real repository
+  boundary and ensure rejected values leave no persisted runtime JSON.
+
+### Self-Review
+
+- The exact domains are derived from the installed `@mariozechner/pi-ai@0.73.1`
+  compatibility types, not URL or Secret heuristics.
+- The existing boolean allowlist and rejection of unknown compatibility keys
+  remain unchanged.
+- No migration, historical revision, or runtime resolution behavior changed.
+
+### Round 2 Concerns
+
+- No implementation concerns remain for the Round 2 finding.

@@ -2056,9 +2056,17 @@ const PI_RUNTIME_BOOLEAN_COMPATIBILITY_KEYS = new Set([
   "zaiToolStream",
 ]);
 
-const PI_RUNTIME_STRING_COMPATIBILITY_KEYS = new Set([
-  "maxTokensField",
-  "thinkingFormat",
+const PI_RUNTIME_MAX_TOKENS_FIELDS = new Set([
+  "max_completion_tokens",
+  "max_tokens",
+]);
+
+const PI_RUNTIME_THINKING_FORMATS = new Set([
+  "openai",
+  "deepseek",
+  "zai",
+  "qwen",
+  "qwen-chat-template",
 ]);
 
 function isPiRuntimeCompatibility(
@@ -2067,7 +2075,10 @@ function isPiRuntimeCompatibility(
   if (!isRecord(value)) return false;
   return Object.entries(value).every(([key, entry]) =>
     (PI_RUNTIME_BOOLEAN_COMPATIBILITY_KEYS.has(key) && typeof entry === "boolean") ||
-    (PI_RUNTIME_STRING_COMPATIBILITY_KEYS.has(key) && typeof entry === "string")
+    (key === "maxTokensField" && typeof entry === "string" &&
+      PI_RUNTIME_MAX_TOKENS_FIELDS.has(entry)) ||
+    (key === "thinkingFormat" && typeof entry === "string" &&
+      PI_RUNTIME_THINKING_FORMATS.has(entry))
   );
 }
 
