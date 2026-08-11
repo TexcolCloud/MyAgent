@@ -32,3 +32,11 @@ WHEN NEW.revision_id IS NOT OLD.revision_id
 BEGIN
   SELECT RAISE(ABORT, 'immutable_model_profile_revision');
 END;
+
+CREATE TRIGGER provider_connections_driver_immutable
+BEFORE UPDATE OF provider_driver ON provider_connections
+FOR EACH ROW
+WHEN NEW.provider_driver IS NOT OLD.provider_driver
+BEGIN
+  SELECT RAISE(ABORT, 'immutable_provider_driver');
+END;

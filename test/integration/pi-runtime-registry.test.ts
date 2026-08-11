@@ -22,6 +22,7 @@ import type {
 } from "../../src/domain/ids.js";
 import { DEFAULT_RUN_LIMITS } from "../../src/domain/limits.js";
 import type { PiRuntimeContract } from "../../src/domain/pi-runtime.js";
+import { ModelProviderError } from "../../src/ports/model.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { FakeIds } from "../helpers/fake-ids.js";
 import { ScriptedModel, completedText } from "../helpers/scripted-model.js";
@@ -44,12 +45,12 @@ const ANTHROPIC_CONTRACT: PiRuntimeContract = {
   modelId: "claude-sonnet-4-20250514",
   contextWindow: 200_000,
   maxOutputTokens: 64_000,
-  compatibility: { supportsReasoning: true },
+  compatibility: { supportsDeveloperRole: false },
 };
 
 describe("persisted Pi runtime registry", () => {
   it("uses the exact stored contract for verification and Agent snapshots", async () => {
-    await usingFixture(async ({ db, repository }) => {
+    await usingFixture("stored-contract", async ({ db, repository }) => {
       const clock = new FakeClock(NOW);
       const ids = new FakeIds({
         providerConnectionRevisionIds: [CONNECTION_REVISION_ID],
@@ -194,6 +195,105 @@ describe("persisted Pi runtime registry", () => {
       expect(Object.isFrozen(snapshot.model.piRuntime?.compatibility)).toBe(true);
     });
   });
+
+  it("does not create a fallback revision or Verification for a failed Pi profile", async () => {
+    await usingFixture("failed-verification", async ({ repository }) => {
+      repository.createConnection({
+        connectionId: CONNECTION_ID,
+        displayName: "Anthropic",
+        providerKind: "openai_compatible",
+        providerDriver: "pi/anthropic",
+        revision: {
+          revisionId: CONNECTION_REVISION_ID,
+          connectionId: CONNECTION_ID,
+          state: "draft",
+          baseUrl: "https://api.anthropic.com/v1",
+          auth: { type: "none" },
+          allowInsecureHttp: false,
+          protocolPreference: "responses",
+          presetVersion: "pi-test-v1",
+          createdAt: NOW,
+        },
+        eventId: eventId("connection-create"),
+        traceId: "trace-connection",
+        now: NOW,
+      });
+      repository.createProfile({
+        profileId: PROFILE_ID,
+        displayName: "Claude",
+        revision: {
+          revisionId: PROFILE_REVISION_ID,
+          profileId: PROFILE_ID,
+          connectionRevisionId: CONNECTION_REVISION_ID,
+          state: "draft",
+          providerModelId: ANTHROPIC_CONTRACT.modelId,
+          invocationProtocol: "responses",
+          piRuntime: ANTHROPIC_CONTRACT,
+          maxInputTokens: ANTHROPIC_CONTRACT.contextWindow,
+          contextWindowSource: "preset",
+          capabilityBaseline: "text_and_single_tool_call_v1",
+          verifiedCapabilities: [],
+          createdAt: NOW,
+        },
+        eventId: eventId("profile-create"),
+        traceId: "trace-profile",
+        now: NOW,
+      });
+      repository.queueVerification({
+        verificationId: VERIFICATION_ID,
+        profileRevisionId: PROFILE_REVISION_ID,
+        expectedRevision: 0,
+        capabilityBaseline: "text_and_single_tool_call_v1",
+        eventId: eventId("verification-queue"),
+        traceId: "trace-verification",
+        now: NOW,
+      });
+      const claimed = repository.claimVerification({
+        leaseOwner: "worker-a",
+        now: NOW,
+        leaseUntil: new Date(NOW.getTime() + 60_000),
+      });
+      if (claimed === null) throw new Error("verification_not_claimed");
+
+      const model = new ScriptedModel();
+      model.script({
+        chunks: [],
+        error: new ModelProviderError({
+          code: "invocation_protocol_unsupported",
+          transient: false,
+          status: 404,
+        }),
+      });
+      const verifier = new VerifyModelService({
+        registry: repository,
+        model,
+        clock: new FakeClock(NOW),
+        ids: new FakeIds({
+          modelProfileRevisionIds: ["mpr_forbidden_fallback" as ModelProfileRevisionId],
+          modelVerificationIds: ["ver_forbidden_fallback" as ModelVerificationId],
+          modelRegistryEventIds: [
+            eventId("forbidden-fallback"),
+            eventId("verification-complete"),
+          ],
+        }),
+        requestTimeoutMs: 5_000,
+        jobTimeoutMs: 30_000,
+      });
+
+      const completed = await verifier.runClaimed(
+        claimed,
+        new AbortController().signal,
+      );
+
+      expect(completed).toMatchObject({
+        state: "failed",
+        resultCode: "invocation_protocol_unsupported",
+        fallbackVerificationId: null,
+      });
+      expect(repository.getProfile(PROFILE_ID).revisions).toHaveLength(1);
+      expect(repository.getVerification(VERIFICATION_ID).fallbackVerificationId).toBeNull();
+    });
+  });
 });
 
 const AGENT_DEFINITION: AgentDefinitionRevision = {
@@ -214,13 +314,14 @@ function eventId(value: string): ModelRegistryEventId {
 }
 
 async function usingFixture(
+  name: string,
   run: (fixture: {
     db: DatabaseSync;
     repository: SqliteModelRegistryRepository;
   }) => Promise<void>,
 ): Promise<void> {
   const connection = openDatabase({
-    path: tempPath("pi-runtime-registry.db"),
+    path: tempPath(`pi-runtime-registry-${name}.db`),
     busyTimeoutMs: 5_000,
   });
   try {

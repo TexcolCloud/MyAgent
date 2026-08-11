@@ -178,3 +178,116 @@ and passed in 154 seconds, followed by a successful standalone build.
   on this Windows environment. Its phases pass when run with an adequate test
   timeout, as recorded above.
 - No implementation concerns remain for Task 2.
+
+## Round 1 Review Fixes
+
+### RED Evidence
+
+Compatibility validation and direct SQLite immutability:
+
+```powershell
+npm run test:contract -- test/contract/sqlite-migrations.test.ts test/contract/model-registry-repository.test.ts
+```
+
+Result before production changes: exit 1; 4 failed and 55 passed. Three
+failures demonstrated the reviewed defects: `apiKey` and `baseUrl` were
+accepted inside persisted compatibility metadata, and direct
+`provider_driver` updates succeeded. The fourth failure was an expected JSON
+fixture that still named the removed fabricated `supportsReasoning` field; the
+literal was corrected to match the safe fixture before GREEN verification.
+
+The first Pi fallback run stopped on a duplicate fixture database path and was
+not counted as RED. After giving each integration case its own fixture name,
+the command reached the reviewed behavior:
+
+```powershell
+npm run test:integration -- test/integration/pi-runtime-registry.test.ts
+```
+
+Result before production changes: exit 1; 1 failed and 1 passed. A failed Pi
+verification received `fallbackVerificationId: "ver_forbidden_fallback"`
+instead of `null`, proving that it created the forbidden fallback revision and
+Verification.
+
+Legacy fallback baseline before production changes:
+
+```powershell
+npm run test:unit -- test/unit/model-verification.test.ts
+```
+
+Result: exit 0; 29 passed.
+
+### GREEN Evidence
+
+Focused contract verification:
+
+```powershell
+npm run test:contract -- test/contract/sqlite-migrations.test.ts test/contract/model-registry-repository.test.ts
+```
+
+Result: exit 0; 2 files passed, 59 tests passed.
+
+Focused Pi and legacy fallback verification:
+
+```powershell
+npm run test:integration -- test/integration/pi-runtime-registry.test.ts
+npm run test:unit -- test/unit/model-verification.test.ts
+```
+
+Results: both exit 0; 2 Pi integration tests and 29 legacy unit tests passed.
+
+Legacy migration and Pi runtime integration verification:
+
+```powershell
+npm run test:integration -- test/integration/legacy-model-migration.test.ts test/integration/pi-runtime-registry.test.ts
+```
+
+Result: exit 0; 2 files passed, 7 tests passed.
+
+Full repository tests:
+
+```powershell
+npm test
+```
+
+Result: exit 0; 80 files passed, 1 skipped; 777 tests passed, 5 skipped.
+
+Static verification and build:
+
+```powershell
+npm run typecheck
+npm run lint
+npm run build
+git diff --check
+```
+
+Results: all exit 0. Build completed TypeScript compilation and copied SQLite
+migrations. An initial escalated parallel `git diff --check` invocation lost
+its working directory and was discarded; the direct worktree rerun exited 0.
+
+### Implementation
+
+- Pi-backed Profile revisions now return no protocol fallback candidate.
+  Profiles without `piRuntime` retain the existing Responses/Chat fallback.
+- Migration 0003 adds a database trigger that aborts any direct
+  `provider_driver` mutation with `immutable_provider_driver`.
+- Persisted Pi compatibility metadata is pinned to the ten fields supported by
+  `@mariozechner/pi-ai@0.73.1`: eight boolean fields and two string fields.
+  Unknown fields, wrong types, numeric entries, credentials, and transport URLs
+  map to `DomainError("invalid_model_profile")`.
+
+### Self-Review
+
+- The Pi guard is placed after target resolution and before any fallback IDs or
+  revision objects are created, so failure completion remains unchanged and no
+  extra IDs are consumed.
+- The SQLite trigger uses `IS NOT`, matching the existing null-safe immutability
+  style and protecting both null/non-null transitions and Driver replacement.
+- The compatibility validator accepts empty metadata and all known 0.73.1
+  boolean/string fields while excluding arbitrary primitive extension points.
+- Existing legacy fallback coverage remained green before and after the fix.
+- No unrelated production behavior or schema history was changed.
+
+### Round 1 Concerns
+
+- No implementation concerns remain for the Round 1 findings.

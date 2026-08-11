@@ -465,6 +465,9 @@ export class VerifyModelService {
       return undefined;
     }
     const target = this.resolveTarget(claimed.profileRevisionId);
+    if (target.profileRevision.piRuntime !== undefined) {
+      return undefined;
+    }
     if (
       target.profileRevision.invocationProtocol !==
       target.connectionRevision.protocolPreference

@@ -24,8 +24,8 @@ const ANTHROPIC_CONTRACT: PiRuntimeContract = {
   contextWindow: 200_000,
   maxOutputTokens: 64_000,
   compatibility: {
-    supportsReasoning: true,
     supportsDeveloperRole: false,
+    supportsStrictMode: false,
   },
 };
 
@@ -53,7 +53,7 @@ describe("SqliteModelRegistryRepository", () => {
       ).get("mpr-pi")).toEqual({
         runtime_contract_json:
           '{"api":"anthropic-messages","catalogProviderId":"anthropic",' +
-          '"compatibility":{"supportsDeveloperRole":false,"supportsReasoning":true},' +
+          '"compatibility":{"supportsDeveloperRole":false,"supportsStrictMode":false},' +
           '"contextWindow":200000,"driverId":"pi/anthropic","kind":"pi_ai",' +
           '"maxOutputTokens":64000,"modelId":"claude-sonnet-4-20250514",' +
           '"piVersion":"0.73.1"}',
@@ -61,8 +61,44 @@ describe("SqliteModelRegistryRepository", () => {
       expect(() => db.prepare(
         "UPDATE model_profile_revisions SET runtime_contract_json = ? WHERE revision_id = ?",
       ).run("{}", "mpr-pi")).toThrowError("immutable_model_profile_revision");
+      expect(() => db.prepare(
+        "UPDATE provider_connections SET provider_driver = ? WHERE connection_id = ?",
+      ).run("pi/openai", "connection-pi")).toThrowError("immutable_provider_driver");
     });
   });
+
+  it.each(["apiKey", "baseUrl"])(
+    "rejects transport or credential compatibility field %s",
+    (unsafeField) => {
+      usingFixture(`unsafe-pi-runtime-${unsafeField}`, ({ db, repository }) => {
+        repository.createConnection({
+          ...createConnectionInput("connection-pi", "pcr-pi"),
+          providerDriver: "pi/anthropic",
+        });
+        const unsafeContract = {
+          ...ANTHROPIC_CONTRACT,
+          compatibility: {
+            ...ANTHROPIC_CONTRACT.compatibility,
+            [unsafeField]: unsafeField === "apiKey"
+              ? "secret-must-not-persist"
+              : "https://provider.example/v1",
+          },
+        };
+
+        expect(() => repository.createProfile({
+          ...createProfileInput("profile-pi", "mpr-pi", "pcr-pi"),
+          revision: profileRevision("mpr-pi", "profile-pi", "pcr-pi", {
+            providerModelId: unsafeContract.modelId,
+            invocationProtocol: "responses",
+            piRuntime: unsafeContract,
+          }),
+        })).toThrowError(expect.objectContaining({ code: "invalid_model_profile" }));
+        expect(db.prepare(
+          "SELECT runtime_contract_json FROM model_profile_revisions WHERE revision_id = ?",
+        ).get("mpr-pi")).toBeUndefined();
+      });
+    },
+  );
 
   it("maps malformed persisted Pi runtime JSON to the typed invalid Profile error", () => {
     usingFixture("malformed-pi-runtime-contract", ({ db, repository }) => {

@@ -2028,7 +2028,7 @@ function assertPiRuntime(value: unknown): asserts value is PiRuntimeContract {
     !isNonEmptyString(value.catalogProviderId) || !isNonEmptyString(value.api) ||
     !isNonEmptyString(value.modelId) || !isPositiveInteger(value.contextWindow) ||
     (value.maxOutputTokens !== undefined && !isPositiveInteger(value.maxOutputTokens)) ||
-    !isPrimitiveRecord(value.compatibility)) {
+    !isPiRuntimeCompatibility(value.compatibility)) {
     throw new DomainError("invalid_model_profile");
   }
 }
@@ -2045,12 +2045,29 @@ function isPositiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0;
 }
 
-function isPrimitiveRecord(
+const PI_RUNTIME_BOOLEAN_COMPATIBILITY_KEYS = new Set([
+  "requiresReasoningContentOnAssistantMessages",
+  "sendSessionAffinityHeaders",
+  "supportsDeveloperRole",
+  "supportsEagerToolInputStreaming",
+  "supportsReasoningEffort",
+  "supportsStore",
+  "supportsStrictMode",
+  "zaiToolStream",
+]);
+
+const PI_RUNTIME_STRING_COMPATIBILITY_KEYS = new Set([
+  "maxTokensField",
+  "thinkingFormat",
+]);
+
+function isPiRuntimeCompatibility(
   value: unknown,
-): value is Record<string, boolean | number | string> {
-  return isRecord(value) && Object.values(value).every((entry) =>
-    typeof entry === "boolean" || typeof entry === "string" ||
-    (typeof entry === "number" && Number.isFinite(entry))
+): value is Record<string, boolean | string> {
+  if (!isRecord(value)) return false;
+  return Object.entries(value).every(([key, entry]) =>
+    (PI_RUNTIME_BOOLEAN_COMPATIBILITY_KEYS.has(key) && typeof entry === "boolean") ||
+    (PI_RUNTIME_STRING_COMPATIBILITY_KEYS.has(key) && typeof entry === "string")
   );
 }
 

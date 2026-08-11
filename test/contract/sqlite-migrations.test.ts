@@ -390,6 +390,10 @@ describe("SQLite migrations", () => {
       ).run('{"kind":"changed"}', "mpr-a"))
         .toThrowError("immutable_model_profile_revision");
       expect(() => connection.db.prepare(
+        "UPDATE provider_connections SET provider_driver = ? WHERE connection_id = ?",
+      ).run("pi/deepseek", "connection-a"))
+        .toThrowError("immutable_provider_driver");
+      expect(() => connection.db.prepare(
         "DELETE FROM model_registry_events WHERE event_id = ?",
       ).run("event-a")).toThrowError("append_only_model_registry_events");
       expect(() => connection.db.prepare(
