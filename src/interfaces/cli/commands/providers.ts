@@ -9,7 +9,8 @@ export type ProviderAuthInput =
 export interface ProviderCreateInput {
   readonly slug: string;
   readonly displayName: string;
-  readonly kind: "openai" | "deepseek" | "openai_compatible";
+  readonly kind?: "openai" | "deepseek" | "openai_compatible";
+  readonly driverId?: string;
   readonly baseUrl?: string;
   readonly auth: ProviderAuthInput;
   readonly allowInsecureHttp?: boolean;

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 
+import type { ListProviderDriversService } from "../../../application/list-provider-drivers.js";
 import { manualModelEntryAllowed } from "../../../application/discover-models.js";
 import type { ManageModelProfilesService } from "../../../application/manage-model-profiles.js";
 import { modelContextPreset } from "../../../config/provider-presets.js";
@@ -34,6 +35,7 @@ export function registerModelProfileRoutes(
       | "listProfiles"
     >;
     readonly profiles: ManageModelProfilesService;
+    readonly providerDrivers: ListProviderDriversService;
     readonly now?: () => Date;
   },
 ): void {
@@ -46,28 +48,32 @@ export function registerModelProfileRoutes(
       const target = services.registry.getConnectionRevision(connectionRevisionId);
       if (target === null) throw new Error("provider_connection_revision_not_found");
       const now = services.now?.() ?? new Date();
-      assertModelSelection(
-        services.registry.getDiscoveredModels(connectionRevisionId, now),
-        body.modelId,
-        body.manualEntryAcknowledged === true,
-      );
-      const context = resolveContext(
-        target.providerKind,
-        body.modelId,
-        body.maxInputTokens,
-        body.contextWindowSource,
-      );
+      const discovery = services.registry.getDiscoveredModels(connectionRevisionId, now);
+      const resolved = "catalogCandidateId" in body
+        ? resolveCatalogSelection(
+          services,
+          target.providerDriver,
+          body,
+        )
+        : resolveManualSelection(
+          target.providerKind,
+          target.providerDriver,
+          target.revision.protocolPreference,
+          body,
+        );
+      assertModelSelection(discovery, resolved.modelId, resolved.manualEntryAcknowledged);
       const profileId = parseModelProfileId(body.slug);
       const result = createProfileOrConflict(services, profileId, () =>
         services.profiles.create({
           profileId,
           displayName: body.displayName,
           connectionRevisionId,
-          providerModelId: body.modelId,
-          invocationProtocol: body.protocol === "auto"
-            ? target.revision.protocolPreference
-            : body.protocol,
-          ...context,
+          providerModelId: resolved.modelId,
+          invocationProtocol: resolved.invocationProtocol,
+          ...(resolved.candidate === undefined
+            ? {}
+            : { piRuntime: { kind: "pi_ai" as const, ...resolved.candidate.invocation } }),
+          ...resolved.context,
           traceId: request.id,
         }));
       return reply.code(201).send(profileResponse(result));
@@ -173,6 +179,100 @@ function assertModelSelection(
   throw new DomainError("manual_model_entry_required");
 }
 
+function resolveCatalogSelection(
+  services: { readonly providerDrivers: ListProviderDriversService },
+  providerDriver: string | undefined,
+  body: {
+    readonly catalogCandidateId: string;
+    readonly maxInputTokens?: number | undefined;
+    readonly contextWindowSource?: ModelProfileRevision["contextWindowSource"] | undefined;
+  },
+) {
+  const candidate = services.providerDrivers.resolveSupportedCandidate(
+    body.catalogCandidateId,
+  );
+  if (providerDriver !== candidate.driverId) {
+    throw new DomainError("invalid_model_profile");
+  }
+  return {
+    candidate,
+    modelId: candidate.modelId,
+    invocationProtocol: "pi_ai" as const,
+    manualEntryAcknowledged: false,
+    context: resolveCatalogContext(
+      candidate.invocation.contextWindow,
+      body.maxInputTokens,
+      body.contextWindowSource,
+    ),
+  };
+}
+
+function resolveCatalogContext(
+  catalogContextWindow: number,
+  maxInputTokens: number | undefined,
+  source: ModelProfileRevision["contextWindowSource"] | undefined,
+): Pick<ModelProfileRevision, "maxInputTokens" | "contextWindowSource"> {
+  if (
+    (source === undefined && maxInputTokens === undefined) ||
+    (
+      source === "preset" &&
+      (maxInputTokens === undefined || maxInputTokens === catalogContextWindow)
+    )
+  ) {
+    return {
+      maxInputTokens: catalogContextWindow,
+      contextWindowSource: "preset",
+    };
+  }
+  if (
+    source === "operator" &&
+    maxInputTokens !== undefined &&
+    maxInputTokens <= catalogContextWindow
+  ) {
+    return { maxInputTokens, contextWindowSource: "operator" };
+  }
+  if (
+    source === "assumed_32768" &&
+    maxInputTokens === 32_768 &&
+    maxInputTokens <= catalogContextWindow
+  ) {
+    return { maxInputTokens, contextWindowSource: "assumed_32768" };
+  }
+  throw new DomainError("invalid_model_context_window");
+}
+
+function resolveManualSelection(
+  providerKind: ProviderKind,
+  providerDriver: string | undefined,
+  protocolPreference: "chat_completions" | "responses" | "pi_ai",
+  body: {
+    readonly modelId: string;
+    readonly protocol: "auto" | "chat_completions" | "responses";
+    readonly maxInputTokens?: number | undefined;
+    readonly contextWindowSource?: ModelProfileRevision["contextWindowSource"] | undefined;
+    readonly manualEntryAcknowledged?: boolean | undefined;
+  },
+) {
+  if (providerDriver !== "pi/openai-compatible") {
+    throw new DomainError("invalid_model_profile");
+  }
+  const manualEntryAcknowledged = body.manualEntryAcknowledged === true;
+  return {
+    candidate: undefined,
+    modelId: body.modelId,
+    invocationProtocol: body.protocol === "auto"
+      ? protocolPreference
+      : body.protocol,
+    manualEntryAcknowledged,
+    context: resolveContext(
+      providerKind,
+      body.modelId,
+      body.maxInputTokens,
+      body.contextWindowSource,
+    ),
+  };
+}
+
 function resolveContext(
   providerKind: ProviderKind,
   modelId: string,
@@ -202,10 +302,18 @@ function profileResponse(profile: ModelProfileView) {
     activeRevisionId: profile.activeRevisionId,
     retiredAt: profile.retiredAt?.toISOString() ?? null,
     recordRevision: profile.recordRevision,
-    revisions: profile.revisions.map((revision) => ({
-      ...revision,
-      createdAt: revision.createdAt.toISOString(),
-    })),
+    revisions: profile.revisions.map((revision) => {
+      const { piRuntime, ...safeRevision } = revision;
+      return {
+        ...safeRevision,
+        ...(piRuntime === undefined
+          ? {}
+          : {
+              catalogCandidateId: `${piRuntime.driverId}:${piRuntime.modelId}`,
+            }),
+        createdAt: revision.createdAt.toISOString(),
+      };
+    }),
   };
 }
 

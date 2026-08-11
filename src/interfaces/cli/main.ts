@@ -68,10 +68,11 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     if (command === "providers add") {
       rejectVisibleApiKey(flags);
       const baseUrl = stringFlag(flags, "base-url");
+      const provider = providerSelection(flags);
       await addProvider(client, {
         slug: requiredFlag(flags, "slug"),
         displayName: requiredFlag(flags, "display-name"),
-        kind: oneOf(requiredFlag(flags, "kind"), ["openai", "deepseek", "openai_compatible"] as const),
+        ...provider,
         ...(baseUrl === undefined ? {} : { baseUrl }),
         auth: await providerAuth(flags, options.readStdin ?? readStandardInput),
         ...(booleanFlag(flags, "allow-insecure-http") ? { allowInsecureHttp: true } : {}),
@@ -88,6 +89,9 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
         auth: await providerAuth(flags, options.readStdin ?? readStandardInput),
         allowInsecureHttp: booleanFlag(flags, "allow-insecure-http"),
         protocolPreference: oneOf(requiredFlag(flags, "protocol"), ["chat_completions", "responses"] as const),
+        ...(stringFlag(flags, "driver") === undefined
+          ? {}
+          : { driverId: requiredFlag(flags, "driver") }),
       }, write);
       return 0;
     }
@@ -96,12 +100,12 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     if (command === "providers promote") { await promoteProvider(client, requiredFlag(flags, "provider"), requiredFlag(flags, "connection-revision"), revisionFlag(flags), write); return 0; }
     if (command === "providers retire") { await retireProvider(client, requiredFlag(flags, "provider"), revisionFlag(flags), write); return 0; }
     if (command === "models create") {
+      const selection = modelSelection(flags);
       await createModel(client, {
         slug: requiredFlag(flags, "slug"),
         displayName: requiredFlag(flags, "display-name"),
         connectionRevisionId: requiredFlag(flags, "connection-revision"),
-        modelId: requiredFlag(flags, "model-id"),
-        protocol: oneOf(requiredFlag(flags, "protocol"), ["auto", "chat_completions", "responses"] as const),
+        ...selection,
         ...(stringFlag(flags, "max-input-tokens") === undefined ? {} : { maxInputTokens: positiveIntegerFlag(flags, "max-input-tokens") }),
         ...(stringFlag(flags, "context-source") === undefined ? {} : { contextWindowSource: oneOf(requiredFlag(flags, "context-source"), ["preset", "operator", "assumed_32768"] as const) }),
         ...(booleanFlag(flags, "manual-entry") ? { manualEntryAcknowledged: true } : {}),
@@ -216,6 +220,45 @@ function oneOf<const T extends readonly string[]>(value: string, allowed: T): T[
   throw new CliUsageError("invalid_cli_option", "A CLI option has an invalid value.");
 }
 
+function providerSelection(flags: CliFlags):
+  | { readonly kind: "openai" | "deepseek" | "openai_compatible" }
+  | { readonly driverId: string } {
+  const kind = stringFlag(flags, "kind");
+  const driverId = stringFlag(flags, "driver");
+  if ((kind === undefined) === (driverId === undefined)) {
+    throw new CliUsageError("invalid_cli_option", "Choose one Provider Driver.");
+  }
+  return driverId === undefined
+    ? { kind: oneOf(kind!, ["openai", "deepseek", "openai_compatible"] as const) }
+    : { driverId };
+}
+
+function modelSelection(flags: CliFlags):
+  | {
+      readonly modelId: string;
+      readonly protocol: "auto" | "chat_completions" | "responses";
+    }
+  | { readonly catalogCandidateId: string } {
+  const modelId = stringFlag(flags, "model-id");
+  const catalogCandidateId = stringFlag(flags, "catalog-candidate");
+  if ((modelId === undefined) === (catalogCandidateId === undefined)) {
+    throw new CliUsageError("invalid_cli_option", "Choose one Model source.");
+  }
+  if (catalogCandidateId !== undefined) {
+    if (stringFlag(flags, "protocol") !== undefined || booleanFlag(flags, "manual-entry")) {
+      throw new CliUsageError("invalid_cli_option", "Catalog models use server-resolved invocation data.");
+    }
+    return { catalogCandidateId };
+  }
+  return {
+    modelId: modelId!,
+    protocol: oneOf(
+      requiredFlag(flags, "protocol"),
+      ["auto", "chat_completions", "responses"] as const,
+    ),
+  };
+}
+
 function cliFailure(error: unknown): { exitCode: number; problem: CliProblemOutput } {
   if (error instanceof CliUsageError) return { exitCode: 2, problem: error };
   if (error instanceof CliValidationError) return { exitCode: 2, problem: error };
@@ -267,13 +310,13 @@ const COMMAND_GRAMMAR: Readonly<Record<string, {
   "sessions delete": { positional: 3, flags: RUN_FLAGS },
   backup: { positional: 2, flags: RUN_FLAGS },
   "model setup": { positional: 2, flags: ADMIN_FLAGS },
-  "providers add": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "kind", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
-  "providers update": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision", "display-name", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
+  "providers add": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "kind", "driver", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
+  "providers update": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision", "driver", "display-name", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
   "providers list": { positional: 2, flags: ADMIN_FLAGS },
   "providers discover": { positional: 2, flags: [...ADMIN_FLAGS, "connection-revision", "expected-revision"] },
   "providers promote": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "connection-revision", "expected-revision"] },
   "providers retire": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision"] },
-  "models create": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "connection-revision", "model-id", "protocol", "max-input-tokens", "context-source", "manual-entry"] },
+  "models create": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "connection-revision", "catalog-candidate", "model-id", "protocol", "max-input-tokens", "context-source", "manual-entry"] },
   "models verify": { positional: 2, flags: [...ADMIN_FLAGS, "profile-revision", "expected-revision"] },
   "models promote": { positional: 2, flags: [...ADMIN_FLAGS, "model", "profile-revision", "expected-revision"] },
   "models list": { positional: 2, flags: ADMIN_FLAGS },

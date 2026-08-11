@@ -11,12 +11,14 @@ const environment = {
 describe("model control CLI", () => {
   it.each([
     [["providers", "add", "--slug", "deepseek", "--display-name", "DeepSeek", "--kind", "deepseek", "--base-url", "https://api.deepseek.com", "--api-key-env", "DEEPSEEK_API_KEY", "--protocol", "responses"], "POST", "/v1/admin/provider-connections", { slug: "deepseek", displayName: "DeepSeek", kind: "deepseek", baseUrl: "https://api.deepseek.com", auth: { type: "environment", fromEnvironment: "DEEPSEEK_API_KEY" }, protocolPreference: "responses" }],
+    [["providers", "add", "--slug", "native-openai", "--display-name", "Native OpenAI", "--driver", "pi/openai", "--api-key-env", "OPENAI_API_KEY"], "POST", "/v1/admin/provider-connections", { slug: "native-openai", displayName: "Native OpenAI", driverId: "pi/openai", auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" } }],
     [["providers", "update", "--provider", "deepseek", "--expected-revision", "1", "--display-name", "DeepSeek", "--base-url", "https://api.deepseek.com", "--api-key-env", "DEEPSEEK_API_KEY", "--protocol", "responses"], "POST", "/v1/admin/provider-connections/deepseek/revisions", { expectedRevision: 1, displayName: "DeepSeek", baseUrl: "https://api.deepseek.com", auth: { type: "environment", fromEnvironment: "DEEPSEEK_API_KEY" }, allowInsecureHttp: false, protocolPreference: "responses" }],
     [["providers", "list"], "GET", "/v1/admin/provider-connections", undefined],
     [["providers", "discover", "--connection-revision", "pcr_1", "--expected-revision", "2"], "POST", "/v1/admin/provider-connection-revisions/pcr_1/discover", { expectedRevision: 2 }],
     [["providers", "promote", "--provider", "deepseek", "--connection-revision", "pcr_1", "--expected-revision", "2"], "POST", "/v1/admin/provider-connections/deepseek/promotions", { connectionRevisionId: "pcr_1", expectedRevision: 2 }],
     [["providers", "retire", "--provider", "deepseek", "--expected-revision", "3"], "POST", "/v1/admin/provider-connections/deepseek/retirement", { expectedRevision: 3 }],
     [["models", "create", "--slug", "deepseek-flash", "--display-name", "DeepSeek Flash", "--connection-revision", "pcr_1", "--model-id", "deepseek-v4-flash", "--protocol", "responses", "--max-input-tokens", "65536", "--context-source", "operator"], "POST", "/v1/admin/model-profiles", { slug: "deepseek-flash", displayName: "DeepSeek Flash", connectionRevisionId: "pcr_1", modelId: "deepseek-v4-flash", protocol: "responses", maxInputTokens: 65536, contextWindowSource: "operator" }],
+    [["models", "create", "--slug", "gpt-mini", "--display-name", "GPT Mini", "--connection-revision", "pcr_1", "--catalog-candidate", "pi/openai:gpt-4.1-mini"], "POST", "/v1/admin/model-profiles", { slug: "gpt-mini", displayName: "GPT Mini", connectionRevisionId: "pcr_1", catalogCandidateId: "pi/openai:gpt-4.1-mini" }],
     [["models", "promote", "--model", "deepseek-flash", "--profile-revision", "mpr_1", "--expected-revision", "2"], "POST", "/v1/admin/model-profiles/deepseek-flash/promotions", { profileRevisionId: "mpr_1", expectedRevision: 2 }],
     [["models", "list"], "GET", "/v1/admin/model-profiles", undefined],
     [["models", "retire", "--model", "deepseek-flash", "--expected-revision", "3"], "POST", "/v1/admin/model-profiles/deepseek-flash/retirement", { expectedRevision: 3 }],
@@ -447,7 +449,7 @@ describe("model control CLI", () => {
     const requests: string[] = [];
     const output: string[] = [];
     const prompt = scriptedPrompt({
-      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      selects: ["deepseek", "deepseek-v4-flash", "environment", "operator"],
       inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", "primary"],
       confirmations: [true, false, false],
     });
@@ -477,10 +479,117 @@ describe("model control CLI", () => {
     expect(output.join("\n")).toContain("Affected Agents: primary");
   });
 
+  it("labels a static choice as Catalog model and sends only Driver/Candidate identifiers", async () => {
+    const requests: CapturedRequest[] = [];
+    const selectLabels: string[] = [];
+    const selectAnswers = [
+      "openai",
+      "pi/openai:gpt-4.1-mini",
+      "environment",
+      "preset",
+    ];
+    const inputAnswers = [
+      "openai",
+      "OpenAI",
+      "https://api.openai.com/v1",
+      "OPENAI_API_KEY",
+      "gpt-mini",
+      "GPT Mini",
+    ];
+    const prompt: CliPrompt = {
+      select: async <T extends string>(message: string) => {
+        selectLabels.push(message);
+        return selectAnswers.shift() as T;
+      },
+      input: async () => inputAnswers.shift()!,
+      secret: async () => { throw new Error("unexpected_secret_prompt"); },
+      confirm: async () => false,
+    };
+    const fetcher = createFetcher((request) => {
+      requests.push(request);
+      if (request.path === "/v1/admin/provider-drivers") {
+        return jsonResponse(providerDriverCatalog());
+      }
+      if (request.path === "/v1/admin/provider-connections") {
+        return jsonResponse({
+          connectionId: "openai",
+          displayName: "OpenAI",
+          providerKind: "openai",
+          providerDriver: "pi/openai",
+          activeRevisionId: null,
+          retiredAt: null,
+          recordRevision: 0,
+          credentialConfigured: true,
+          revisions: [{
+            revisionId: "pcr_1",
+            connectionId: "openai",
+            state: "draft",
+            baseUrl: "https://api.openai.com/v1",
+            allowInsecureHttp: false,
+            protocolPreference: "responses",
+            presetVersion: "openai-v1",
+            credentialConfigured: true,
+            createdAt: "2026-08-10T00:00:00.000Z",
+          }],
+        }, 201);
+      }
+      if (request.path.endsWith("/discover")) {
+        return jsonResponse({
+          connectionRevisionId: "pcr_1",
+          recordRevision: 1,
+          state: "fresh",
+          models: [{ id: "gpt-4.1-mini" }],
+          cache: { fetchedAt: null, expiresAt: null },
+          error: null,
+        });
+      }
+      if (request.path === "/v1/admin/model-profiles") {
+        return jsonResponse({
+          ...profileResponse(),
+          profileId: "gpt-mini",
+          revisions: [{
+            ...profileResponse().revisions[0],
+            providerModelId: "gpt-4.1-mini",
+            catalogCandidateId: "pi/openai:gpt-4.1-mini",
+            invocationProtocol: "pi_ai",
+            maxInputTokens: 1_047_576,
+            contextWindowSource: "preset",
+          }],
+        }, 201);
+      }
+      return jsonResponse({ ok: true });
+    });
+
+    const exitCode = await executeCli(["model", "setup"], {
+      environment,
+      fetcher,
+      prompt,
+      write: vi.fn(),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests.map(({ method, path }) => `${method} ${path}`).slice(0, 4))
+      .toEqual([
+        "GET /v1/admin/provider-drivers",
+        "POST /v1/admin/provider-connections",
+        "POST /v1/admin/provider-connection-revisions/pcr_1/discover",
+        "POST /v1/admin/model-profiles",
+      ]);
+    expect(selectLabels).toContain("Catalog model");
+    expect(selectLabels).not.toContain("Model");
+    expect(requests[1]?.body).toMatchObject({ driverId: "pi/openai" });
+    expect(requests[1]?.body).not.toHaveProperty("kind");
+    expect(requests[3]?.body).toMatchObject({
+      catalogCandidateId: "pi/openai:gpt-4.1-mini",
+    });
+    expect(requests[3]?.body).not.toHaveProperty("modelId");
+    expect(requests[3]?.body).not.toHaveProperty("invocation");
+  });
+
   it("lets the control plane resolve a selected preset context limit", async () => {
     let profileBody: Record<string, unknown> | undefined;
     const prompt = scriptedPrompt({
-      selects: ["deepseek", "environment", "deepseek-chat", "preset"],
+      selects: ["deepseek", "deepseek-chat", "environment", "preset"],
       inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", "deepseek-chat", "DeepSeek Chat"],
       confirmations: [false],
     });
@@ -509,7 +618,7 @@ describe("model control CLI", () => {
     const requests: string[] = [];
     const output: string[] = [];
     const prompt = scriptedPrompt({
-      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      selects: ["deepseek", "deepseek-v4-flash", "environment", "operator"],
       inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", ""],
       confirmations: [true, false],
     });
@@ -542,7 +651,7 @@ describe("model control CLI", () => {
   it("emits one JSON result for successful interactive setup", async () => {
     const output: string[] = [];
     const prompt = scriptedPrompt({
-      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      selects: ["deepseek", "deepseek-v4-flash", "environment", "operator"],
       inputs: ["deepseek", "DeepSeek", "https://raw.example.test/", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", ""],
       confirmations: [true, false, true],
     });
@@ -566,9 +675,13 @@ describe("model control CLI", () => {
     expect(output[0]).not.toContain("https://raw.example.test/");
   });
 
-  it("maps a blank required interactive value to one validation Problem before HTTP", async () => {
+  it("maps a blank required interactive value after the safe catalog read", async () => {
     const output: string[] = [];
-    const fetcher = vi.fn<typeof fetch>();
+    const requests: CapturedRequest[] = [];
+    const fetcher = createFetcher((request) => {
+      requests.push(request);
+      return jsonResponse(providerDriverCatalog());
+    });
     const prompt = scriptedPrompt({
       selects: ["deepseek"],
       inputs: ["   "],
@@ -583,7 +696,10 @@ describe("model control CLI", () => {
     });
 
     expect(exitCode).toBe(2);
-    expect(fetcher).not.toHaveBeenCalled();
+    expect(requests).toEqual([expect.objectContaining({
+      method: "GET",
+      path: "/v1/admin/provider-drivers",
+    })]);
     expect(output).toEqual(['{"code":"missing_interactive_value","detail":"A required interactive value is missing.","traceId":"cli"}']);
   });
 
@@ -591,7 +707,7 @@ describe("model control CLI", () => {
     const requests: string[] = [];
     const output: string[] = [];
     const prompt = scriptedPrompt({
-      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      selects: ["deepseek", "deepseek-v4-flash", "environment", "operator"],
       inputs: ["deepseek", "DeepSeek", "https://raw.example.test/", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", contextLimit],
       confirmations: [],
     });
@@ -612,7 +728,7 @@ describe("model control CLI", () => {
   it("emits one JSON Problem for interactive Verification failure", async () => {
     const output: string[] = [];
     const prompt = scriptedPrompt({
-      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      selects: ["deepseek", "deepseek-v4-flash", "environment", "operator"],
       inputs: ["deepseek", "DeepSeek", "https://raw.example.test/", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", ""],
       confirmations: [true, false],
     });
@@ -641,7 +757,7 @@ describe("model control CLI", () => {
   ])("emits one JSON Problem when confirmed setup receives HTTP %i", async (status, code, expectedExit) => {
     const output: string[] = [];
     const prompt = scriptedPrompt({
-      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      selects: ["deepseek", "deepseek-v4-flash", "environment", "operator"],
       inputs: ["deepseek", "DeepSeek", "https://raw.example.test/", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", ""],
       confirmations: [true, false, true],
     });
@@ -667,7 +783,7 @@ describe("model control CLI", () => {
     const confirmations: string[] = [];
     let promotionConfirmed = false;
     const values = {
-      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      selects: ["deepseek", "deepseek-v4-flash", "environment", "operator"],
       inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", "deepseek-flash", "DeepSeek Flash", "65536", "primary"],
       confirmations: [true, true, true],
     };
@@ -729,7 +845,7 @@ describe("model control CLI", () => {
     const requests: CapturedRequest[] = [];
     const output: string[] = [];
     const prompt = scriptedPrompt({
-      selects: ["deepseek", "environment", "deepseek-v4-flash", "operator"],
+      selects: ["deepseek", "deepseek-v4-flash", "environment", "operator"],
       inputs: [
         "deepseek",
         "DeepSeek",
@@ -891,6 +1007,7 @@ function setupFetcher(requests: string[]): typeof fetch {
 }
 
 function setupResponse(request: CapturedRequest): Response {
+  if (request.path === "/v1/admin/provider-drivers") return jsonResponse(providerDriverCatalog());
   if (request.path === "/v1/admin/provider-connections") return jsonResponse({ connectionId: "deepseek", displayName: "DeepSeek", providerKind: "deepseek", activeRevisionId: null, retiredAt: null, recordRevision: 0, credentialConfigured: true, revisions: [{ revisionId: "pcr_1", connectionId: "deepseek", state: "draft", baseUrl: "https://api.deepseek.com/v1", allowInsecureHttp: false, protocolPreference: "responses", presetVersion: "1", credentialConfigured: true, createdAt: "2026-08-10T00:00:00.000Z" }] }, 201);
   if (request.path.endsWith("/discover")) return jsonResponse({ connectionRevisionId: "pcr_1", recordRevision: 1, state: "fresh", models: [{ id: "deepseek-v4-flash" }], cache: { fetchedAt: "2026-08-10T00:00:00.000Z", expiresAt: "2026-08-10T01:00:00.000Z" }, error: null });
   if (request.path === "/v1/admin/model-profiles") return jsonResponse(profileResponse(), 201);
@@ -898,6 +1015,41 @@ function setupResponse(request: CapturedRequest): Response {
   if (request.method === "POST" && request.path.endsWith("/verifications")) return jsonResponse({ verificationId: "ver_1", profileRevisionId: "mpr_1", capabilityBaseline: "text_and_single_tool_call_v1", status: "queued", recordRevision: 1, operationUrl: "/v1/admin/model-verifications/ver_1" }, 202);
   if (request.path === "/v1/admin/model-verifications/ver_1") return jsonResponse(verification("passed"));
   return jsonResponse({ ok: true });
+}
+
+function providerDriverCatalog() {
+  return {
+    piVersion: "0.73.1",
+    drivers: [
+      {
+        driverId: "pi/openai",
+        candidates: [{
+          candidateId: "pi/openai:gpt-4.1-mini",
+          displayName: "GPT-4.1 mini",
+          modelId: "gpt-4.1-mini",
+          credentialSupport: "bearer",
+        }],
+      },
+      {
+        driverId: "pi/deepseek",
+        candidates: [
+          {
+            candidateId: "pi/deepseek:deepseek-v4-flash",
+            displayName: "DeepSeek V4 Flash",
+            modelId: "deepseek-v4-flash",
+            credentialSupport: "bearer",
+          },
+          {
+            candidateId: "pi/deepseek:deepseek-chat",
+            displayName: "DeepSeek Chat",
+            modelId: "deepseek-chat",
+            credentialSupport: "bearer",
+          },
+        ],
+      },
+      { driverId: "pi/openai-compatible", candidates: [] },
+    ],
+  };
 }
 
 function profileResponse() {

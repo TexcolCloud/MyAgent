@@ -26,8 +26,11 @@ export function migrate(db: DatabaseSync): void {
 }
 
 function applyNextMigration(db: DatabaseSync, migrations: readonly Migration[]): boolean {
-  db.exec("BEGIN IMMEDIATE");
+  db.exec("PRAGMA foreign_keys = OFF");
+  let transactionStarted = false;
   try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionStarted = true;
     const appliedVersions = db
       .prepare("SELECT version FROM schema_migrations ORDER BY version")
       .all() as Array<{ version: number }>;
@@ -36,16 +39,29 @@ function applyNextMigration(db: DatabaseSync, migrations: readonly Migration[]):
 
     if (migration !== undefined) {
       db.exec(migration.sql);
+      const violations = db.prepare("PRAGMA foreign_key_check").all();
+      if (violations.length > 0) {
+        throw new Error(`migration_foreign_key_violation:${JSON.stringify(violations)}`);
+      }
       db.prepare(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
       ).run(migration.version);
     }
 
     db.exec("COMMIT");
+    transactionStarted = false;
     return migration !== undefined;
   } catch (error) {
-    db.exec("ROLLBACK");
+    if (transactionStarted) {
+      try {
+        db.exec("ROLLBACK");
+      } finally {
+        transactionStarted = false;
+      }
+    }
     throw error;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
   }
 }
 

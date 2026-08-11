@@ -22,6 +22,18 @@ interface ProviderResponse {
   }];
 }
 
+interface ProviderDriverCatalogResponse {
+  readonly drivers: readonly {
+    readonly driverId: string;
+    readonly candidates: readonly {
+      readonly candidateId: string;
+      readonly displayName: string;
+      readonly modelId: string;
+      readonly credentialSupport: "bearer" | "none" | "unsupported";
+    }[];
+  }[];
+}
+
 interface DiscoveryResponse {
   readonly recordRevision: number;
   readonly state: "fresh" | "stale" | "empty" | "unsupported" | "failed";
@@ -47,15 +59,25 @@ export async function setupModel(
   write: CliWrite,
   json: boolean,
 ): Promise<number> {
-  // 1. Select provider preset.
+  const catalog = await client.request<ProviderDriverCatalogResponse>(
+    "/v1/admin/provider-drivers",
+    { authority: "admin" },
+  );
+
+  // 1. Select a stable Driver and, for native Drivers, a Catalog Model Candidate.
   const selectedKind = await prompt.select("Provider", ["openai", "deepseek", "custom"] as const);
-  const kind = selectedKind === "custom" ? "openai_compatible" : selectedKind;
+  const driverId = selectedKind === "custom"
+    ? "pi/openai-compatible"
+    : `pi/${selectedKind}`;
   const preset = presets[selectedKind];
 
   // 2. Collect the immutable connection destination and credential reference.
   const slug = requiredAnswer(await prompt.input("Provider slug", selectedKind));
   const displayName = requiredAnswer(await prompt.input("Provider display name", title(selectedKind)));
   const baseUrl = requiredAnswer(await prompt.input("Base URL", preset.baseUrl));
+  const catalogCandidate = selectedKind === "custom"
+    ? undefined
+    : await selectCatalogCandidate(catalog, driverId, prompt);
   const authChoices = selectedKind === "custom"
     ? ["environment", "managed_secret", "none"] as const
     : ["environment", "managed_secret"] as const;
@@ -73,7 +95,7 @@ export async function setupModel(
     body: {
       slug,
       displayName,
-      kind,
+      driverId,
       baseUrl,
       ...credential,
       protocolPreference: preset.protocol,
@@ -96,13 +118,14 @@ export async function setupModel(
     }, json);
     return 5;
   }
-  const manual = discovery.state === "empty" || discovery.state === "unsupported";
+  const manual = selectedKind === "custom" &&
+    (discovery.state === "empty" || discovery.state === "unsupported");
   if (!manual && discovery.models.length === 0) throw new Error("invalid_control_plane_response");
 
   // 5. Select the model and resolve an explicit context source.
-  const modelId = manual
+  const modelId = catalogCandidate?.modelId ?? (manual
     ? requiredAnswer(await prompt.input("Model ID"))
-    : await prompt.select("Model", discovery.models.map((model) => model.id));
+    : await prompt.select("Discovered model", discovery.models.map((model) => model.id)));
   const profileSlug = requiredAnswer(await prompt.input("Model profile slug", slugFor(modelId)));
   const profileName = requiredAnswer(await prompt.input("Model profile display name", modelId));
   const contextSource = await prompt.select("Context source", ["preset", "operator", "assumed_32768"] as const);
@@ -118,8 +141,12 @@ export async function setupModel(
       slug: profileSlug,
       displayName: profileName,
       connectionRevisionId: connectionRevision.revisionId,
-      modelId,
-      protocol: connectionRevision.protocolPreference,
+      ...(catalogCandidate === undefined
+        ? {
+            modelId,
+            protocol: connectionRevision.protocolPreference,
+          }
+        : { catalogCandidateId: catalogCandidate.candidateId }),
       ...context,
       ...(manual ? { manualEntryAcknowledged: true } : {}),
     },
@@ -242,6 +269,27 @@ export async function setupModel(
   }
   writeSetupResult(write, json, { status: "configured", profileId: profileSlug, traceId: verification.traceId }, review);
   return 0;
+}
+
+async function selectCatalogCandidate(
+  catalog: ProviderDriverCatalogResponse,
+  driverId: string,
+  prompt: CliPrompt,
+): Promise<ProviderDriverCatalogResponse["drivers"][number]["candidates"][number]> {
+  const driver = catalog.drivers.find((entry) => entry.driverId === driverId);
+  const candidates = driver?.candidates.filter(
+    (candidate) => candidate.credentialSupport !== "unsupported",
+  ) ?? [];
+  if (candidates.length === 0) throw new Error("invalid_control_plane_response");
+  const selected = await prompt.select(
+    "Catalog model",
+    candidates.map((candidate) => candidate.candidateId),
+  );
+  const candidate = candidates.find(
+    (entry) => entry.candidateId === selected || entry.modelId === selected,
+  );
+  if (candidate === undefined) throw new Error("invalid_control_plane_response");
+  return candidate;
 }
 
 export function createConsolePrompt(): CliPrompt {

@@ -225,6 +225,77 @@ describe("HTTP model control plane", () => {
     }
   });
 
+  it("creates a native Provider Connection from a server-resolved Driver", async () => {
+    const harness = await startTestApp();
+    try {
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "native-openai",
+          displayName: "Native OpenAI",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toMatchObject({
+        connectionId: "native-openai",
+        providerKind: "openai",
+        providerDriver: "pi/openai",
+      });
+      expect(harness.modelRegistry.getConnection("native-openai" as never))
+        .toMatchObject({ providerDriver: "pi/openai" });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a mismatched Driver on a Provider Connection revision", async () => {
+    const harness = await startTestApp();
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "immutable-driver",
+          displayName: "Immutable Driver",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+      expect(created.statusCode).toBe(201);
+
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections/immutable-driver/revisions",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          expectedRevision: 0,
+          displayName: "Immutable Driver",
+          driverId: "pi/deepseek",
+          baseUrl: "https://api.openai.com/v1",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+          allowInsecureHttp: false,
+          protocolPreference: "responses",
+        },
+      });
+
+      expect(response.statusCode).toBe(422);
+      expect(response.json()).toMatchObject({ code: "invalid_provider_connection" });
+      expect(harness.modelRegistry.getConnection("immutable-driver" as never))
+        .toMatchObject({ recordRevision: 0, providerDriver: "pi/openai" });
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("maps invalid and insecure Provider URLs to typed validation Problems", async () => {
     const harness = await startTestApp();
     try {
@@ -617,8 +688,7 @@ describe("HTTP model control plane", () => {
           slug: "gpt-mini",
           displayName: "GPT Mini",
           connectionRevisionId,
-          modelId: "gpt-4o-mini",
-          protocol: "auto",
+          catalogCandidateId: "pi/openai:gpt-4o-mini",
         },
       });
       expect(created.statusCode).toBe(201);
@@ -631,7 +701,8 @@ describe("HTTP model control plane", () => {
           expect.objectContaining({
             connectionRevisionId,
             providerModelId: "gpt-4o-mini",
-            invocationProtocol: "responses",
+            catalogCandidateId: "pi/openai:gpt-4o-mini",
+            invocationProtocol: "pi_ai",
             maxInputTokens: 128_000,
             contextWindowSource: "preset",
             state: "draft",
@@ -666,12 +737,197 @@ describe("HTTP model control plane", () => {
           slug: "gpt-mini",
           displayName: "Duplicate GPT Mini",
           connectionRevisionId,
-          modelId: "gpt-4o-mini",
-          protocol: "responses",
+          catalogCandidateId: "pi/openai:gpt-4o-mini",
         },
       });
       expect(duplicate.statusCode).toBe(409);
       expect(duplicate.json()).toMatchObject({ code: "resource_conflict" });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("creates a Pi Model Profile from a server-resolved catalog Candidate", async () => {
+    const harness = await startTestApp({
+      modelDiscovery: {
+        discover: async () => ({
+          state: "fresh",
+          models: [{ id: "gpt-4.1-mini", owner: "openai" }],
+          fetchedAt: new Date("2026-08-07T00:00:00.000Z"),
+        }),
+      },
+    });
+    try {
+      const connection = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "catalog-openai",
+          displayName: "Catalog OpenAI",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+      const connectionRevisionId = connection.json().revisions[0].revisionId as string;
+      const discovery = await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/provider-connection-revisions/${connectionRevisionId}/discover`,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: { expectedRevision: 0 },
+      });
+      expect(discovery.statusCode).toBe(200);
+
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/model-profiles",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "catalog-gpt-mini",
+          displayName: "Catalog GPT Mini",
+          connectionRevisionId,
+          catalogCandidateId: "pi/openai:gpt-4.1-mini",
+          maxInputTokens: 65_536,
+          contextWindowSource: "operator",
+        },
+      });
+
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toMatchObject({
+        revisions: [expect.objectContaining({
+          providerModelId: "gpt-4.1-mini",
+          catalogCandidateId: "pi/openai:gpt-4.1-mini",
+          invocationProtocol: "pi_ai",
+          maxInputTokens: 65_536,
+          contextWindowSource: "operator",
+        })],
+      });
+      expect(harness.modelRegistry.getProfile("catalog-gpt-mini" as never))
+        .toMatchObject({
+          revisions: [expect.objectContaining({
+            piRuntime: expect.objectContaining({
+              kind: "pi_ai",
+              piVersion: "0.73.1",
+              driverId: "pi/openai",
+              modelId: "gpt-4.1-mini",
+              api: expect.any(String),
+            }),
+          })],
+        });
+
+      for (const [slug, catalogCandidateId, code] of [
+        ["unknown-candidate", "pi/openai:not-in-catalog", "invalid_model_profile"],
+        ["mismatched-candidate", "pi/deepseek:deepseek-chat", "invalid_model_profile"],
+        ["undiscovered-candidate", "pi/openai:gpt-4o-mini", "manual_model_entry_required"],
+      ] as const) {
+        const rejected = await harness.app.inject({
+          method: "POST",
+          url: "/v1/admin/model-profiles",
+          remoteAddress: "127.0.0.1",
+          headers: adminHeaders,
+          payload: {
+            slug,
+            displayName: slug,
+            connectionRevisionId,
+            catalogCandidateId,
+          },
+        });
+        expect(rejected.statusCode).toBe(422);
+        expect(rejected.json()).toMatchObject({ code });
+      }
+      expect(harness.modelRegistry.listProfiles()).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ profileId: "unknown-candidate" }),
+          expect.objectContaining({ profileId: "mismatched-candidate" }),
+          expect.objectContaining({ profileId: "undiscovered-candidate" }),
+        ]),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects the manual Model Profile shape for a native Driver", async () => {
+    const harness = await startTestApp({
+      modelDiscovery: {
+        discover: async () => ({
+          state: "fresh",
+          models: [{ id: "gpt-4.1-mini" }],
+          fetchedAt: new Date("2026-08-07T00:00:00.000Z"),
+        }),
+      },
+    });
+    try {
+      const connection = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "strict-native",
+          displayName: "Strict Native",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+      const connectionRevisionId = connection.json().revisions[0].revisionId as string;
+      await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/provider-connection-revisions/${connectionRevisionId}/discover`,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: { expectedRevision: 0 },
+      });
+
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/model-profiles",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "forbidden-native-manual",
+          displayName: "Forbidden Native Manual",
+          connectionRevisionId,
+          modelId: "gpt-4.1-mini",
+          protocol: "responses",
+        },
+      });
+
+      expect(response.statusCode).toBe(422);
+      expect(response.json()).toMatchObject({ code: "invalid_model_profile" });
+      expect(harness.modelRegistry.listProfiles()).not.toContainEqual(
+        expect.objectContaining({ profileId: "forbidden-native-manual" }),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a client-supplied Pi invocation instead of persisting it", async () => {
+    const harness = await startTestApp();
+    try {
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/model-profiles",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "forged-pi-profile",
+          displayName: "Forged Pi Profile",
+          connectionRevisionId: "pcr_forged",
+          catalogCandidateId: "pi/openai:gpt-4.1-mini",
+          invocation: { kind: "pi_ai", api: "made-up-api" },
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({ code: "invalid_request" });
+      expect(harness.modelRegistry.listProfiles()).not.toContainEqual(
+        expect.objectContaining({ profileId: "forged-pi-profile" }),
+      );
     } finally {
       await harness.close();
     }

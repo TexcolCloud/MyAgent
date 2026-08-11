@@ -9,6 +9,7 @@ import type { CreateRunService } from "../../application/create-run.js";
 import type { DecideApprovalService } from "../../application/decide-approval.js";
 import type { DeleteSessionService } from "../../application/delete-session.js";
 import type { DiscoverModelsService } from "../../application/discover-models.js";
+import { ListProviderDriversService } from "../../application/list-provider-drivers.js";
 import type { ManageModelProfilesService } from "../../application/manage-model-profiles.js";
 import type { ManageProviderConnectionsService } from "../../application/manage-provider-connections.js";
 import type { ManageSecretsService } from "../../application/manage-secrets.js";
@@ -36,6 +37,7 @@ import { registerModelProfileRoutes } from "./routes/model-profiles.js";
 import { registerModelVerificationRoutes } from "./routes/model-verifications.js";
 import { registerModelAssignmentRoutes } from "./routes/model-assignments.js";
 import { registerManagedSecretRoutes } from "./routes/managed-secrets.js";
+import { registerProviderDriverRoutes } from "./routes/provider-drivers.js";
 import { serializeWithSchema } from "./schemas.js";
 import type { SseStreamOptions } from "./sse.js";
 
@@ -149,8 +151,16 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
   }
   if (options.modelControl !== undefined) {
     app.register((api, _routeOptions, done) => {
-      registerProviderConnectionRoutes(api, options.modelControl!);
-      registerModelProfileRoutes(api, options.modelControl!);
+      const providerDrivers = new ListProviderDriversService();
+      registerProviderDriverRoutes(api, providerDrivers);
+      registerProviderConnectionRoutes(api, {
+        ...options.modelControl!,
+        providerDrivers,
+      });
+      registerModelProfileRoutes(api, {
+        ...options.modelControl!,
+        providerDrivers,
+      });
       registerModelVerificationRoutes(api, options.modelControl!);
       registerModelAssignmentRoutes(api, options.modelControl!);
       registerManagedSecretRoutes(api, options.modelControl!);

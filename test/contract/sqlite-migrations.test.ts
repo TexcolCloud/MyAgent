@@ -89,6 +89,77 @@ describe("SQLite migrations", () => {
     }
   });
 
+  it("adds the Pi invocation protocol without losing referenced Profile revisions", () => {
+    const connection = openDatabase({
+      path: tempPath("pi-protocol-upgrade.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrateThroughVersion2(connection.db);
+      connection.db.prepare(
+        `INSERT INTO provider_connections (
+           connection_id, display_name, provider_kind, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run("upgrade-provider", "Upgrade Provider", "openai", NOW, NOW);
+      connection.db.prepare(
+        `INSERT INTO provider_connection_revisions (
+           revision_id, connection_id, state, base_url, auth_json,
+           allow_insecure_http, protocol_preference, preset_version, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "pcr-upgrade", "upgrade-provider", "active", "https://api.example.test/v1",
+        '{"type":"none"}', 0, "responses", "legacy", NOW,
+      );
+      connection.db.prepare(
+        `INSERT INTO model_profiles (
+           profile_id, display_name, created_at, updated_at
+         ) VALUES (?, ?, ?, ?)`,
+      ).run("legacy-profile", "Legacy Profile", NOW, NOW);
+      connection.db.prepare(
+        `INSERT INTO model_profile_revisions (
+           revision_id, profile_id, connection_revision_id, state,
+           provider_model_id, invocation_protocol, max_input_tokens,
+           context_window_source, capability_baseline,
+           verified_capabilities_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "mpr-legacy", "legacy-profile", "pcr-upgrade", "active", "legacy-model",
+        "responses", 32_768, "operator", "text_and_single_tool_call_v1",
+        '["streaming_text","single_tool_call"]', NOW,
+      );
+      connection.db.prepare(
+        `INSERT INTO model_assignments (
+           agent_id, model_profile_revision_id, source, record_revision, updated_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run("primary", "mpr-legacy", "explicit", 0, NOW);
+
+      migrate(connection.db);
+
+      expect(connection.db.prepare(
+        "SELECT model_profile_revision_id FROM model_assignments WHERE agent_id = ?",
+      ).get("primary")).toEqual({ model_profile_revision_id: "mpr-legacy" });
+      connection.db.prepare(
+        `INSERT INTO model_profiles (
+           profile_id, display_name, created_at, updated_at
+         ) VALUES (?, ?, ?, ?)`,
+      ).run("pi-profile", "Pi Profile", NOW, NOW);
+      expect(() => connection.db.prepare(
+        `INSERT INTO model_profile_revisions (
+           revision_id, profile_id, connection_revision_id, state,
+           provider_model_id, invocation_protocol, max_input_tokens,
+           context_window_source, capability_baseline,
+           verified_capabilities_json, runtime_contract_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "mpr-pi", "pi-profile", "pcr-upgrade", "draft", "gpt-4.1-mini",
+        "pi_ai", 1_047_576, "preset", "text_and_single_tool_call_v1", "[]",
+        '{"kind":"pi_ai","piVersion":"0.73.1"}', NOW,
+      )).not.toThrow();
+    } finally {
+      connection.close();
+    }
+  });
+
   it("rejects a message linked to a Run from another Session", () => {
     const connection = openDatabase({
       path: tempPath("message-ownership.db"),

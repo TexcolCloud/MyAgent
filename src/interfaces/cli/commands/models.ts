@@ -5,8 +5,9 @@ export interface ModelCreateInput {
   readonly slug: string;
   readonly displayName: string;
   readonly connectionRevisionId: string;
-  readonly modelId: string;
-  readonly protocol: "auto" | "chat_completions" | "responses";
+  readonly catalogCandidateId?: string;
+  readonly modelId?: string;
+  readonly protocol?: "auto" | "chat_completions" | "responses";
   readonly maxInputTokens?: number;
   readonly contextWindowSource?: "preset" | "operator" | "assumed_32768";
   readonly manualEntryAcknowledged?: boolean;

@@ -5,6 +5,22 @@ import { agentIdSchema, identifierSchema } from "./schemas.js";
 
 export const invocationProtocolSchema = z.enum(["chat_completions", "responses"]);
 export const providerKindSchema = z.enum(["openai", "deepseek", "openai_compatible"]);
+export const providerDriverIdSchema = z.string().regex(/^pi\/[a-z0-9-]+$/u);
+
+const providerDriverCandidateResponseSchema = z.strictObject({
+  candidateId: identifierSchema,
+  displayName: z.string(),
+  modelId: z.string(),
+  credentialSupport: z.enum(["bearer", "none", "unsupported"]),
+});
+
+export const providerDriversResponseSchema = z.strictObject({
+  piVersion: z.literal("0.73.1"),
+  drivers: z.array(z.strictObject({
+    driverId: providerDriverIdSchema,
+    candidates: z.array(providerDriverCandidateResponseSchema),
+  })),
+});
 
 export const providerAuthInputSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("none") }),
@@ -22,13 +38,17 @@ export const providerAuthInputSchema = z.discriminatedUnion("type", [
 export const createProviderConnectionSchema = z.strictObject({
   slug: agentIdSchema,
   displayName: z.string().min(1),
-  kind: providerKindSchema,
+  kind: providerKindSchema.optional(),
+  driverId: providerDriverIdSchema.optional(),
   baseUrl: z.string().url().optional(),
   auth: providerAuthInputSchema,
   apiKey: z.string().min(1).optional(),
   allowInsecureHttp: z.boolean().optional(),
   protocolPreference: invocationProtocolSchema.optional(),
 }).superRefine((value, context) => {
+  if ((value.kind === undefined) === (value.driverId === undefined)) {
+    context.addIssue({ code: "custom", message: "choose kind or driverId" });
+  }
   if ((value.auth.type === "api_key") !== (value.apiKey !== undefined)) {
     context.addIssue({ code: "custom", message: "invalid credential input" });
   }
@@ -42,6 +62,7 @@ export const reviseProviderConnectionSchema = z.strictObject({
   apiKey: z.string().min(1).optional(),
   allowInsecureHttp: z.boolean(),
   protocolPreference: invocationProtocolSchema,
+  driverId: providerDriverIdSchema.optional(),
 }).superRefine((value, context) => {
   if ((value.auth.type === "api_key") !== (value.apiKey !== undefined)) {
     context.addIssue({ code: "custom", message: "invalid credential input" });
@@ -68,6 +89,7 @@ export const providerConnectionResponseSchema = z.strictObject({
   connectionId: agentIdSchema,
   displayName: z.string(),
   providerKind: providerKindSchema,
+  providerDriver: providerDriverIdSchema.optional(),
   activeRevisionId: identifierSchema.nullable(),
   retiredAt: z.string().nullable(),
   recordRevision: z.number().int().nonnegative(),
@@ -106,10 +128,21 @@ export const discoveryResponseSchema = z.strictObject({
   }).nullable(),
 });
 
-export const createModelProfileSchema = z.strictObject({
+const modelProfileIdentitySchema = {
   slug: agentIdSchema,
   displayName: z.string().min(1),
   connectionRevisionId: identifierSchema,
+} as const;
+
+const createCatalogModelProfileSchema = z.strictObject({
+  ...modelProfileIdentitySchema,
+  catalogCandidateId: identifierSchema,
+  maxInputTokens: z.number().int().positive().optional(),
+  contextWindowSource: z.enum(["preset", "operator", "assumed_32768"]).optional(),
+});
+
+const createManualModelProfileSchema = z.strictObject({
+  ...modelProfileIdentitySchema,
   modelId: z.string().min(1),
   protocol: z.enum(["auto", "chat_completions", "responses"]),
   maxInputTokens: z.number().int().positive().optional(),
@@ -117,12 +150,18 @@ export const createModelProfileSchema = z.strictObject({
   manualEntryAcknowledged: z.boolean().optional(),
 });
 
+export const createModelProfileSchema = z.union([
+  createCatalogModelProfileSchema,
+  createManualModelProfileSchema,
+]);
+
 const modelProfileRevisionResponseSchema = z.strictObject({
   revisionId: identifierSchema,
   profileId: agentIdSchema,
   connectionRevisionId: identifierSchema,
   providerModelId: z.string(),
-  invocationProtocol: invocationProtocolSchema,
+  catalogCandidateId: identifierSchema.optional(),
+  invocationProtocol: z.enum(["chat_completions", "responses", "pi_ai"]),
   maxInputTokens: z.number().int().positive(),
   contextWindowSource: z.enum(["preset", "operator", "assumed_32768"]),
   capabilityBaseline: z.literal("text_and_single_tool_call_v1"),
