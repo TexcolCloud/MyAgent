@@ -5,6 +5,7 @@ import { isIP } from "node:net";
 
 import type {
   ProviderHttpConnectionRuntime,
+  ProviderFetch,
   ProviderHttpTransport,
   ProviderHttpTransportInput,
 } from "../ports/provider-http-transport.js";
@@ -77,7 +78,7 @@ export class NodeProviderHttpTransport implements ProviderHttpTransport {
     this.resolveAddresses = options.resolveAddresses ?? resolveWithNode;
   }
 
-  createFetch(input: ProviderHttpTransportInput): typeof fetch {
+  createFetch(input: ProviderHttpTransportInput): ProviderFetch {
     if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
       throw protocolError();
     }
@@ -113,7 +114,7 @@ export class NodeProviderHttpTransport implements ProviderHttpTransport {
       return this.execute(request, context, 0);
     };
 
-    return providerFetch as typeof fetch;
+    return providerFetch;
   }
 
   private async execute(

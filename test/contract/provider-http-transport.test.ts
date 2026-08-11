@@ -12,7 +12,7 @@ import type { AddressInfo, Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { gzipSync } from "node:zlib";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   NodeProviderHttpTransport,
@@ -79,6 +79,27 @@ describe("NodeProviderHttpTransport", () => {
     await expect(providerFetch("http://mixed.test/v1/models")).rejects.toMatchObject({
       code: "insecure_provider_url",
     });
+  });
+
+  it("validates the destination before resolving the provider Secret", async () => {
+    const resolveSecret = vi.fn(() => "provider-secret");
+    const secretResolver: SecretResolver = { resolve: resolveSecret };
+    const providerFetch = new NodeProviderHttpTransport({
+      secretResolver,
+      resolveAddresses: async () => [{ address: "169.254.169.254", family: 4 }],
+    }).createFetch({
+      connection: connection("http://metadata.test", {
+        allowInsecureHttp: true,
+        auth: { type: "bearer", secret: { fromEnvironment: "PROVIDER_KEY" } },
+      }),
+      timeoutMs: 100,
+      maxResponseBytes: 64,
+    });
+
+    await expect(providerFetch("http://metadata.test/v1/models")).rejects.toMatchObject({
+      code: "insecure_provider_url",
+    });
+    expect(resolveSecret).not.toHaveBeenCalled();
   });
 
   it("streams request and response bodies while replacing SDK authorization", async () => {

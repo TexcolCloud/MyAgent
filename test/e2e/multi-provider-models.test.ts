@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
+import { bootstrap } from "../../src/bootstrap.js";
+import type { ProviderEgressGatewayListen } from "../../src/adapters/provider-egress-gateway.js";
 import { executeCli } from "../../src/interfaces/cli/main.js";
 import { FakeOpenAiProvider } from "../helpers/fake-openai-provider.js";
 import {
@@ -14,6 +18,71 @@ import {
 } from "../helpers/start-test-app.js";
 
 describe("multi-provider model registry release isolation", () => {
+  it("closes the provider gateway when later service startup fails", async () => {
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const occupied = cleanup.use(
+        await FakeOpenAiProvider.start({ models: ["occupied"] }),
+        (active) => active.close(),
+      );
+      const fixture = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await fixture.stop();
+      let gatewayUrl = "";
+      let gatewayStops = 0;
+
+      const startup = await bootstrap(fixture.configPath, {
+        listen: {
+          host: "127.0.0.1",
+          port: Number(new URL(occupied.baseUrl).port),
+        },
+        signals: false,
+        providerGateway: {
+          listen: captureGatewayUrl((url) => { gatewayUrl = url; }),
+          onStopped: () => { gatewayStops += 1; },
+        },
+      }).then(
+        (service) => ({ service }),
+        (error: unknown) => ({ error }),
+      );
+      if ("service" in startup) await startup.service.shutdown();
+
+      expect("error" in startup).toBe(true);
+      expect(gatewayUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/u);
+      expect(gatewayStops).toBe(1);
+      await expect(fetch(gatewayUrl, { signal: AbortSignal.timeout(1_000) }))
+        .rejects.toThrow();
+    } finally {
+      await cleanup.dispose();
+    }
+  });
+
+  it("closes the provider gateway during normal service shutdown", async () => {
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const fixture = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await fixture.stop();
+      let gatewayUrl = "";
+      let gatewayStops = 0;
+      const service = await bootstrap(fixture.configPath, {
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        providerGateway: {
+          listen: captureGatewayUrl((url) => { gatewayUrl = url; }),
+          onStopped: () => { gatewayStops += 1; },
+        },
+      });
+
+      await service.shutdown();
+      await service.shutdown();
+
+      expect(gatewayStops).toBe(1);
+      await expect(fetch(gatewayUrl, { signal: AbortSignal.timeout(1_000) }))
+        .rejects.toThrow();
+    } finally {
+      await cleanup.dispose();
+    }
+  });
+
   it("cleans partial service startup before closing an earlier provider", async () => {
     const cleanup = createAsyncCleanupStack();
     let providerModelsUrl = "";
@@ -817,6 +886,24 @@ describe("multi-provider model registry release isolation", () => {
     }
   }, 35_000);
 });
+
+function captureGatewayUrl(capture: (url: string) => void): ProviderEgressGatewayListen {
+  return async (server, address) => {
+    await listen(server, address.host, address.port);
+    const actual = server.address() as AddressInfo;
+    capture(`http://${address.host}:${String(actual.port)}`);
+  };
+}
+
+async function listen(server: Server, host: string, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
 
 async function jsonRequest(responsePromise: Promise<Response>, status: number): Promise<unknown> {
   const response = await responsePromise;
