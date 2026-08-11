@@ -12,6 +12,7 @@ import type {
   InvocationProtocol,
   ProviderKind,
 } from "../domain/model-registry.js";
+import type { ProviderDriverId } from "../domain/pi-runtime.js";
 import type {
   ProviderAuth,
   ProviderConnectionRevision,
@@ -51,6 +52,7 @@ export interface CreateProviderConnectionInput {
   readonly connectionId: ProviderConnectionId;
   readonly displayName: string;
   readonly providerKind: ProviderKind;
+  readonly providerDriver?: ProviderDriverId;
   readonly baseUrl?: string;
   readonly credential: ProviderCredentialInput;
   readonly replacementApiKey?: ReplacementProviderApiKey;
@@ -103,21 +105,24 @@ export class ManageProviderConnectionsService {
   create(input: CreateProviderConnectionInput): ProviderConnectionView {
     return this.transaction.run(() => {
       const now = this.clock.now();
-      const preset = providerPreset(input.providerKind);
+      const providerDriver = input.providerDriver ?? providerDriverForKind(input.providerKind);
+      const providerKind = compatibilityKindForDriver(providerDriver);
+      const preset = providerPreset(providerKind);
       const allowInsecureHttp = input.allowInsecureHttp ?? false;
       const baseUrl = validatedBaseUrl(
         input.baseUrl ?? preset.baseUrl ?? "",
         allowInsecureHttp,
       );
       const auth = this.resolveAuth(
-        input.providerKind,
+        providerKind,
         input.credential,
         input.replacementApiKey,
       );
       return this.registry.createConnection({
         connectionId: input.connectionId,
         displayName: requiredText(input.displayName),
-        providerKind: input.providerKind,
+        providerKind,
+        providerDriver,
         revision: {
           revisionId: this.ids.providerConnectionRevisionId(),
           connectionId: input.connectionId,
@@ -287,4 +292,21 @@ function requiredText(value: string): string {
     throw new DomainError("invalid_provider_connection");
   }
   return value;
+}
+
+function providerDriverForKind(kind: ProviderKind): ProviderDriverId {
+  switch (kind) {
+    case "openai":
+      return "pi/openai";
+    case "deepseek":
+      return "pi/deepseek";
+    case "openai_compatible":
+      return "pi/openai-compatible";
+  }
+}
+
+function compatibilityKindForDriver(driver: ProviderDriverId): ProviderKind {
+  if (driver === "pi/openai") return "openai";
+  if (driver === "pi/deepseek") return "deepseek";
+  return "openai_compatible";
 }
