@@ -2063,6 +2063,7 @@ const PI_RUNTIME_MAX_TOKENS_FIELDS = new Set([
 
 const PI_RUNTIME_THINKING_FORMATS = new Set([
   "openai",
+  "openrouter",
   "deepseek",
   "zai",
   "qwen",

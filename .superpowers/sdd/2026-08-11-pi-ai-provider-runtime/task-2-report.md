@@ -310,7 +310,7 @@ Result before the Round 2 production change: exit 1; 2 failed and 48 passed.
 The repository accepted `maxTokensField: "secret"` and
 `thinkingFormat: "https://provider.example/v1"` instead of throwing
 `DomainError("invalid_model_profile")`. The same run confirmed all seven
-documented Pi 0.73.1 enum values still round-tripped before hardening.
+initially enumerated Pi 0.73.1 values still round-tripped before hardening.
 
 ### GREEN Evidence
 
@@ -344,3 +344,55 @@ enum value. TypeScript compilation and whitespace validation both passed.
 ### Round 2 Concerns
 
 - No implementation concerns remain for the Round 2 finding.
+
+## Round 3 Review Fixes
+
+### Finding
+
+Pi's installed 0.73.1 compatibility type also permits
+`thinkingFormat: "openrouter"`. The Round 2 exact allowlist and acceptance
+matrix omitted that literal, incorrectly rejecting a valid stored contract.
+
+### RED Evidence
+
+This was test-first coverage. The valid `thinkingFormat: "openrouter"`
+round-trip case was added before the production allowlist changed:
+
+```powershell
+npm run test:contract -- test/contract/model-registry-repository.test.ts
+```
+
+Result before the Round 3 production change: exit 1; 1 failed and 50 passed.
+The new case failed with `DomainError("invalid_model_profile")`, while both
+existing URL/Secret-shaped rejection cases remained green.
+
+### GREEN Evidence
+
+```powershell
+npm run test:contract -- test/contract/model-registry-repository.test.ts
+npm run typecheck
+git diff --check
+```
+
+Results: all exit 0. The focused contract file passed all 51 tests, including
+the `openrouter` round trip and the retained rejection cases. TypeScript
+compilation and whitespace validation both passed.
+
+### Implementation
+
+- Added `openrouter` to the exact Pi 0.73.1 `thinkingFormat` allowlist.
+- Extended exhaustive accepted-enum coverage to include all six documented
+  `thinkingFormat` values and both `maxTokensField` values.
+
+### Self-Review
+
+- The literal was taken from the installed Pi type declaration, which describes
+  its OpenRouter reasoning payload semantics.
+- No permissive pattern or URL/Secret heuristic was introduced; arbitrary
+  strings remain invalid.
+- The change is limited to one allowed literal, its round-trip regression
+  test, and this report correction.
+
+### Round 3 Concerns
+
+- No implementation concerns remain for the Round 3 finding.

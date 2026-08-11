@@ -138,6 +138,7 @@ describe("SqliteModelRegistryRepository", () => {
     ["maxTokensField", "max_completion_tokens"],
     ["maxTokensField", "max_tokens"],
     ["thinkingFormat", "openai"],
+    ["thinkingFormat", "openrouter"],
     ["thinkingFormat", "deepseek"],
     ["thinkingFormat", "zai"],
     ["thinkingFormat", "qwen"],
