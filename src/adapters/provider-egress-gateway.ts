@@ -9,6 +9,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import type { EffectiveModelRuntime } from "../domain/agent-revision.js";
+import { ModelProviderError } from "../ports/model.js";
 import type { ProviderHttpTransport } from "../ports/provider-http-transport.js";
 import { providerRuntimeConnection } from "./model/provider-runtime-connection.js";
 
@@ -44,29 +45,52 @@ const SAFE_REQUEST_HEADERS = new Set([
 ]);
 const SAFE_RESPONSE_HEADERS = new Set(["content-type"]);
 
+type GatewayState = "new" | "starting" | "ready" | "unavailable" | "stopping" | "stopped";
+
 export class ProviderEgressGateway {
   private readonly capabilities = new Map<string, EffectiveModelRuntime>();
   private readonly activeRequests = new Set<AbortController>();
   private server: Server | undefined;
   private listenerBaseUrl: string | undefined;
-  private stopped = false;
+  private state: GatewayState = "new";
+  private startOperation: Promise<this> | undefined;
+  private stopOperation: Promise<void> | undefined;
 
   constructor(private readonly options: ProviderEgressGatewayOptions) {}
 
   get baseUrl(): string {
-    if (this.listenerBaseUrl === undefined) throw new Error("provider_gateway_not_started");
+    if (this.state !== "ready" || this.listenerBaseUrl === undefined) {
+      throw new Error("provider_gateway_not_started");
+    }
     return this.listenerBaseUrl;
   }
 
-  async start(): Promise<this> {
-    if (this.stopped) throw new Error("provider_gateway_stopped");
-    if (this.server !== undefined) return this;
+  get isAvailable(): boolean {
+    return this.state === "ready";
+  }
+
+  start(): Promise<this> {
+    if (this.state === "ready") return Promise.resolve(this);
+    if (this.startOperation !== undefined) return this.startOperation;
+    if (this.state !== "new") return Promise.reject(this.unavailableError());
+
+    this.state = "starting";
+    const operation = this.startServer();
+    this.startOperation = operation;
+    void operation.then(
+      () => { if (this.startOperation === operation) this.startOperation = undefined; },
+      () => { if (this.startOperation === operation) this.startOperation = undefined; },
+    );
+    return operation;
+  }
+
+  private async startServer(): Promise<this> {
     const server = createServer((request, response) => {
       void this.handle(request, response);
     });
-    this.server = server;
     try {
       await (this.options.listen ?? listenOnLoopback)(server, LISTEN_ADDRESS);
+      if (this.state !== "starting") throw new Error("provider_gateway_start_cancelled");
       const address = server.address();
       if (
         address === null || typeof address === "string" ||
@@ -74,16 +98,20 @@ export class ProviderEgressGateway {
       ) {
         throw new Error("provider_gateway_non_loopback_binding");
       }
+      this.server = server;
       this.listenerBaseUrl = `http://${LISTEN_ADDRESS.host}:${String(address.port)}`;
+      this.state = "ready";
       return this;
     } catch (error) {
       await closeServer(server);
-      this.server = undefined;
+      if (this.server === server) this.server = undefined;
+      if (this.state === "starting") this.state = "unavailable";
       throw error;
     }
   }
 
   routeFor(model: EffectiveModelRuntime): PiGatewayRoute {
+    if (this.state !== "ready") throw this.unavailableError();
     const baseUrl = this.baseUrl;
     const createBytes = this.options.randomBytes ?? nodeRandomBytes;
     for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -102,16 +130,30 @@ export class ProviderEgressGateway {
     throw new Error("provider_gateway_capability_collision");
   }
 
-  async stop(): Promise<void> {
-    if (this.stopped) return;
-    this.stopped = true;
+  stop(): Promise<void> {
+    if (this.stopOperation !== undefined) return this.stopOperation;
+    if (this.state === "stopped") return Promise.resolve();
+
+    const operation = this.stopServer();
+    this.stopOperation = operation;
+    return operation;
+  }
+
+  private async stopServer(): Promise<void> {
+    const startOperation = this.startOperation;
+    this.state = "stopping";
     this.listenerBaseUrl = undefined;
+    await startOperation?.then(
+      () => undefined,
+      () => undefined,
+    );
     this.capabilities.clear();
     for (const controller of this.activeRequests) controller.abort();
     this.activeRequests.clear();
     const server = this.server;
     this.server = undefined;
     if (server !== undefined) await closeServer(server);
+    this.state = "stopped";
     await this.options.onStopped?.();
   }
 
@@ -211,6 +253,13 @@ export class ProviderEgressGateway {
       if (pathMatches && bearerMatches) selected = runtime;
     }
     return selected;
+  }
+
+  private unavailableError(): ModelProviderError {
+    return new ModelProviderError({
+      code: "provider_unavailable",
+      transient: true,
+    });
   }
 }
 

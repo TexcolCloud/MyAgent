@@ -83,6 +83,32 @@ describe("multi-provider model registry release isolation", () => {
     }
   });
 
+  it("keeps HTTP controls available when the Pi gateway listener cannot start", async () => {
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const fixture = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await fixture.stop();
+      let gatewayStops = 0;
+      const service = await bootstrap(fixture.configPath, {
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        providerGateway: {
+          listen: async () => { throw new Error("gateway_listener_unavailable"); },
+          onStopped: () => { gatewayStops += 1; },
+        },
+      });
+
+      const ready = await fetch(`${service.url}/readyz`);
+      await service.shutdown();
+
+      expect(ready.status).toBe(200);
+      expect(await ready.json()).toEqual({ ready: true });
+      expect(gatewayStops).toBe(1);
+    } finally {
+      await cleanup.dispose();
+    }
+  });
+
   it("cleans partial service startup before closing an earlier provider", async () => {
     const cleanup = createAsyncCleanupStack();
     let providerModelsUrl = "";

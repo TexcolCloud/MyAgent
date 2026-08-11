@@ -143,6 +143,52 @@ describe("ProviderEgressGateway", () => {
     expect(attemptedServer?.listening).toBe(false);
   });
 
+  it("fails closed for Pi route issuance after gateway startup is unavailable", async () => {
+    const createFetch = vi.fn(() => vi.fn(async () => new Response("must-not-run")));
+    const gateway = new ProviderEgressGateway({
+      transport: { createFetch },
+      listen: async () => { throw new Error("listener_unavailable"); },
+    });
+    gateways.push(gateway);
+
+    await expect(gateway.start()).rejects.toThrow("listener_unavailable");
+    expect(gateway.isAvailable).toBe(false);
+    const error = thrownBy(() => gateway.routeFor(testModelRuntime()));
+
+    expect(error).toMatchObject({ code: "provider_unavailable", transient: true });
+    expect(createFetch).not.toHaveBeenCalled();
+  });
+
+  it("waits for concurrent start and closes a listener that binds during stop", async () => {
+    let server: Server | undefined;
+    let releaseListen: (() => void) | undefined;
+    const listenReleased = new Promise<void>((resolve) => { releaseListen = resolve; });
+    let releaseEntered: (() => void) | undefined;
+    const listenEntered = new Promise<void>((resolve) => { releaseEntered = resolve; });
+    const gateway = new ProviderEgressGateway({
+      transport: { createFetch: () => vi.fn(async () => new Response("unused")) },
+      listen: async (candidate, address) => {
+        server = candidate;
+        releaseEntered?.();
+        await listenReleased;
+        await listen(candidate, address.host);
+      },
+    });
+    gateways.push(gateway);
+
+    const firstStart = gateway.start();
+    await listenEntered;
+    const secondStart = gateway.start();
+    const secondSettledBeforeListener = await settlesWithin(secondStart, 25);
+    const stop = gateway.stop();
+    releaseListen?.();
+
+    expect(secondSettledBeforeListener).toBe(false);
+    await expect(Promise.all([firstStart, secondStart])).rejects.toThrow();
+    await stop;
+    expect(server?.listening).toBe(false);
+  });
+
   it("rejects a host escape before constructing a controlled provider fetch", async () => {
     const createFetch = vi.fn(() => vi.fn(async () => new Response("unused")));
     const gateway = await new ProviderEgressGateway({
@@ -291,7 +337,8 @@ describe("ProviderEgressGateway", () => {
     await gateway.stop();
 
     expect(stopped).toBe(1);
-    expect(() => gateway.routeFor(testModelRuntime())).toThrow("provider_gateway_not_started");
+    expect(thrownBy(() => gateway.routeFor(testModelRuntime())))
+      .toMatchObject({ code: "provider_unavailable", transient: true });
     await expect(fetch(`${route.baseUrl}/models`, {
       headers: { authorization: `Bearer ${route.apiKey}` },
       signal: AbortSignal.timeout(1_000),
@@ -327,5 +374,30 @@ async function listen(server: Server, host: string): Promise<void> {
       server.removeAllListeners("error");
       resolve();
     });
+  });
+}
+
+function thrownBy(operation: () => unknown): unknown {
+  try {
+    operation();
+  } catch (error) {
+    return error;
+  }
+  throw new Error("expected_operation_to_throw");
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMs);
+    promise.then(
+      () => {
+        clearTimeout(timeout);
+        resolve(true);
+      },
+      () => {
+        clearTimeout(timeout);
+        resolve(true);
+      },
+    );
   });
 }

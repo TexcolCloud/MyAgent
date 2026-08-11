@@ -195,7 +195,7 @@ export async function bootstrap(
     const providerTransport = new NodeProviderHttpTransport({
       secretResolver: secrets,
     });
-    providerGateway = await new ProviderEgressGateway({
+    providerGateway = new ProviderEgressGateway({
       transport: providerTransport,
       ...(options.providerGateway?.listen === undefined
         ? {}
@@ -203,7 +203,15 @@ export async function bootstrap(
       ...(options.providerGateway?.onStopped === undefined
         ? {}
         : { onStopped: options.providerGateway.onStopped }),
-    }).start();
+    });
+    try {
+      await providerGateway.start();
+    } catch (error) {
+      logger.error(
+        { code: "provider_gateway_unavailable", error },
+        "Pi provider egress gateway is unavailable",
+      );
+    }
     const providerModel = new ModelRuntimeRouter({
       chatCompletions: new OpenAiChatCompletionsModel({
         transport: providerTransport,
