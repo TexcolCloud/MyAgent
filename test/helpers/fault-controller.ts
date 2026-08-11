@@ -627,13 +627,16 @@ export function waitForFaultChildCompletion(
     if (options.terminationSignal?.aborted === true) beginCloseDeadline();
     else options.terminationSignal?.addEventListener("abort", beginCloseDeadline, { once: true });
     child.once("close", (code, signal) => {
+      const terminationRequested = options.terminationSignal?.aborted === true;
       closed = true;
       if (closeTimer !== undefined) clearTimeout(closeTimer);
       options.terminationSignal?.removeEventListener("abort", beginCloseDeadline);
       void waitForE2eFixtureRootRelease(root).then(() => {
+        const requestedSigtermExit = terminationRequested &&
+          code === 128 + os.constants.signals.SIGTERM;
         if (processError !== undefined) {
           reject(processError);
-        } else if (code === 0 || signal !== null) {
+        } else if (code === 0 || signal !== null || requestedSigtermExit) {
           resolve();
         } else {
           reject(new FaultChildExitError(code, stderr));

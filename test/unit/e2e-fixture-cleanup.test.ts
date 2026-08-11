@@ -15,6 +15,32 @@ import {
   waitForFaultChildCompletion,
 } from "../helpers/fault-controller.js";
 
+it("accepts tsx's numeric SIGTERM exit only after termination is requested", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "myagent-e2e-sigterm-exit-"));
+  try {
+    const unexpectedChild = new EventEmitter() as ChildProcess;
+    const unexpectedTermination = new AbortController();
+    const unexpectedCompletion = waitForFaultChildCompletion(unexpectedChild, root, [], {
+      terminationSignal: unexpectedTermination.signal,
+    });
+    unexpectedChild.emit("close", 143, null);
+    unexpectedTermination.abort();
+    await expect(unexpectedCompletion).rejects.toThrow("fault_child_exited:143:");
+
+    const child = new EventEmitter() as ChildProcess;
+    const termination = new AbortController();
+    const completion = waitForFaultChildCompletion(child, root, [], {
+      terminationSignal: termination.signal,
+    });
+    termination.abort();
+    child.emit("close", 143, null);
+
+    await expect(completion).resolves.toBeUndefined();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it.skipIf(process.platform !== "win32")(
   "waits for a transient Windows fixture owner without partially deleting it",
   async () => {
