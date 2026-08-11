@@ -11,6 +11,8 @@ import { OpenAiChatCompletionsModel } from "./adapters/model/openai-chat-complet
 import { OpenAiModelDiscovery } from "./adapters/model/openai-model-discovery.js";
 import { OpenAiResponsesModel } from "./adapters/model/openai-responses.js";
 import { ModelRuntimeRouter } from "./adapters/model/model-runtime-router.js";
+import { PiAiSdkClient } from "./adapters/model/pi-ai-client.js";
+import { PiAiModelAdapter } from "./adapters/model/pi-ai-model.js";
 import { NodeProviderHttpTransport } from "./adapters/provider-http-transport.js";
 import {
   ProviderEgressGateway,
@@ -213,6 +215,10 @@ export async function bootstrap(
       );
     }
     const providerModel = new ModelRuntimeRouter({
+      piAi: new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway: providerGateway,
+      }),
       chatCompletions: new OpenAiChatCompletionsModel({
         transport: providerTransport,
       }),
