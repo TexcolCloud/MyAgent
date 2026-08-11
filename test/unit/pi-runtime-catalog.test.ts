@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   PI_RUNTIME_VERSION,
+  listProviderCatalogCandidates,
   resolveProviderCatalogCandidate,
 } from "../../src/config/pi-runtime-catalog.js";
 
@@ -20,5 +21,45 @@ describe("Pi runtime catalog", () => {
       driverId: "pi/github-copilot",
       credentialSupport: "unsupported",
     });
+  });
+
+  it("projects a frozen, project-owned catalog pinned to the Pi runtime version", () => {
+    const candidates = listProviderCatalogCandidates();
+
+    expect(candidates).not.toHaveLength(0);
+    expect(Object.isFrozen(candidates)).toBe(true);
+    for (const candidate of candidates) {
+      expect(candidate.driverId).toMatch(/^pi\/[a-z0-9-]+$/u);
+      expect(candidate.invocation.piVersion).toBe(PI_RUNTIME_VERSION);
+      expect(Object.isFrozen(candidate)).toBe(true);
+      expect(Object.isFrozen(candidate.invocation)).toBe(true);
+      expect(Object.isFrozen(candidate.invocation.compatibility)).toBe(true);
+    }
+  });
+
+  it("does not expose provider transport or credential fields in catalog projections", () => {
+    const projection = JSON.stringify(listProviderCatalogCandidates());
+
+    expect(projection).not.toContain('"baseUrl"');
+    expect(projection).not.toContain('"headers"');
+    expect(projection).not.toContain('"apiKey"');
+    expect(projection).not.toContain('"secret"');
+    expect(projection).not.toContain('"authorization"');
+  });
+
+  it.each([
+    "pi/amazon-bedrock",
+    "pi/azure-openai-responses",
+    "pi/github-copilot",
+    "pi/google-vertex",
+    "pi/openai-codex",
+  ] as const)("keeps %s catalog candidates unsupported", (driverId) => {
+    const candidates = listProviderCatalogCandidates().filter(
+      (candidate) => candidate.driverId === driverId,
+    );
+
+    expect(candidates).not.toHaveLength(0);
+    expect(candidates.every((candidate) => candidate.credentialSupport === "unsupported"))
+      .toBe(true);
   });
 });

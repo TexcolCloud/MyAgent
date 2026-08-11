@@ -75,3 +75,43 @@ Catalog self-check: 969 projected candidates; every contract uses `piVersion: "0
 - Pi `0.73.1` brings transitive SDK declaration issues under this repository's strict library checking (`undici-types`, optional MCP SDK, and DOM `ErrorEvent`). `skipLibCheck` is necessary for the project compiler to validate source code reliably; it does not suppress project-source errors.
 - npm reported upstream deprecation notices for the exact, task-required `@mariozechner` packages. Versions remain pinned as required.
 - A repository-wide `npm test` was started but reached the 120-second command cap before Vitest emitted a final summary. All suites reported before the timeout were passing; it is not recorded as a full-suite pass.
+
+## Fix Round 1
+
+### Review Findings Addressed
+
+- Added catalog-wide assertions that every candidate uses a `pi/` project-owned Driver ID, pins its invocation to `0.73.1`, and freezes the returned list, candidates, invocations, and compatibility projection.
+- Added projection assertions that safe catalog results do not contain Base URL, headers, API key, Secret, or authorization fields.
+- Added catalog-list assertions that AWS (`pi/amazon-bedrock`), Azure-special-header (`pi/azure-openai-responses`), and OAuth/ambient-identity (`pi/github-copilot`, `pi/google-vertex`, and `pi/openai-codex`) families remain visible as unsupported.
+- Replaced the fabricated legacy snapshot with fixed pre-0003 JSON inserted into `agent_revisions` and decoded through the production `SqliteCatalogRepository`. The test asserts `piRuntime` remains absent and `content_json` is byte-for-byte unchanged after the read.
+
+### TDD Evidence
+
+These changes are tests-only proof additions over already-correct production behavior. No production correction was required, so there is no RED-to-GREEN production cycle. The new focused test run passed immediately, proving the established behavior rather than a new implementation.
+
+Command:
+
+```powershell
+npm run test:unit -- test/unit/pi-runtime-catalog.test.ts test/unit/model-registry.test.ts test/unit/agent-resolver.test.ts
+```
+
+Result: exit 0, 3 files passed, 32 tests passed.
+
+Additional checks:
+
+```powershell
+npm run lint
+# exit 0
+
+npm run typecheck
+# exit 0
+```
+
+The first lint attempt after replacing the historical fixture reported one unused test import. Removing that stale import was a test-only cleanup; the final lint command above passed.
+
+### Self-Review
+
+- The catalog tests observe public projection data and object immutability, not Pi implementation details.
+- The historical fixture is a fixed literal JSON record, not a current snapshot with a field removed.
+- The repository read is the production reader; the test asserts it performs no hidden rewrite.
+- No production code, dependency, or runtime behavior changed in this review round.
