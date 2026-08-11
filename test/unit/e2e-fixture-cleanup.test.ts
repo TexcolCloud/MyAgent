@@ -14,6 +14,35 @@ import {
   waitForE2eFixtureRootRelease,
   waitForFaultChildCompletion,
 } from "../helpers/fault-controller.js";
+import { createAsyncCleanupStack } from "../helpers/start-test-app.js";
+
+it("releases cross-platform E2E resources in reverse acquisition order", async () => {
+  const released: string[] = [];
+  const cleanup = createAsyncCleanupStack();
+  cleanup.use("provider", () => { released.push("provider"); });
+  cleanup.use("service", () => { released.push("service"); });
+  cleanup.use("fixture", () => { released.push("fixture"); });
+
+  await cleanup.dispose();
+  await cleanup.dispose();
+
+  expect(released).toEqual(["fixture", "service", "provider"]);
+});
+
+it("continues cross-platform E2E cleanup after the first release failure", async () => {
+  const released: string[] = [];
+  const cleanup = createAsyncCleanupStack();
+  cleanup.use("provider", () => { released.push("provider"); });
+  cleanup.use("service", () => {
+    released.push("service");
+    throw new Error("service_release_failed");
+  });
+  cleanup.use("fixture", () => { released.push("fixture"); });
+
+  await expect(cleanup.dispose()).rejects.toThrow("service_release_failed");
+
+  expect(released).toEqual(["fixture", "service", "provider"]);
+});
 
 it("accepts tsx's numeric SIGTERM exit only after termination is requested", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "myagent-e2e-sigterm-exit-"));

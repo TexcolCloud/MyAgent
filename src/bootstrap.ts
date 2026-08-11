@@ -392,8 +392,8 @@ export async function bootstrap(
       await cleanupResources([
         () => app?.close(),
         () => verificationWorker?.stop(),
-        () => runWorker?.stop(),
         () => expirer?.stop(),
+        () => runWorker?.stop(),
         () => providerGateway?.stop(),
         () => connection.close(),
       ]);
@@ -418,8 +418,8 @@ export async function bootstrap(
       await cleanupResources([
         () => app?.close(),
         () => verificationWorker?.stop(),
-        () => runWorker?.stop(),
         () => expirer?.stop(),
+        () => runWorker?.stop(),
         () => providerGateway?.stop(),
         () => connection.close(),
       ]);

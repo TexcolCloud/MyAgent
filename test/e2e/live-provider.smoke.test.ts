@@ -7,8 +7,8 @@ import { startRealTestApp } from "../helpers/start-test-app.js";
 
 const settings = smokeSettings();
 
-describe.skipIf(settings === null)("live DeepSeek provider smoke", () => {
-  it("discovers, verifies, assigns, and completes one contained no-Tool Responses Run", async () => {
+describe.skipIf(settings === null)("live Pi DeepSeek provider smoke", () => {
+  it("discovers, verifies, assigns, and completes one contained no-Tool Pi Run", async () => {
     if (settings === null) throw new Error("smoke_settings_missing");
     const secret = process.env.MYAGENT_DEEPSEEK_API_KEY;
     if (secret === undefined || secret.length === 0) throw new Error("smoke_api_key_missing");
@@ -21,8 +21,9 @@ describe.skipIf(settings === null)("live DeepSeek provider smoke", () => {
         providerBaseUrl: settings.baseUrl,
         modelId: settings.model,
         protocol: "responses",
-        providerKind: "deepseek",
-        apiKeyEnvironment: "MYAGENT_DEEPSEEK_API_KEY",
+        driverId: "pi/deepseek",
+        catalogCandidateId: `pi/deepseek:${settings.model}`,
+        apiKeyEnvironment: settings.apiKeyEnvironment,
         agentId: "primary",
         verificationTimeoutMs: 120_000,
       });
@@ -44,11 +45,19 @@ describe.skipIf(settings === null)("live DeepSeek provider smoke", () => {
         ).get(run.runId)).toEqual({ count: 0 });
         expect(database.prepare(
           `SELECT json_extract(agent_revisions.content_json, '$.model.invocationProtocol')
-                    AS protocol
+                    AS protocol,
+                  json_extract(agent_revisions.content_json, '$.model.piRuntime.piVersion')
+                    AS pi_version,
+                  json_extract(agent_revisions.content_json, '$.model.piRuntime.driverId')
+                    AS driver_id
            FROM runs JOIN agent_revisions
              ON agent_revisions.revision_id = runs.agent_revision_id
            WHERE runs.run_id = ?`,
-        ).get(run.runId)).toEqual({ protocol: "responses" });
+        ).get(run.runId)).toEqual({
+          protocol: "pi_ai",
+          pi_version: "0.73.1",
+          driver_id: "pi/deepseek",
+        });
       } finally {
         database.close();
       }
@@ -61,7 +70,11 @@ describe.skipIf(settings === null)("live DeepSeek provider smoke", () => {
   }, 210_000);
 });
 
-function smokeSettings(): { model: string; baseUrl: string } | null {
+function smokeSettings(): {
+  model: string;
+  baseUrl: string;
+  apiKeyEnvironment: "MYAGENT_DEEPSEEK_API_KEY";
+} | null {
   const baseUrl = process.env.MYAGENT_DEEPSEEK_BASE_URL;
   const apiKey = process.env.MYAGENT_DEEPSEEK_API_KEY;
   if (
@@ -71,5 +84,6 @@ function smokeSettings(): { model: string; baseUrl: string } | null {
   return {
     baseUrl,
     model: process.env.MYAGENT_DEEPSEEK_MODEL || "deepseek-v4-flash",
+    apiKeyEnvironment: "MYAGENT_DEEPSEEK_API_KEY",
   };
 }

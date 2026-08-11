@@ -87,6 +87,20 @@ Phase 1 must cover fake Pi streams for every supported invocation contract, one-
 
 Phase 2 must cover TTY startup and cleanup, hidden Secret input, separate Run/Admin credential handling, authenticated API use, SSE cursor reconnection, redacted rendering, exact Approval decisions, configuration-wizard lifecycle, and optimistic-concurrency conflicts. Windows and Linux CI run without real provider credentials. Real-provider checks remain opt-in smoke tests and do not assert generated prose.
 
+Phase 1 release proof keeps the approved gateway degradation boundary: a
+gateway startup failure does not abort the HTTP control plane or historical
+non-Pi runtime. It leaves the active Model Assignment byte-stable and causes Pi
+Verification and Run execution to fail closed as `provider_unavailable`, with
+no direct provider or historical-adapter fallback. Bootstrap owns the database,
+gateway, workers, and HTTP listener and releases every started resource in
+reverse startup order after both partial startup failure and normal shutdown.
+
+The deterministic Windows/Linux suites use only local fake providers. The
+DeepSeek live check remains opt-in under the existing environment contract and
+creates a pinned `pi/deepseek` Profile only when its Base URL, catalog model ID,
+and API-key environment reference are configured; no live credential is added
+to normal tests or CI.
+
 ## Decisions Recorded Elsewhere
 
 - [ADR 0023](../../adr/0023-enforce-pi-ai-egress-through-a-loopback-gateway.md) records the loopback egress boundary.

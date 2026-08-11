@@ -18,6 +18,44 @@ Run `myagent model setup` for the guided flow, or use the individual `providers`
 
 Promotion never moves an existing Agent Assignment. Use `myagent agents set-model` for each deliberate rebind.
 
+## Pi Drivers, Catalog, And Discovery
+
+This release pins `@mariozechner/pi-ai` and `@mariozechner/pi-tui` to exact
+version `0.73.1`. The Provider Driver catalog is package metadata for that
+installed version. In the CLI and TUI, `Catalog model` means a static Pi
+candidate; `Discovered model` means a model ID returned by the configured
+Connection's remote `GET /models` endpoint. Neither label is Verification or
+makes a model assignable. A catalog candidate must also appear in remote
+discovery before its Profile can be verified, promoted, and assigned.
+
+Native Pi Drivers in this release accept only a bearer API key supplied by an
+environment or managed Secret reference, or explicit no-auth when the catalog
+candidate supports it. OAuth, Azure special-header credentials, and AWS
+identity-chain credentials are shown as `unsupported` and cannot be used to
+create or assign a Profile. `pi/openai-compatible` remains the explicit manual
+path for arbitrary compatible endpoints.
+
+Each new native Profile persists one exact Driver, candidate, invocation
+contract, and Pi version. Run execution uses that frozen snapshot. There is no
+automatic model, protocol, or provider fallback; changing any of them requires
+a later verified Profile and explicit Assignment.
+
+## Gateway Health Diagnostics
+
+Pi can reach a Provider only through the process-owned loopback Provider Egress
+Gateway. If its listener cannot start, `/healthz`, `/readyz`, Admin operations,
+and historical non-Pi Runs remain available for diagnosis and repair. Affected
+Pi Verification and Run attempts fail closed with the safe
+`provider_unavailable` code. The service never sends Pi directly to the
+Provider and never falls back to a historical adapter.
+
+Check the structured local log for `provider_gateway_unavailable`, then confirm
+that the service can bind `127.0.0.1` on an ephemeral port. Do not expose the
+gateway listener, log its opaque route capability, print Authorization headers,
+or bypass it with a public Base URL. Restart after correcting local listener
+policy or resource exhaustion; active Assignments do not move during the
+failure.
+
 ## Provider API Key Rotation
 
 Update the Provider Connection with the replacement credential. This creates a new managed Secret Version and a draft Connection Revision. Discover and verify a Profile against the draft, then promote and reassign explicitly. A failed discovery or Verification leaves the active Connection, Profile, Assignment, and old referenced Secret Version unchanged.
@@ -62,6 +100,16 @@ Purge removes an unreferenced Connection or Profile after explicit confirmation.
 
 ## Opt-In DeepSeek Smoke
 
-The live smoke is disabled unless both `MYAGENT_DEEPSEEK_BASE_URL` and `MYAGENT_DEEPSEEK_API_KEY` are present. `MYAGENT_DEEPSEEK_MODEL` is optional and defaults to `deepseek-v4-flash`.
+The live Pi Driver smoke is disabled unless both
+`MYAGENT_DEEPSEEK_BASE_URL` and `MYAGENT_DEEPSEEK_API_KEY` are present.
+`MYAGENT_DEEPSEEK_MODEL` is optional and defaults to
+`deepseek-v4-flash`; when set, it must name a `pi/deepseek` candidate in the
+pinned `0.73.1` catalog and the remote discovery response. The API key remains
+an environment Secret reference and must never be placed in configuration,
+test data, command arguments, or CI.
 
-Run `npm run test:smoke:live`. The smoke discovers models, creates and verifies a Responses Profile, promotes and assigns it, and completes one no-Tool Run. It checks protocol completion and containment only; it does not assert response prose. Normal tests and CI do not require or request these variables.
+Run `npm run test:smoke:live`. The smoke discovers models, creates and verifies
+a `pi/deepseek` Profile through the loopback gateway, promotes and assigns it,
+and completes one no-Tool Run. It checks the persisted Driver/version,
+protocol completion, and containment only; it does not assert response prose.
+Normal tests and CI do not require or request these variables.

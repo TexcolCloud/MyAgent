@@ -109,6 +109,156 @@ describe("multi-provider model registry release isolation", () => {
     }
   });
 
+  it("keeps an active Pi assignment byte-stable when gateway startup fails", async () => {
+    const providerSecret = "PI_GATEWAY_FAILURE_SECRET_MARKER";
+    const previousSecret = process.env.RELEASE_PI_API_KEY;
+    process.env.RELEASE_PI_API_KEY = providerSecret;
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["deepseek-v4-flash"],
+        expectedApiKey: providerSecret,
+        chat: [
+          { type: "verification_text", text: "Pi verification passed" },
+          { type: "verification_tool", callId: "verify-pi-gateway-failure" },
+        ],
+      }), (active) => active.close());
+      const fixture = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await fixture.setupVerifiedModel({
+        connectionSlug: "pi-gateway-failure",
+        profileSlug: "pi-gateway-failure",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "deepseek-v4-flash",
+        protocol: "responses",
+        driverId: "pi/deepseek",
+        catalogCandidateId: "pi/deepseek:deepseek-v4-flash",
+        apiKeyEnvironment: "RELEASE_PI_API_KEY",
+        agentId: "primary",
+      });
+      const frozenAssignment = assignmentSnapshot(fixture.databasePath, "primary");
+      await fixture.stop();
+      provider.clearCapturedRequests();
+      let gatewayStops = 0;
+      const service = await bootstrap(fixture.configPath, {
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        providerGateway: {
+          listen: async () => { throw new Error("gateway_listener_unavailable"); },
+          onStopped: () => { gatewayStops += 1; },
+        },
+      });
+      cleanup.use(service, (active) => active.shutdown());
+
+      const ready = await fetch(`${service.url}/readyz`);
+      const assignmentResponse = await serviceRequest(
+        service.url,
+        "admin-test-token",
+        "/v1/admin/agents/primary/model-assignment",
+      );
+      const run = await jsonRequest(serviceRequest(
+        service.url,
+        "run-test-token",
+        "/v1/runs",
+        {
+          method: "POST",
+          headers: { "idempotency-key": "pi-gateway-failure-run" },
+          body: JSON.stringify({
+            agentId: "primary",
+            sessionKey: "release:pi-gateway-failure",
+            input: { type: "text", text: "This must fail closed." },
+          }),
+        },
+      ), 202) as { runId: string };
+      const failed = await waitForRunState(service.url, run.runId, "failed");
+
+      expect({ status: ready.status, body: await ready.json() }).toEqual({
+        status: 200,
+        body: { ready: true },
+      });
+      expect({ status: assignmentResponse.status, body: await assignmentResponse.json() })
+        .toMatchObject({ status: 200, body: { state: "assigned" } });
+      expect(failed).toMatchObject({
+        status: "failed",
+        failure: { code: "provider_unavailable" },
+      });
+      expect(assignmentSnapshot(fixture.databasePath, "primary"))
+        .toBe(frozenAssignment);
+      expect(provider.chatRequests).toEqual([]);
+      expect(provider.responsesRequests).toEqual([]);
+      await service.shutdown();
+      expect(gatewayStops).toBe(1);
+    } finally {
+      restoreEnvironment("RELEASE_PI_API_KEY", previousSecret);
+      await cleanup.dispose();
+    }
+  }, 25_000);
+
+  it("runs a new Pi profile through the gateway without exposing its Secret", async () => {
+    const providerSecret = "PI_PROVIDER_SECRET_RELEASE_MARKER";
+    const previousSecret = process.env.RELEASE_PI_API_KEY;
+    process.env.RELEASE_PI_API_KEY = providerSecret;
+    const gatewayRequests: string[] = [];
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["deepseek-v4-flash"],
+        expectedApiKey: providerSecret,
+        chat: [
+          { type: "verification_text", text: "Pi text verification passed" },
+          { type: "verification_tool", callId: "verify-pi-gateway" },
+          { type: "text", text: "Pi gateway run completed" },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp({
+        providerGateway: {
+          listen: captureGatewayTraffic(gatewayRequests),
+        },
+      }), (active) => active.close());
+      const setup = await service.setupVerifiedModel({
+        connectionSlug: "pi-gateway-release",
+        profileSlug: "pi-gateway-release",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "deepseek-v4-flash",
+        protocol: "responses",
+        driverId: "pi/deepseek",
+        catalogCandidateId: "pi/deepseek:deepseek-v4-flash",
+        apiKeyEnvironment: "RELEASE_PI_API_KEY",
+        agentId: "primary",
+      });
+      const run = await service.createRun({
+        agentId: "primary",
+        sessionKey: "release:pi-gateway",
+        text: "Complete through the controlled Pi route.",
+        idempotencyKey: "pi-gateway-release-run",
+      });
+      await service.waitForRunStatus(run.runId, "completed");
+      const events = await service.readRunEvents(run.runId);
+      const runResponse = await service.runRequest(`/v1/runs/${run.runId}`);
+      const runView = await runResponse.json();
+
+      expect(gatewayRequests.length).toBeGreaterThanOrEqual(3);
+      expect(gatewayRequests.every((requestPath) => requestPath.startsWith("/pi/")))
+        .toBe(true);
+      expect(provider.chatRequests).toHaveLength(3);
+      expect(provider.chatRequests.every(({ credentialMatched }) => credentialMatched))
+        .toBe(true);
+      expect(JSON.stringify({
+        setup,
+        setupResponses: service.setupResponseBodies,
+        events,
+        runView,
+        logs: service.logs,
+        gatewayRequests,
+        providerRequests: provider.chatRequests,
+      })).not.toContain(providerSecret);
+      expect((await readFile(service.databasePath)).includes(Buffer.from(providerSecret)))
+        .toBe(false);
+    } finally {
+      restoreEnvironment("RELEASE_PI_API_KEY", previousSecret);
+      await cleanup.dispose();
+    }
+  }, 30_000);
+
   it("cleans partial service startup before closing an earlier provider", async () => {
     const cleanup = createAsyncCleanupStack();
     let providerModelsUrl = "";
@@ -921,6 +1071,15 @@ function captureGatewayUrl(capture: (url: string) => void): ProviderEgressGatewa
   };
 }
 
+function captureGatewayTraffic(requestPaths: string[]): ProviderEgressGatewayListen {
+  return async (server, address) => {
+    server.on("request", (request) => {
+      requestPaths.push(request.url ?? "");
+    });
+    await listen(server, address.host, address.port);
+  };
+}
+
 async function listen(server: Server, host: string, port: number): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -935,6 +1094,53 @@ async function jsonRequest(responsePromise: Promise<Response>, status: number): 
   const response = await responsePromise;
   expect(response.status).toBe(status);
   return response.status === 204 ? null : response.json();
+}
+
+function assignmentSnapshot(databasePath: string, agentId: string): string {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    return JSON.stringify(database.prepare(
+      "SELECT * FROM model_assignments WHERE agent_id = ?",
+    ).get(agentId));
+  } finally {
+    database.close();
+  }
+}
+
+function serviceRequest(
+  serviceUrl: string,
+  token: string,
+  pathname: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  return fetch(`${serviceUrl}${pathname}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(init.body === undefined ? {} : { "content-type": "application/json" }),
+      ...init.headers,
+    },
+  });
+}
+
+async function waitForRunState(
+  serviceUrl: string,
+  runId: string,
+  expected: string,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    const response = await serviceRequest(
+      serviceUrl,
+      "run-test-token",
+      `/v1/runs/${runId}`,
+    );
+    expect(response.status).toBe(200);
+    const run = await response.json() as Record<string, unknown>;
+    if (run.status === expected) return run;
+    if (Date.now() >= deadline) throw new Error(`run_status_timeout:${String(run.status)}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 async function waitForVerificationFailure(
@@ -1003,4 +1209,9 @@ async function queueCandidateVerification(
     },
   ), 202) as { verificationId: string };
   return queued.verificationId;
+}
+
+function restoreEnvironment(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
 }

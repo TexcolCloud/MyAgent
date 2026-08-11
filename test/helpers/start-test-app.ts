@@ -6,7 +6,11 @@ import { fileURLToPath } from "node:url";
 import type { FastifyBaseLogger } from "fastify";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { createHttpApp } from "../../src/interfaces/http/app.js";
-import { bootstrap, type BootstrappedService } from "../../src/bootstrap.js";
+import {
+  bootstrap,
+  type BootstrapOptions,
+  type BootstrappedService,
+} from "../../src/bootstrap.js";
 import type { SseStreamOptions } from "../../src/interfaces/http/sse.js";
 import { SqliteApprovalRepository } from "../../src/adapters/sqlite/approval-repository.js";
 import { SqliteCatalogRepository } from "../../src/adapters/sqlite/catalog-repository.js";
@@ -190,6 +194,7 @@ export async function startRealTestApp(options: {
   readonly verificationRequestTimeoutMs?: number;
   readonly listenPort?: number;
   readonly onRootCreated?: (root: string) => void;
+  readonly providerGateway?: BootstrapOptions["providerGateway"];
 } = {}): Promise<{
   readonly root: string;
   readonly url: string;
@@ -208,6 +213,8 @@ export async function startRealTestApp(options: {
     apiKeyEnvironment?: string;
     apiKey?: string;
     providerKind?: "openai" | "deepseek" | "openai_compatible";
+    driverId?: `pi/${string}`;
+    catalogCandidateId?: string;
     verificationTimeoutMs?: number;
   }): Promise<VerifiedModelSetup>;
   createRun(input: {
@@ -266,6 +273,9 @@ export async function startRealTestApp(options: {
       signals: false,
       log: { write: (line) => logs.push(line) },
       worker: { concurrency: 1, idleDelayMs: 10, leaseDurationMs: 1_000 },
+      ...(options.providerGateway === undefined
+        ? {}
+        : { providerGateway: options.providerGateway }),
     });
   };
   const stop = async (): Promise<void> => {
@@ -333,6 +343,9 @@ export async function startRealTestApp(options: {
       if (input.apiKey !== undefined && input.apiKeyEnvironment !== undefined) {
         throw new Error("real_test_provider_auth_ambiguous");
       }
+      if ((input.driverId === undefined) !== (input.catalogCandidateId === undefined)) {
+        throw new Error("real_test_pi_selection_incomplete");
+      }
       const connectionResponse = await requireStatus(await setupAdminRequest(
         "/provider-connections",
         {
@@ -340,7 +353,9 @@ export async function startRealTestApp(options: {
           body: JSON.stringify({
             slug: input.connectionSlug,
             displayName: input.connectionSlug,
-            kind: input.providerKind ?? "openai_compatible",
+            ...(input.driverId === undefined
+              ? { kind: input.providerKind ?? "openai_compatible" }
+              : { driverId: input.driverId }),
             baseUrl: input.providerBaseUrl,
             auth: input.apiKey !== undefined
               ? { type: "api_key" }
@@ -373,10 +388,14 @@ export async function startRealTestApp(options: {
             slug: input.profileSlug,
             displayName: input.profileSlug,
             connectionRevisionId,
-            modelId: input.modelId,
-            protocol: input.protocol,
-            maxInputTokens: 32_768,
-            contextWindowSource: "operator",
+            ...(input.catalogCandidateId === undefined
+              ? {
+                  modelId: input.modelId,
+                  protocol: input.protocol,
+                  maxInputTokens: 32_768,
+                  contextWindowSource: "operator",
+                }
+              : { catalogCandidateId: input.catalogCandidateId }),
           }),
         },
       ), 201, "create_profile");
