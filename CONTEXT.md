@@ -21,8 +21,12 @@ A project-owned stable identity for the runtime family that reaches a Model Prov
 _Avoid_: Library provider name, Provider Connection
 
 **Invocation Protocol**:
-The provider-facing API contract fixed for a Model Profile and captured by a Run; it identifies one resolved provider invocation form without runtime selection or fallback.
-_Avoid_: Model Provider, automatic runtime fallback
+The durable invocation family fixed for a Model Profile and captured by a Run; `pi_ai` denotes the Pi runtime path, whose exact Provider API form is fixed by its Provider Compatibility Contract without runtime selection or fallback.
+_Avoid_: Model Provider, automatic runtime fallback, mutable Provider API choice
+
+**Provider Compatibility Contract**:
+A versioned, Provider-specific request and response encoding explicitly stored in a Pi runtime contract and captured by a Run; it fixes the Provider API form inside the `pi_ai` Invocation Protocol without selecting another protocol or falling back at runtime.
+_Avoid_: Runtime fallback, automatic protocol selection, Provider workaround
 
 **Provider Connection**:
 An Operator-configured route to one Model Provider, consisting of a provider kind, Base URL, and Secret reference; one connection may expose many models.
@@ -72,6 +76,10 @@ _Avoid_: Server dashboard, database console
 A verified behavior of a Model Profile, such as streaming text or producing one structured Tool Call through its Invocation Protocol.
 _Avoid_: Provider claim, model metadata
 
+**Single Tool Call Boundary**:
+The current Model Capability boundary under which one model attempt may produce exactly one structured Tool Call; an attempt producing multiple distinct calls is invalid and cannot authorize or execute any of them.
+_Avoid_: Best-effort first call, implicit multi-tool support
+
 **Provider Health**:
 The latest operational observation for a Provider Connection or Model Profile; degraded health does not revoke prior verification or alter Model Assignments.
 _Avoid_: Model Verification, readiness
@@ -81,8 +89,12 @@ The enumeration of model identifiers advertised by a Provider Connection; discov
 _Avoid_: Model Verification, availability check
 
 **Catalog Model Candidate**:
-A model configuration published by a runtime library as a possible Provider choice; it does not represent a live discovery result from a Provider Connection.
+A project-owned model configuration published in a Provider Driver catalog, derived from runtime-library metadata or a maintained Compatibility Variant; it does not represent a live discovery result from a Provider Connection.
 _Avoid_: Discovered model, verified model
+
+**Compatibility Variant**:
+A Catalog Model Candidate for the same provider model identifier whose distinct immutable Pi runtime contract selects a maintained Provider Compatibility Contract.
+_Avoid_: Alias, automatic protocol fallback, mutable model setting
 
 **Model Verification**:
 A bounded live check that the Operator-selected Model Profile can serve its intended invocation protocol and required capabilities at that moment.
