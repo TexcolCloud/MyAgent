@@ -684,6 +684,7 @@ function piRequest(overrides: Partial<ModelRequest> = {}): ModelRequest {
         driverId: "pi/deepseek",
         catalogProviderId: "deepseek",
         api: "openai-completions",
+        providerCompatibilityContract: "none",
         modelId: "deepseek-v4-flash",
         contextWindow: 8_192,
         maxOutputTokens: 2_048,

@@ -20,6 +20,7 @@ const ANTHROPIC_CONTRACT: PiRuntimeContract = {
   driverId: "pi/anthropic",
   catalogProviderId: "anthropic",
   api: "anthropic-messages",
+  providerCompatibilityContract: "none",
   modelId: "claude-sonnet-4-20250514",
   contextWindow: 200_000,
   maxOutputTokens: 64_000,

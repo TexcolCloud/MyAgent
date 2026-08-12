@@ -1,4 +1,5 @@
 export type ProviderDriverId = `pi/${string}`;
+export type ProviderCompatibilityContract = "none" | "deepseek-responses-v1";
 
 export interface PiRuntimeContract {
   readonly kind: "pi_ai";
@@ -6,6 +7,7 @@ export interface PiRuntimeContract {
   readonly driverId: ProviderDriverId;
   readonly catalogProviderId: string;
   readonly api: string;
+  readonly providerCompatibilityContract: ProviderCompatibilityContract;
   readonly modelId: string;
   readonly contextWindow: number;
   readonly maxOutputTokens?: number;

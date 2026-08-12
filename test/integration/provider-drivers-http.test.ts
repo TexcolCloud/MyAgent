@@ -30,6 +30,17 @@ describe("HTTP provider Driver catalog", () => {
             ]),
           }),
           expect.objectContaining({
+            driverId: "pi/deepseek",
+            candidates: expect.arrayContaining([
+              expect.objectContaining({
+                candidateId: "pi/deepseek:deepseek-v4-flash",
+              }),
+              expect.objectContaining({
+                candidateId: "pi/deepseek:deepseek-v4-flash-responses",
+              }),
+            ]),
+          }),
+          expect.objectContaining({
             driverId: "pi/anthropic",
             candidates: expect.arrayContaining([
               expect.objectContaining({ credentialSupport: "unsupported" }),
