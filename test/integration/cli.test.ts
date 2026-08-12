@@ -44,7 +44,7 @@ describe("CLI HTTP boundary", () => {
       write: (line) => output.push(line),
       writeError: (line) => output.push(line),
     })).resolves.toBe(2);
-    await expect(executeCli(["tui", "--token", "override-run-token", "--admin-token", "override-admin-token"], {
+    await expect(executeCli(["tui", "--api-url", "http://127.0.0.1:8787"], {
       environment,
       stdinIsTTY: true,
       stdoutIsTTY: true,
@@ -60,26 +60,24 @@ describe("CLI HTTP boundary", () => {
     expect(output.join("\n")).not.toContain("token");
   });
 
-  it("uses explicit TUI token overrides for their separate authority clients", async () => {
+  it("rejects visible TUI tokens without creating a workbench", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
-    const authorizations: string[] = [];
-    const runTui = async (input: { readonly client: { listProviderDrivers(): Promise<unknown> } }) => {
-      await input.client.listProviderDrivers();
-    };
+    const output: string[] = [];
+    const runTui = vi.fn();
 
     await expect(executeCli(["tui", "--token", "run-override", "--admin-token", "admin-override"], {
       environment: { MYAGENT_RUN_TOKEN: "run-environment", MYAGENT_ADMIN_TOKEN: "admin-environment" },
       stdinIsTTY: true,
       stdoutIsTTY: true,
-      fetcher: async (_input, init) => {
-        authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
-        return Response.json({ piVersion: "0.73.1", drivers: [] });
-      },
-      runTui: runTui as never,
-      writeError: () => undefined,
-    })).resolves.toBe(0);
+      runTui,
+      write: (line) => output.push(line),
+      writeError: (line) => output.push(line),
+    })).resolves.toBe(2);
 
-    expect(authorizations).toEqual(["Bearer admin-override"]);
+    expect(output).toEqual(["visible_tui_token_forbidden: Use TUI environment variables or masked prompts for tokens. (traceId: cli)"]);
+    expect(runTui).not.toHaveBeenCalled();
+    expect(output.join("\n")).not.toContain("run-override");
+    expect(output.join("\n")).not.toContain("admin-override");
   });
 
   it("loads local config validation without importing SQLite", async () => {

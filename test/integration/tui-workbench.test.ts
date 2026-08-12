@@ -11,33 +11,93 @@ describe("TUI workbench", () => {
   it("renders three bounded regions and restores the terminal on exit", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36, inputs: ["\u0003"] });
 
-    await runWorkbench({ client: safeClient(), terminal });
+    await expect(runWorkbench({ client: safeClient(), terminal })).resolves.toBe(0);
 
     expect(terminal.frames.at(-1)).toContain("Runs");
     expect(terminal.frames.at(-1)).toContain("Inspect");
     expect(terminal.stopCalls).toBe(1);
   });
 
-  it("does not render a raw provider response or token in inspector text", () => {
+  it("routes navigation input into the main pane and loads safe Agent summaries", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const workbench = runWorkbench({ client: safeClient(), terminal });
+
+    await terminal.ready();
+    terminal.input("\u001b[A");
+    terminal.input("\r");
+    await terminal.waitForFrame("Research Agent");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    expect(terminal.frames.at(-1)).toContain("Agents");
+    expect(terminal.frames.at(-1)).toContain("Research Agent");
+  });
+
+  it("loads safe Provider Connection and Model Profile summaries through navigation", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const workbench = runWorkbench({ client: safeClient(), terminal });
+
+    await terminal.ready();
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await terminal.waitForFrame("Provider One");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await terminal.waitForFrame("Model One");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    expect(terminal.frames.at(-1)).toContain("Profiles");
+    expect(terminal.frames.at(-1)).toContain("Model One");
+  });
+
+  it("opens the existing masked model-setup workflow with m", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const workbench = runWorkbench({ client: safeClient(), terminal });
+
+    await terminal.ready();
+    terminal.input("m");
+    await terminal.waitForFrame("Provider");
+    terminal.input("\u001b");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+  });
+
+  it("stops the terminal once when startup fails", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36, startError: new Error("terminal_start_failed") });
+
+    await expect(runWorkbench({ client: safeClient(), terminal })).rejects.toThrow("terminal_start_failed");
+    expect(terminal.stopCalls).toBe(1);
+  });
+
+  it("does not render credential-bearing multiline provider details", () => {
     const screen = new InspectorScreen();
-    screen.showProblem({ code: "provider_unavailable", detail: "safe detail", traceId: "t_1" });
+    screen.showProblem({
+      code: "provider_unavailable\u001b[31m",
+      detail: "safe detail\nAuthorization: Bearer secret-value\nAPI key: hidden\ntoken=hidden\nshown",
+      traceId: "t_1\u0007",
+    });
 
     const text = screen.render(40).join("\n");
     expect(text).toContain("provider_unavailable");
+    expect(text).toContain("shown");
     expect(text).not.toContain("Authorization");
     expect(text).not.toContain("Bearer");
+    expect(text).not.toContain("API key");
+    expect(text).not.toContain("hidden");
+    expect(text).not.toContain("\u001b");
   });
 
-  it("keeps every region within a narrow render width", () => {
-    const inspector = new InspectorScreen();
-    inspector.showProblem({
-      code: "provider_unavailable",
-      detail: "A safe diagnostic detail that must be bounded to the inspector column.",
-      traceId: "t_1",
-    });
+  it("keeps the composed three-region layout within a narrow render width", async () => {
+    const terminal = new FakeTuiTerminal({ width: 24, height: 36, inputs: ["\u0003"] });
 
-    for (const line of inspector.render(12)) {
-      expect(visibleWidth(line)).toBeLessThanOrEqual(12);
+    await runWorkbench({ client: safeClient(), terminal });
+
+    for (const frame of terminal.frames) {
+      for (const line of plainLines(frame)) {
+        expect(visibleWidth(line)).toBeLessThanOrEqual(24);
+      }
     }
   });
 });
@@ -114,11 +174,22 @@ class FakeTuiTerminal implements Terminal {
   stopCalls = 0;
   private onInput: ((data: string) => void) | undefined;
 
-  constructor(private readonly options: { readonly width: number; readonly height: number; readonly inputs?: readonly string[] }) {}
+  constructor(private readonly options: { readonly width: number; readonly height: number; readonly inputs?: readonly string[]; readonly startError?: Error }) {}
 
   start(onInput: (data: string) => void): void {
+    if (this.options.startError !== undefined) throw this.options.startError;
     this.onInput = onInput;
     setTimeout(() => this.options.inputs?.forEach((input) => this.onInput?.(input)), 0);
+  }
+
+  input(data: string): void { this.onInput?.(data); }
+  async ready(): Promise<void> { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }
+  async waitForFrame(value: string): Promise<void> {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (this.frames.at(-1)?.includes(value) === true) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+    }
+    throw new Error(`frame_not_found:${value}`);
   }
 
   stop(): void { this.stopCalls += 1; }
@@ -139,8 +210,38 @@ class FakeTuiTerminal implements Terminal {
 
 function safeClient() {
   return {
+    listAgents: async () => ({ agents: [{ id: "research", displayName: "Research Agent", revisionId: "rev_1" }], unavailable: [] }),
+    listProviderConnections: async () => ({ connections: [{ connectionId: "provider-one", displayName: "Provider One", activeRevisionId: "pcr_1", retiredAt: null }] }),
+    listModelProfiles: async () => ({ profiles: [{ profileId: "model-one", displayName: "Model One", activeRevisionId: "mpr_1", retiredAt: null }] }),
     listProviderDrivers: async () => ({ piVersion: "0.73.1" as const, drivers: [] }),
+    adminRequest: async <T>(path: string) => (path === "/v1/admin/provider-drivers"
+      ? { piVersion: "0.73.1", drivers: [] } as T
+      : {} as T),
   };
+}
+
+function plainLines(frame: string): string[] {
+  let text = "";
+  for (let index = 0; index < frame.length; index += 1) {
+    if (frame.charCodeAt(index) !== 0x1b) {
+      text += frame[index]!;
+      continue;
+    }
+    const next = frame[index + 1];
+    if (next === "[") {
+      index += 2;
+      while (index < frame.length && !isAnsiTerminator(frame[index]!)) index += 1;
+    } else if (next === "]") {
+      index += 2;
+      while (index < frame.length && frame.charCodeAt(index) !== 0x07) index += 1;
+    }
+  }
+  return text.split(/\r?\n/u);
+}
+
+function isAnsiTerminator(character: string): boolean {
+  const code = character.charCodeAt(0);
+  return code >= 0x40 && code <= 0x7e;
 }
 
 function scriptedPrompt(values: {

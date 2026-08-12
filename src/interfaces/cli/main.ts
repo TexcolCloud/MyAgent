@@ -50,11 +50,7 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
         stdoutIsTTY: options.stdoutIsTTY ?? process.stdout.isTTY === true,
       });
       const credentials = await readTuiCredentials({
-        environment: {
-          ...environment,
-          ...(stringFlag(flags, "token") === undefined ? {} : { MYAGENT_RUN_TOKEN: requiredFlag(flags, "token") }),
-          ...(stringFlag(flags, "admin-token") === undefined ? {} : { MYAGENT_ADMIN_TOKEN: requiredFlag(flags, "admin-token") }),
-        },
+        environment,
         promptSecret: (label) => (options.prompt ?? createConsolePrompt()).secret(label),
       });
       const workbenchOptions: RunWorkbenchOptions = {
@@ -326,7 +322,7 @@ const ADMIN_COMMANDS = new Set([
 
 const RUN_FLAGS = ["api-url", "token", "json"] as const;
 const ADMIN_FLAGS = ["api-url", "admin-token", "json"] as const;
-const TUI_FLAGS = ["api-url", "token", "admin-token"] as const;
+const TUI_FLAGS = ["api-url"] as const;
 const COMMAND_GRAMMAR: Readonly<Record<string, {
   readonly positional: number;
   readonly flags: readonly string[];
@@ -368,6 +364,9 @@ function assertCommandGrammar(command: string, positional: number, flags: CliFla
   const grammar = COMMAND_GRAMMAR[command];
   if (grammar === undefined || positional !== grammar.positional) {
     throw new CliUsageError("invalid_cli_command", "The CLI command is invalid.");
+  }
+  if (command === "tui" && (flags.token !== undefined || flags["admin-token"] !== undefined)) {
+    throw new CliUsageError("visible_tui_token_forbidden", "Use TUI environment variables or masked prompts for tokens.");
   }
   const allowed = new Set(grammar.flags);
   if (Object.keys(flags).some((flag) => !allowed.has(flag))) {

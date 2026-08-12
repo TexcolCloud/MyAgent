@@ -85,6 +85,29 @@ export interface ProviderDriverCatalog {
   }[];
 }
 
+export interface AgentListView {
+  readonly agents: readonly { readonly id: string; readonly revisionId: string; readonly displayName: string }[];
+  readonly unavailable: readonly { readonly label: string; readonly code: "invalid_agent_config" }[];
+}
+
+export interface ProviderConnectionsView {
+  readonly connections: readonly {
+    readonly connectionId: string;
+    readonly displayName: string;
+    readonly activeRevisionId: string | null;
+    readonly retiredAt: string | null;
+  }[];
+}
+
+export interface ModelProfilesView {
+  readonly profiles: readonly {
+    readonly profileId: string;
+    readonly displayName: string;
+    readonly activeRevisionId: string | null;
+    readonly retiredAt: string | null;
+  }[];
+}
+
 export class TuiClient {
   private readonly runClient: CliClient;
   private readonly adminClient: CliClient;
@@ -129,6 +152,18 @@ export class TuiClient {
 
   listPendingApprovals(): Promise<{ readonly approvals: readonly PendingApproval[] }> {
     return this.runClient.request("/v1/approvals?status=pending");
+  }
+
+  listAgents(): Promise<AgentListView> {
+    return this.runClient.request("/v1/agents");
+  }
+
+  listProviderConnections(): Promise<ProviderConnectionsView> {
+    return this.adminClient.request("/v1/admin/provider-connections", { authority: "admin" });
+  }
+
+  listModelProfiles(): Promise<ModelProfilesView> {
+    return this.adminClient.request("/v1/admin/model-profiles", { authority: "admin" });
   }
 
   listProviderDrivers(): Promise<ProviderDriverCatalog> {

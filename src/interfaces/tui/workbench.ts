@@ -8,62 +8,127 @@ import {
   type Terminal,
 } from "@mariozechner/pi-tui";
 
+import { PiTuiPrompt } from "./pi-tui-prompt.js";
 import { ChatScreen } from "./screens/chat.js";
 import { InspectorScreen } from "./screens/inspector.js";
-import { NavigationScreen } from "./screens/navigation.js";
+import { NavigationScreen, type WorkbenchDestination } from "./screens/navigation.js";
+import { runModelSetupScreen } from "./screens/model-setup.js";
 import type { TuiClient } from "./tui-client.js";
 
+type WorkbenchClient = Pick<TuiClient,
+  "listAgents" | "listProviderConnections" | "listModelProfiles" | "adminRequest"
+>;
+
 export interface RunWorkbenchOptions {
-  readonly client: Pick<TuiClient, "listProviderDrivers">;
+  readonly client: WorkbenchClient;
   readonly terminal?: Terminal;
 }
 
-export async function runWorkbench(options: RunWorkbenchOptions): Promise<void> {
+export async function runWorkbench(options: RunWorkbenchOptions): Promise<number> {
   const terminal = options.terminal ?? new ProcessTerminal();
   const tui = new TUI(terminal);
   const inspector = new InspectorScreen();
   const chat = new ChatScreen();
-  const navigation = new NavigationScreen((destination) => {
-    chat.show(destination);
-    inspector.clear();
-    tui.requestRender();
-  });
-  const layout = new WorkbenchLayout(navigation, chat, inspector);
-  tui.addChild(layout);
-  tui.setFocus(chat);
-
   let closed = false;
-  let finish: (() => void) | undefined;
-  const close = () => {
+  let modelSetupPending = false;
+  let resolveExit: (() => void) | undefined;
+  const stopped = () => {
     if (closed) return;
     closed = true;
-    tui.stop();
-    finish?.();
-  };
-
-  const done = new Promise<void>((resolve) => { finish = resolve; });
-  tui.addInputListener((data) => {
-    if (!matchesKey(data, "ctrl+c")) return undefined;
     if (tui.hasOverlay()) tui.hideOverlay();
-    close();
-    return { consume: true };
-  });
-  tui.start();
-  tui.requestRender(true);
+    resolveExit?.();
+  };
+  const refresh = (destination: WorkbenchDestination) => {
+    void loadDestination(options.client, destination, chat, inspector).finally(() => tui.requestRender());
+  };
+  const navigation = new NavigationScreen(refresh);
+  tui.addChild(new WorkbenchLayout(navigation, chat, inspector));
+  tui.setFocus(navigation);
+  const finished = new Promise<void>((resolve) => { resolveExit = resolve; });
 
-  void options.client.listProviderDrivers().then(
-    () => undefined,
-    () => {
-      inspector.showProblem({
-        code: "service_unavailable",
-        detail: "The control plane is unavailable.",
-        traceId: "tui",
+  try {
+    tui.addInputListener((data) => {
+      if (matchesKey(data, "ctrl+c")) {
+        stopped();
+        return { consume: true };
+      }
+      if (!matchesKey(data, "m") || modelSetupPending) return undefined;
+      modelSetupPending = true;
+      void runModelSetupScreen({
+        prompt: new PiTuiPrompt(tui),
+        client: options.client,
+        write: () => undefined,
+        onProgress: (progress) => {
+          chat.show("profiles", [modelSetupLabel(progress)]);
+          tui.requestRender();
+        },
+      }).then(
+        () => refresh("profiles"),
+        () => inspector.showProblem({
+          code: "service_unavailable",
+          detail: "Model setup is unavailable.",
+          traceId: "tui",
+        }),
+      ).finally(() => {
+        modelSetupPending = false;
+        tui.setFocus(navigation);
+        tui.requestRender();
       });
-      tui.requestRender();
-    },
-  );
+      return { consume: true };
+    });
+    tui.start();
+    tui.requestRender(true);
+    await finished;
+    return 0;
+  } finally {
+    if (!closed && tui.hasOverlay()) tui.hideOverlay();
+    closed = true;
+    tui.stop();
+  }
+}
 
-  await done;
+async function loadDestination(
+  client: WorkbenchClient,
+  destination: WorkbenchDestination,
+  chat: ChatScreen,
+  inspector: InspectorScreen,
+): Promise<void> {
+  chat.show(destination, ["Loading..."]);
+  inspector.clear();
+  try {
+    if (destination === "agents") {
+      const response = await client.listAgents();
+      chat.show(destination, response.agents.length === 0
+        ? ["No Agents are available."]
+        : response.agents.map((agent) => `${agent.displayName} (${agent.id})`));
+      return;
+    }
+    if (destination === "providers") {
+      const response = await client.listProviderConnections();
+      chat.show(destination, response.connections.length === 0
+        ? ["No Provider Connections are available."]
+        : response.connections.map((connection) => `${connection.displayName} (${connection.connectionId})`));
+      return;
+    }
+    if (destination === "profiles") {
+      const response = await client.listModelProfiles();
+      chat.show(destination, response.profiles.length === 0
+        ? ["No Model Profiles are available. Press m to set up a model."]
+        : response.profiles.map((profile) => `${profile.displayName} (${profile.profileId})`));
+      return;
+    }
+    chat.show(destination);
+  } catch {
+    inspector.showProblem({
+      code: "service_unavailable",
+      detail: "The control plane is unavailable.",
+      traceId: "tui",
+    });
+  }
+}
+
+function modelSetupLabel(progress: string): string {
+  return `Model setup: ${progress.replace(/_/gu, " ")}`;
 }
 
 class WorkbenchLayout implements Component {
@@ -87,34 +152,18 @@ class WorkbenchLayout implements Component {
     const inspector = this.inspector.render(inspectorWidth);
     const height = Math.max(navigation.length, chat.length, inspector.length);
     return Array.from({ length: height }, (_, index) => line(
-      navigation[index] ?? "",
-      navigationWidth,
-      chat[index] ?? "",
-      chatWidth,
-      inspector[index] ?? "",
-      inspectorWidth,
-      width,
+      navigation[index] ?? "", navigationWidth, chat[index] ?? "", chatWidth,
+      inspector[index] ?? "", inspectorWidth, width,
     ));
   }
 
   invalidate(): void {}
 }
 
-function line(
-  navigation: string,
-  navigationWidth: number,
-  chat: string,
-  chatWidth: number,
-  inspector: string,
-  inspectorWidth: number,
-  width: number,
-): string {
-  const columns = [
-    pad(navigation, navigationWidth),
-    pad(chat, chatWidth),
-    pad(inspector, inspectorWidth),
-  ];
-  return truncateToWidth(columns.join(" "), width);
+function line(navigation: string, navigationWidth: number, chat: string, chatWidth: number, inspector: string, inspectorWidth: number, width: number): string {
+  return truncateToWidth([
+    pad(navigation, navigationWidth), pad(chat, chatWidth), pad(inspector, inspectorWidth),
+  ].join(" "), width);
 }
 
 function pad(value: string, width: number): string {
