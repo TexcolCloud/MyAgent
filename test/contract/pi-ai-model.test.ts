@@ -285,6 +285,8 @@ describe("PiAiModelAdapter", () => {
     ["context window", { contextWindow: 128_000 }],
     ["output limit", { maxOutputTokens: 8_192 }],
     ["compatibility", { compatibility: { supportsUsageInStreaming: true } }],
+    ["null compatibility", { compatibility: null }],
+    ["missing compatibility", { compatibility: undefined }],
   ] as const)(
     "rejects a captured DeepSeek Responses contract paired with another %s before egress",
     async (_case, override) => {

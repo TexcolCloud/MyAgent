@@ -259,6 +259,8 @@ describe("SqliteModelRegistryRepository", () => {
     ["context window", { contextWindow: 128_000 }],
     ["output limit", { maxOutputTokens: 8_192 }],
     ["compatibility", { compatibility: { supportsUsageInStreaming: true } }],
+    ["null compatibility", { compatibility: null }],
+    ["missing compatibility", { compatibility: undefined }],
   ] as const)(
     "rejects a persisted DeepSeek Responses contract paired with another %s",
     (_case, override) => {

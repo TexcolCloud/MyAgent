@@ -26,6 +26,7 @@ export interface ProviderCatalogCandidate {
 export function isValidProviderCompatibilityRuntime(
   runtime: PiRuntimeContract,
 ): boolean {
+  if (!isPrimitiveRecord(runtime.compatibility)) return false;
   if (runtime.providerCompatibilityContract === "none") return true;
   if (runtime.providerCompatibilityContract !== "deepseek-responses-v1") return false;
   return runtime.kind === "pi_ai" &&
@@ -40,6 +41,16 @@ export function isValidProviderCompatibilityRuntime(
       requiresReasoningContentOnAssistantMessages: true,
       thinkingFormat: "deepseek",
     });
+}
+
+function isPrimitiveRecord(
+  value: unknown,
+): value is Readonly<Record<string, boolean | number | string>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) &&
+    Object.values(value).every((entry) =>
+      typeof entry === "boolean" || typeof entry === "string" ||
+      (typeof entry === "number" && Number.isFinite(entry))
+    );
 }
 
 function primitiveRecordsMatch(

@@ -64,3 +64,25 @@ The live-smoke npm wrapper still cannot discover its test from a repository
 located beneath `.worktrees`. This is pre-existing test-runner infrastructure;
 the compatibility behavior and credential-absent smoke path are covered by the
 root-explicit run above.
+
+## Scoped Re-review Follow-up
+
+Scoped re-review found that captured DeepSeek Responses runtimes with a null or
+missing `compatibility` record reached `Object.entries()` in the immutable
+identity guard and escaped as a raw `TypeError`. Two adapter regressions first
+reproduced that failure while the matching persisted-Profile cases confirmed
+the repository already returned `invalid_model_profile`.
+
+The shared identity guard now validates that `compatibility` is a non-array
+object containing only finite primitive values before any contract-specific
+branch or record comparison. Captured null, missing, and otherwise malformed
+records therefore fail before gateway allocation or Pi invocation as a
+non-transient `model_protocol_error`; valid legacy/manual `none` runtimes retain
+their existing behavior.
+
+Follow-up verification:
+
+- Focused contract: 2 files and 116 tests passed.
+- Run-worker integration: 1 file and 13 tests passed.
+- `npm run lint`: PASS.
+- `npm run typecheck`: PASS.
