@@ -137,13 +137,18 @@ Purge removes an unreferenced Connection or Profile after explicit confirmation.
 The live Pi Driver smoke is disabled unless both
 `MYAGENT_DEEPSEEK_BASE_URL` and `MYAGENT_DEEPSEEK_API_KEY` are present.
 `MYAGENT_DEEPSEEK_MODEL` is optional and defaults to
-`deepseek-v4-flash`; when set, it must name a `pi/deepseek` candidate in the
-pinned `0.73.1` catalog and the remote discovery response. The API key remains
-an environment Secret reference and must never be placed in configuration,
-test data, command arguments, or CI.
+`deepseek-v4-flash`; when supplied, it must equal that exact value. The smoke
+requires remote discovery of `deepseek-v4-flash` and selects the explicit
+`pi/deepseek:deepseek-v4-flash-responses` Compatibility Variant from the
+pinned `0.73.1` catalog. An Operator-owned proxy may supply the Base URL, but
+the Base URL never triggers compatibility inference. The API key remains an
+environment Secret reference and must never be placed in configuration, test
+data, command arguments, or CI.
 
 Run `npm run test:smoke:live`. The smoke discovers models, creates and verifies
 a `pi/deepseek` Profile through the loopback gateway, promotes and assigns it,
 and completes one no-Tool Run. It checks the persisted Driver/version,
 protocol completion, and containment only; it does not assert response prose.
-Normal tests and CI do not require or request these variables.
+When the required environment references are absent, it skips before provider
+setup and makes no network request. Normal tests and CI do not require or
+request these variables.
