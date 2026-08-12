@@ -33,6 +33,7 @@ export interface PiAiClient {
   stream(input: {
     contract: PiRuntimeContract;
     route: PiGatewayRoute;
+    purpose: ModelRequest["purpose"];
     input: readonly ModelInput[];
     tools: ModelRequest["tools"];
     toolChoice: ModelRequest["toolChoice"];
@@ -60,6 +61,7 @@ export class PiAiSdkClient implements PiAiClient {
   async *stream(input: {
     contract: PiRuntimeContract;
     route: PiGatewayRoute;
+    purpose: ModelRequest["purpose"];
     input: readonly ModelInput[];
     tools: ModelRequest["tools"];
     toolChoice: ModelRequest["toolChoice"];
@@ -76,7 +78,7 @@ export class PiAiSdkClient implements PiAiClient {
         : { maxTokens: input.contract.maxOutputTokens }),
       ...(input.toolChoice === undefined ? {} : { toolChoice: input.toolChoice }),
       maxRetries: 0,
-      onPayload: (payload) => transformPayload(input.contract, payload),
+      onPayload: (payload) => transformPayload(input.contract, input.purpose, payload),
       onResponse(response) {
         status = response.status;
         retryAfterMs = parseRetryAfter(response.headers);
@@ -230,8 +232,12 @@ function assistantMessage(
 
 function transformPayload(
   contract: PiRuntimeContract,
+  purpose: ModelRequest["purpose"],
   payload: unknown,
 ): unknown | undefined {
+  if (contract.providerCompatibilityContract === "deepseek-responses-v1") {
+    return deepSeekResponsesPayload(purpose, payload);
+  }
   if (
     contract.api !== "openai-completions" &&
     contract.api !== "openai-responses" &&
@@ -250,18 +256,47 @@ function transformPayload(
   return { ...sanitized, parallel_tool_calls: false };
 }
 
+function deepSeekResponsesPayload(
+  purpose: ModelRequest["purpose"],
+  payload: unknown,
+): Record<string, unknown> | undefined {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return undefined;
+  }
+  const source = payload as Record<string, unknown>;
+  const sanitized: Record<string, unknown> = {};
+  for (const field of ["model", "input", "stream"] as const) {
+    if (Object.hasOwn(source, field)) sanitized[field] = source[field];
+  }
+  if (Object.hasOwn(source, "tools")) {
+    sanitized.tools = Array.isArray(source.tools)
+      ? source.tools.map(omitToolStrict)
+      : source.tools;
+  }
+  if (
+    purpose === "verification_tool" &&
+    Array.isArray(sanitized.tools) &&
+    sanitized.tools.length > 0
+  ) {
+    sanitized.tool_choice = "required";
+  }
+  return sanitized;
+}
+
+function omitToolStrict(tool: unknown): unknown {
+  if (typeof tool !== "object" || tool === null || Array.isArray(tool)) return tool;
+  const sanitized = { ...tool } as Record<string, unknown>;
+  delete sanitized.strict;
+  return sanitized;
+}
+
 function omitManualResponsesCompatibilityFields(
   payload: object,
 ): Record<string, unknown> {
   const sanitized = { ...payload } as Record<string, unknown>;
   delete sanitized.store;
   if (Array.isArray(sanitized.tools)) {
-    sanitized.tools = sanitized.tools.map((tool) => {
-      if (typeof tool !== "object" || tool === null || Array.isArray(tool)) return tool;
-      const sanitizedTool = { ...tool } as Record<string, unknown>;
-      delete sanitizedTool.strict;
-      return sanitizedTool;
-    });
+    sanitized.tools = sanitized.tools.map(omitToolStrict);
   }
   return sanitized;
 }

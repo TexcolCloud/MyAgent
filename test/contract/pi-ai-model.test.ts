@@ -17,6 +17,7 @@ import {
 import { NodeProviderHttpTransport } from "../../src/adapters/provider-http-transport.js";
 import { providerConnectionRevisionIdFromUuid } from "../../src/domain/ids.js";
 import type { ModelChunk, ModelInput, ModelRequest } from "../../src/ports/model.js";
+import { FakeOpenAiProvider } from "../helpers/fake-openai-provider.js";
 
 describe("PiAiModelAdapter", () => {
   it("maps Pi text, usage, and one function call into ModelChunk values", async () => {
@@ -471,6 +472,190 @@ describe("PiAiModelAdapter", () => {
 });
 
 describe("PiAiSdkClient", () => {
+  it("whitelists the DeepSeek Responses verification payload after Pi serialization", async () => {
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{
+        type: "tool",
+        callId: "provider-verification-call",
+        name: "capability_probe",
+        arguments: { nonce: "00000000-0000-4000-8000-000000000001" },
+      }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const request = deepSeekResponsesRequest(provider.baseUrl, {
+      purpose: "verification_tool",
+      input: [{
+        type: "message",
+        role: "user",
+        content: "Call capability_probe with nonce 00000000-0000-4000-8000-000000000001",
+      }],
+      tools: [capabilityProbeTool()],
+      toolChoice: "required",
+    });
+
+    try {
+      await collect(new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway,
+      }).streamAttempt(request, signal()));
+
+      expect(provider.responsesRequests).toHaveLength(1);
+      const body = provider.responsesRequests[0]!.body as Record<string, unknown>;
+      expect(body).toMatchObject({
+        model: "deepseek-v4-flash",
+        stream: true,
+        input: expect.any(Array),
+        tools: [expect.any(Object)],
+        tool_choice: "required",
+      });
+      expect(body).not.toHaveProperty("store");
+      expect(body).not.toHaveProperty("parallel_tool_calls");
+      expect(body.tools).toEqual([
+        expect.not.objectContaining({ strict: expect.anything() }),
+      ]);
+      expect(Object.keys(body).sort()).toEqual([
+        "input",
+        "model",
+        "stream",
+        "tool_choice",
+        "tools",
+      ]);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
+  it("omits tool choice from a regular DeepSeek Responses run with tools", async () => {
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{ type: "text", text: "done" }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const request = deepSeekResponsesRequest(provider.baseUrl, {
+      tools: [capabilityProbeTool()],
+    });
+
+    try {
+      await collect(new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway,
+      }).streamAttempt(request, signal()));
+
+      expect(provider.responsesRequests).toHaveLength(1);
+      const body = provider.responsesRequests[0]!.body as Record<string, unknown>;
+      expect(body).not.toHaveProperty("tool_choice");
+      expect(Object.keys(body).sort()).toEqual(["input", "model", "stream", "tools"]);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
+  it("preserves the provider call ID in a whitelisted DeepSeek Responses continuation", async () => {
+    const providerCallId = "provider-continuation-call";
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{ type: "text", text: "continued" }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const request = deepSeekResponsesRequest(provider.baseUrl, {
+      input: [
+        { type: "message", role: "user", content: "Probe it" },
+        {
+          type: "assistant_tool_call",
+          callId: providerCallId,
+          name: "capability_probe",
+          arguments: { nonce: "continuation-nonce" },
+        },
+        {
+          type: "tool_result",
+          callId: providerCallId,
+          name: "capability_probe",
+          output: { accepted: true },
+        },
+      ],
+      tools: [capabilityProbeTool()],
+    });
+
+    try {
+      await collect(new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway,
+      }).streamAttempt(request, signal()));
+
+      expect(provider.responsesRequests).toHaveLength(1);
+      const body = provider.responsesRequests[0]!.body as Record<string, unknown>;
+      expect(body).not.toHaveProperty("tool_choice");
+      expect(body).not.toHaveProperty("store");
+      expect(body).not.toHaveProperty("parallel_tool_calls");
+      expect(body.tools).toEqual([
+        expect.not.objectContaining({ strict: expect.anything() }),
+      ]);
+      expect(body.input).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "function_call", call_id: providerCallId }),
+        expect.objectContaining({ type: "function_call_output", call_id: providerCallId }),
+      ]));
+      expect(Object.keys(body).sort()).toEqual(["input", "model", "stream", "tools"]);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
+  it("keeps the existing manual Responses transform for the same DeepSeek model ID", async () => {
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{ type: "text", text: "manual" }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const request = deepSeekResponsesRequest(provider.baseUrl, {
+      purpose: "verification_tool",
+      tools: [capabilityProbeTool()],
+      toolChoice: "required",
+      model: {
+        ...deepSeekResponsesRequest(provider.baseUrl).model,
+        piRuntime: {
+          ...deepSeekResponsesRequest(provider.baseUrl).model.piRuntime!,
+          driverId: "pi/openai-compatible",
+          providerCompatibilityContract: "none",
+        },
+      },
+    });
+
+    try {
+      await collect(new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway,
+      }).streamAttempt(request, signal()));
+
+      expect(provider.responsesRequests).toHaveLength(1);
+      const body = provider.responsesRequests[0]!.body as Record<string, unknown>;
+      expect(body).not.toHaveProperty("tool_choice");
+      expect(body).not.toHaveProperty("store");
+      expect(body).toHaveProperty("parallel_tool_calls", false);
+      expect(body.tools).toEqual([
+        expect.not.objectContaining({ strict: expect.anything() }),
+      ]);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
   it("constructs the Pi model and context only from the frozen contract and gateway route", async () => {
     const captured: Array<{ model: unknown; context: unknown; options: unknown }> = [];
     let transformedPayload: unknown;
@@ -565,6 +750,7 @@ describe("PiAiSdkClient", () => {
     const clientInput = {
       contract: request.model.piRuntime!,
       route,
+      purpose: request.purpose,
       input: request.input,
       tools: request.tools,
       toolChoice: request.toolChoice,
@@ -694,6 +880,41 @@ function piRequest(overrides: Partial<ModelRequest> = {}): ModelRequest {
     input: [{ type: "message", role: "user", content: "Hello" }],
     tools: [],
     ...overrides,
+  };
+}
+
+function deepSeekResponsesRequest(
+  baseUrl: string,
+  overrides: Partial<ModelRequest> = {},
+): ModelRequest {
+  const base = piRequest();
+  return {
+    ...base,
+    model: {
+      ...base.model,
+      baseUrl,
+      allowInsecureHttp: true,
+      invocationProtocol: "pi_ai",
+      piRuntime: {
+        ...base.model.piRuntime!,
+        api: "openai-responses",
+        providerCompatibilityContract: "deepseek-responses-v1",
+      },
+    },
+    ...overrides,
+  };
+}
+
+function capabilityProbeTool(): ModelRequest["tools"][number] {
+  return {
+    name: "capability_probe",
+    description: "Return the supplied nonce",
+    inputSchema: {
+      type: "object",
+      properties: { nonce: { type: "string" } },
+      required: ["nonce"],
+      additionalProperties: false,
+    },
   };
 }
 

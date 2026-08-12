@@ -34,6 +34,7 @@ export class PiAiModelAdapter implements ModelPort {
       for await (const event of this.options.client.stream({
         contract,
         route,
+        purpose: request.purpose,
         input: request.input,
         tools: request.tools,
         toolChoice: request.toolChoice,
