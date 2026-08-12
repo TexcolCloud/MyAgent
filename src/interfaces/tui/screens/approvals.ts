@@ -73,7 +73,7 @@ export class ApprovalScreen implements Component, Focusable {
 
   async select(approvalId: string): Promise<boolean> {
     const index = this.approvals.findIndex((approval) => approval.approvalId === approvalId);
-    if (index < 0 || this.pending) return false;
+    if (index < 0 || this.pending || this.locked) return false;
     this.selectedIndex = index;
     this.outcome = undefined;
     this.problem = undefined;

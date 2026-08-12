@@ -246,11 +246,14 @@ describe("TUI workbench", () => {
     await approvals.select("apr_1");
 
     await expect(approvals.decide("approved")).resolves.toBe(true);
+    await expect(approvals.select("apr_2")).resolves.toBe(false);
     await expect(approvals.decide("denied")).resolves.toBe(false);
 
     expect(decideApproval).toHaveBeenCalledExactlyOnceWith("apr_1", "approve");
     expect(approvals.controlsEnabled).toBe(false);
-    expect(approvals.render(120).join("\n")).toContain("Server state: approved");
+    const rendered = approvals.render(120).join("\n");
+    expect(rendered).toContain("Server state: approved");
+    expect(rendered).toContain("Approval apr_1");
   });
 
   it("retires an externally resolved Approval after the first local decision fails", async () => {
@@ -263,7 +266,10 @@ describe("TUI workbench", () => {
     });
     const approvals = new ApprovalScreen({
       client: {
-        listPendingApprovals: async () => ({ approvals: [pendingApproval()] }),
+        listPendingApprovals: async () => ({ approvals: [
+          pendingApproval(),
+          { ...pendingApproval(), approvalId: "apr_2", toolCallId: "tool_2" },
+        ] }),
         decideApproval,
       },
     });
@@ -271,6 +277,7 @@ describe("TUI workbench", () => {
     await approvals.select("apr_1");
 
     await expect(approvals.decide("denied")).resolves.toBe(false);
+    await expect(approvals.select("apr_2")).resolves.toBe(false);
     await expect(approvals.decide("approved")).resolves.toBe(false);
 
     const rendered = approvals.render(120).join("\n");
