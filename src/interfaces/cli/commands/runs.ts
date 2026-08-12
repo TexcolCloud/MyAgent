@@ -18,8 +18,8 @@ export async function watchRun(client: CliClient, runId: string, write: CliWrite
       client,
       cursor,
       signal,
-      onEvent: (event) => {
-        write(JSON.stringify(event));
+      onEvent: (event, serializedData) => {
+        write(serializedData);
         if (TERMINAL_RUN_EVENTS.has(event.type)) terminal = true;
       },
     });

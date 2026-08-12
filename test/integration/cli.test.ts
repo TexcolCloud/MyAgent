@@ -174,6 +174,76 @@ describe("CLI HTTP boundary", () => {
     expect(write).toHaveBeenCalledWith(completed);
   });
 
+  it("preserves validated noncanonical SSE data when watching a Run", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const completed = [
+      "{",
+      ' "type" : "run.completed", "payload" : {},',
+      ' "occurredAt" : "2026-08-12T00:00:00.000Z", "sequence" : 9, "runId" : "run-cli-1"',
+      "}",
+    ].join("\n");
+    const data = completed.split("\n").map((line) => `data: ${line}`).join("\n");
+    const write = vi.fn();
+
+    await expect(executeCli(["run", "watch", "run-cli-1"], {
+      environment: {
+        MYAGENT_API_URL: "http://127.0.0.1:8787",
+        MYAGENT_BEARER_TOKEN: "operator-token",
+      },
+      fetcher: async () => new Response(
+        `id: 9\nevent: run.completed\n${data}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+      write,
+    })).resolves.toBe(0);
+
+    expect(write).toHaveBeenCalledWith(completed);
+  });
+
+  it("fails a Run watch with the existing credential exit when its token is absent", async () => {
+    const { CliClient } = await import("../../src/interfaces/cli/client.js");
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const originalStream = CliClient.prototype.stream;
+    let attempts = 0;
+    const stream = vi.spyOn(CliClient.prototype, "stream").mockImplementation(function (this: InstanceType<typeof CliClient>, ...args) {
+      attempts += 1;
+      if (attempts === 1) return originalStream.apply(this, args);
+      return Promise.resolve(new Response(
+        "id: 1\nevent: run.completed\ndata: {\"runId\":\"run-cli-1\",\"sequence\":1,\"type\":\"run.completed\",\"occurredAt\":\"2026-08-12T00:00:00.000Z\",\"payload\":{}}\n\n",
+        { status: 200 },
+      ));
+    });
+    try {
+      await expect(executeCli(["run", "watch", "run-cli-1"], {
+        environment: { MYAGENT_API_URL: "http://127.0.0.1:8787" },
+        writeError: () => undefined,
+      })).resolves.toBe(3);
+      expect(stream).toHaveBeenCalledOnce();
+    } finally {
+      stream.mockRestore();
+    }
+  });
+
+  it("fails a Run watch with the existing service exit after one fetch rejection", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const fetcher = vi.fn()
+      .mockRejectedValueOnce(new TypeError("network unavailable"))
+      .mockResolvedValue(new Response(
+        "id: 1\nevent: run.completed\ndata: {\"runId\":\"run-cli-1\",\"sequence\":1,\"type\":\"run.completed\",\"occurredAt\":\"2026-08-12T00:00:00.000Z\",\"payload\":{}}\n\n",
+        { status: 200 },
+      ));
+
+    await expect(executeCli(["run", "watch", "run-cli-1"], {
+      environment: {
+        MYAGENT_API_URL: "http://127.0.0.1:8787",
+        MYAGENT_BEARER_TOKEN: "operator-token",
+      },
+      fetcher,
+      writeError: () => undefined,
+    })).resolves.toBe(6);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("reconnects a non-terminal watch with the latest Event ID", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
     const delta = JSON.stringify({

@@ -108,8 +108,42 @@ describe("consumeRunEvents", () => {
       cursor: { runId: "run_1", lastEventId: "5" },
       onEvent: (event) => { events.push(event); },
       signal: new AbortController().signal,
+      interruption: "return_cursor",
     })).resolves.toEqual({ runId: "run_1", lastEventId: "6" });
     expect(events).toHaveLength(1);
+  });
+
+  it("propagates a missing Run credential instead of treating it as a reconnectable interruption", async () => {
+    const client = new CliClient({ baseUrl: "http://127.0.0.1:8787" });
+
+    for (const interruption of [undefined, "return_cursor"] as const) {
+      await expect(consumeRunEvents({
+        client,
+        cursor: { runId: "run_1" },
+        onEvent: () => undefined,
+        signal: new AbortController().signal,
+        ...(interruption === undefined ? {} : { interruption }),
+      })).rejects.toMatchObject({ code: "run_token_required" });
+    }
+  });
+
+  it("propagates fetch rejection unless cursor recovery is explicitly requested", async () => {
+    const failure = new TypeError("network unavailable");
+    const client = cliClient(async () => { throw failure; });
+
+    await expect(consumeRunEvents({
+      client,
+      cursor: { runId: "run_1", lastEventId: "4" },
+      onEvent: () => undefined,
+      signal: new AbortController().signal,
+    })).rejects.toBe(failure);
+    await expect(consumeRunEvents({
+      client,
+      cursor: { runId: "run_1", lastEventId: "4" },
+      onEvent: () => undefined,
+      signal: new AbortController().signal,
+      interruption: "return_cursor",
+    })).resolves.toEqual({ runId: "run_1", lastEventId: "4" });
   });
 
   it("forwards abort to fetch and stops a pending read at the last committed cursor", async () => {

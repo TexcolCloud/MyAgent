@@ -41,8 +41,9 @@ export class RunEventStreamError extends Error {
 export async function consumeRunEvents(input: {
   readonly client: RunEventClient | Pick<CliClient, "stream">;
   readonly cursor: RunEventCursor;
-  readonly onEvent: (event: SafeRunEvent) => void;
+  readonly onEvent: (event: SafeRunEvent, serializedData: string) => void;
   readonly signal: AbortSignal;
+  readonly interruption?: "return_cursor";
 }): Promise<RunEventCursor> {
   let committed = input.cursor;
   if (input.signal.aborted) return committed;
@@ -54,8 +55,9 @@ export async function consumeRunEvents(input: {
       input.cursor.lastEventId,
       input.signal,
     );
-  } catch {
-    return committed;
+  } catch (error) {
+    if (isRecoverableInterruption(error, input)) return committed;
+    throw error;
   }
   if (!response.ok || response.body === null) {
     throw new RunEventStreamError(
@@ -74,8 +76,9 @@ export async function consumeRunEvents(input: {
       let chunk: Awaited<ReturnType<typeof reader.read>>;
       try {
         chunk = await reader.read();
-      } catch {
-        return committed;
+      } catch (error) {
+        if (isRecoverableInterruption(error, input)) return committed;
+        throw error;
       }
       if (chunk.done) return committed;
       buffer += decoder.decode(chunk.value, { stream: true });
@@ -90,12 +93,12 @@ export async function consumeRunEvents(input: {
           frame.push(line);
           continue;
         }
-        const event = decodeFrame(frame, input.cursor.runId, committed);
+        const decoded = decodeFrame(frame, input.cursor.runId, committed);
         frame = [];
-        if (event === undefined) continue;
-        input.onEvent(event);
-        committed = greatestCursor(committed, event.sequence);
-        if (TERMINAL_RUN_EVENTS.has(event.type)) {
+        if (decoded === undefined) continue;
+        input.onEvent(decoded.event, decoded.serializedData);
+        committed = greatestCursor(committed, decoded.event.sequence);
+        if (TERMINAL_RUN_EVENTS.has(decoded.event.type)) {
           await reader.cancel().catch(() => undefined);
           return committed;
         }
@@ -110,7 +113,7 @@ function decodeFrame(
   lines: readonly string[],
   expectedRunId: string,
   cursor: RunEventCursor,
-): SafeRunEvent | undefined {
+): { readonly event: SafeRunEvent; readonly serializedData: string } | undefined {
   let id: string | undefined;
   let eventName: string | undefined;
   const dataLines: string[] = [];
@@ -130,9 +133,10 @@ function decodeFrame(
   }
 
   const sequence = parseEventId(id, cursor);
+  const serializedData = dataLines.join("\n");
   let decoded: unknown;
   try {
-    decoded = JSON.parse(dataLines.join("\n")) as unknown;
+    decoded = JSON.parse(serializedData) as unknown;
   } catch {
     throw invalidEvent(cursor);
   }
@@ -142,7 +146,7 @@ function decodeFrame(
       decoded.type !== eventName) {
     throw invalidEvent(cursor);
   }
-  return decoded;
+  return { event: decoded, serializedData };
 }
 
 function parseEventId(id: string, cursor: RunEventCursor): number {
@@ -189,4 +193,12 @@ function invalidEvent(cursor: RunEventCursor): RunEventStreamError {
     "The committed Run event is invalid.",
     cursor,
   );
+}
+
+function isRecoverableInterruption(
+  error: unknown,
+  input: { readonly signal: AbortSignal; readonly interruption?: "return_cursor" },
+): boolean {
+  return input.signal.aborted ||
+    (input.interruption === "return_cursor" && error instanceof TypeError);
 }
