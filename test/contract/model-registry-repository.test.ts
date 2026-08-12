@@ -30,6 +30,22 @@ const ANTHROPIC_CONTRACT: PiRuntimeContract = {
   },
 };
 
+const DEEPSEEK_RESPONSES_CONTRACT: PiRuntimeContract = {
+  kind: "pi_ai",
+  piVersion: "0.73.1",
+  driverId: "pi/deepseek",
+  catalogProviderId: "deepseek",
+  api: "openai-responses",
+  providerCompatibilityContract: "deepseek-responses-v1",
+  modelId: "deepseek-v4-flash",
+  contextWindow: 1_000_000,
+  maxOutputTokens: 384_000,
+  compatibility: {
+    requiresReasoningContentOnAssistantMessages: true,
+    thinkingFormat: "deepseek",
+  },
+};
+
 describe("SqliteModelRegistryRepository", () => {
   it("persists a Provider Driver and canonical immutable Pi runtime contract", () => {
     usingFixture("pi-runtime-contract", ({ db, repository }) => {
@@ -233,6 +249,31 @@ describe("SqliteModelRegistryRepository", () => {
         .toThrowError(expect.objectContaining({ code: "invalid_model_profile" }));
     });
   });
+
+  it.each([
+    ["driver", { driverId: "pi/openai" }],
+    ["provider", { catalogProviderId: "openai" }],
+    ["API", { api: "openai-completions" }],
+    ["model", { modelId: "deepseek-chat" }],
+    ["Pi version", { piVersion: "0.74.0" }],
+    ["context window", { contextWindow: 128_000 }],
+    ["output limit", { maxOutputTokens: 8_192 }],
+    ["compatibility", { compatibility: { supportsUsageInStreaming: true } }],
+  ] as const)(
+    "rejects a persisted DeepSeek Responses contract paired with another %s",
+    (_case, override) => {
+      usingFixture(`corrupt-deepseek-responses-${_case}`, ({ db, repository }) => {
+        repository.createConnection(createConnectionInput("connection-pi", "pcr-pi"));
+        insertRawRuntimeContract(db, "profile-corrupt", "mpr-corrupt", "pcr-pi", {
+          ...DEEPSEEK_RESPONSES_CONTRACT,
+          ...override,
+        });
+
+        expect(() => repository.getProfile(profileId("profile-corrupt")))
+          .toThrowError(expect.objectContaining({ code: "invalid_model_profile" }));
+      });
+    },
+  );
 
   it("replaces discovery generations atomically and preserves stale models on refresh failure", () => {
     usingFixture("discovery-generations", ({ db, repository }) => {
@@ -1745,6 +1786,9 @@ function insertRawRuntimeContract(
   connectionRevision: string,
   runtime: object,
 ): void {
+  const runtimeModelId = "modelId" in runtime && typeof runtime.modelId === "string"
+    ? runtime.modelId
+    : ANTHROPIC_CONTRACT.modelId;
   db.prepare(
     `INSERT INTO model_profiles (
        profile_id, display_name, active_revision_id, retired_at,
@@ -1759,7 +1803,7 @@ function insertRawRuntimeContract(
        verified_capabilities_json, runtime_contract_json, created_at
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    revision, profile, connectionRevision, "draft", ANTHROPIC_CONTRACT.modelId,
+    revision, profile, connectionRevision, "draft", runtimeModelId,
     "pi_ai", ANTHROPIC_CONTRACT.contextWindow, "preset",
     "text_and_single_tool_call_v1", "[]", JSON.stringify(runtime), NOW.toISOString(),
   );

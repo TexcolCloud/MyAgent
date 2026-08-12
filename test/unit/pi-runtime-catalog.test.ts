@@ -61,6 +61,27 @@ describe("Pi runtime catalog", () => {
     })).toBeUndefined();
   });
 
+  it("resolves an omitted historical compatibility contract as none without mutation", () => {
+    const candidate = resolveProviderCatalogCandidate(
+      "pi/deepseek:deepseek-v4-flash",
+    );
+    expect(candidate).toBeDefined();
+    const {
+      providerCompatibilityContract: omittedCompatibility,
+      ...historicalRuntime
+    } = candidate!.invocation;
+    const originalJson = JSON.stringify(historicalRuntime);
+
+    expect(omittedCompatibility).toBe("none");
+    expect(resolveProviderCatalogCandidateForRuntime(
+      historicalRuntime as Parameters<
+        typeof resolveProviderCatalogCandidateForRuntime
+      >[0],
+    )).toBe(candidate);
+    expect(JSON.stringify(historicalRuntime)).toBe(originalJson);
+    expect(historicalRuntime).not.toHaveProperty("providerCompatibilityContract");
+  });
+
   it("projects a frozen, project-owned catalog pinned to the Pi runtime version", () => {
     const candidates = listProviderCatalogCandidates();
 

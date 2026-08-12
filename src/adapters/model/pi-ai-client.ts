@@ -27,6 +27,7 @@ export type PiStreamEvent =
       reason: "aborted" | "error";
       status?: number;
       retryAfterMs?: number;
+      protocolError?: boolean;
     };
 
 export interface PiAiClient {
@@ -85,38 +86,46 @@ export class PiAiSdkClient implements PiAiClient {
       },
     });
 
-    for await (const event of events) {
-      if (event.type === "text_delta") {
-        if (event.delta.length > 0) yield { type: "text_delta", text: event.delta };
-      } else if (event.type === "toolcall_end") {
-        yield {
-          type: "tool_call",
-          id: event.toolCall.id,
-          name: event.toolCall.name,
-          arguments: JSON.stringify(event.toolCall.arguments),
-        };
-      } else if (event.type === "done") {
-        yield {
-          type: "done",
-          reason: event.reason,
-          usage: {
-            inputTokens: totalInputTokens(event.message.usage),
-            outputTokens: event.message.usage.output,
-          },
-        };
-      } else if (event.type === "error") {
-        const metadata = gatewayErrorMetadata(event.error.errorMessage);
-        yield {
-          type: "error",
-          reason: event.reason,
-          ...(status === undefined
-            ? metadata?.status === undefined ? {} : { status: metadata.status }
-            : { status }),
-          ...(retryAfterMs === undefined
-            ? metadata?.retryAfterMs === undefined ? {} : { retryAfterMs: metadata.retryAfterMs }
-            : { retryAfterMs }),
-        };
+    try {
+      for await (const event of events) {
+        if (event.type === "text_delta") {
+          if (event.delta.length > 0) yield { type: "text_delta", text: event.delta };
+        } else if (event.type === "toolcall_end") {
+          yield {
+            type: "tool_call",
+            id: event.toolCall.id,
+            name: event.toolCall.name,
+            arguments: JSON.stringify(event.toolCall.arguments),
+          };
+        } else if (event.type === "done") {
+          yield {
+            type: "done",
+            reason: event.reason,
+            usage: {
+              inputTokens: totalInputTokens(event.message.usage),
+              outputTokens: event.message.usage.output,
+            },
+          };
+        } else if (event.type === "error") {
+          const metadata = gatewayErrorMetadata(event.error.errorMessage);
+          yield {
+            type: "error",
+            reason: event.reason,
+            ...(event.error.errorMessage === PI_PAYLOAD_PROTOCOL_ERROR
+              ? { protocolError: true }
+              : {}),
+            ...(status === undefined
+              ? metadata?.status === undefined ? {} : { status: metadata.status }
+              : { status }),
+            ...(retryAfterMs === undefined
+              ? metadata?.retryAfterMs === undefined ? {} : { retryAfterMs: metadata.retryAfterMs }
+              : { retryAfterMs }),
+          };
+        }
       }
+    } catch (error) {
+      if (error instanceof PiPayloadProtocolError) throw protocolError();
+      throw error;
     }
   }
 }
@@ -261,17 +270,25 @@ function deepSeekResponsesPayload(
   payload: unknown,
 ): Record<string, unknown> | undefined {
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-    return undefined;
+    throw new PiPayloadProtocolError();
   }
   const source = payload as Record<string, unknown>;
-  const sanitized: Record<string, unknown> = {};
-  for (const field of ["model", "input", "stream"] as const) {
-    if (Object.hasOwn(source, field)) sanitized[field] = source[field];
+  if (
+    typeof source.model !== "string" || source.model.length === 0 ||
+    !Array.isArray(source.input) || source.stream !== true
+  ) {
+    throw new PiPayloadProtocolError();
   }
+  const sanitized: Record<string, unknown> = {
+    model: source.model,
+    input: source.input,
+    stream: source.stream,
+  };
   if (Object.hasOwn(source, "tools")) {
-    sanitized.tools = Array.isArray(source.tools)
-      ? source.tools.map(omitToolStrict)
-      : source.tools;
+    if (!Array.isArray(source.tools) || !source.tools.every(isUnknownRecord)) {
+      throw new PiPayloadProtocolError();
+    }
+    sanitized.tools = source.tools.map(omitToolStrict);
   }
   if (
     purpose === "verification_tool" &&
@@ -281,6 +298,19 @@ function deepSeekResponsesPayload(
     sanitized.tool_choice = "required";
   }
   return sanitized;
+}
+
+const PI_PAYLOAD_PROTOCOL_ERROR = "pi_payload_protocol_error";
+
+class PiPayloadProtocolError extends Error {
+  constructor() {
+    super(PI_PAYLOAD_PROTOCOL_ERROR);
+    this.name = "PiPayloadProtocolError";
+  }
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function omitToolStrict(tool: unknown): unknown {

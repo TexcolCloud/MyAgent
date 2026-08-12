@@ -1,5 +1,5 @@
 import type { JsonValue } from "../../domain/json.js";
-import type { ProviderCompatibilityContract } from "../../domain/pi-runtime.js";
+import { isValidProviderCompatibilityRuntime } from "../../domain/pi-runtime.js";
 import {
   ModelProviderError,
   type ModelChunk,
@@ -25,7 +25,7 @@ export class PiAiModelAdapter implements ModelPort {
     if (signal.aborted) throw abortError();
     const contract = request.model.piRuntime;
     if (contract === undefined) throw protocolError();
-    if (!isProviderCompatibilityContract(contract.providerCompatibilityContract)) {
+    if (!isValidProviderCompatibilityRuntime(contract)) {
       throw protocolError();
     }
     if (!isValidPiContextInput(request.input)) throw protocolError();
@@ -129,7 +129,9 @@ function finishReasonFromPi(reason: "stop" | "length" | "toolUse"): ModelFinishR
 function providerError(event: {
   status?: number;
   retryAfterMs?: number;
+  protocolError?: boolean;
 }): ModelProviderError {
+  if (event.protocolError === true) return protocolError();
   const { status } = event;
   if (status === undefined) {
     return new ModelProviderError({ transient: true, code: "provider_unavailable" });
@@ -184,12 +186,6 @@ function isAbortError(error: unknown): boolean {
 
 function isTokenCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
-function isProviderCompatibilityContract(
-  value: unknown,
-): value is ProviderCompatibilityContract {
-  return value === "none" || value === "deepseek-responses-v1";
 }
 
 function isJsonValue(value: unknown): value is JsonValue {

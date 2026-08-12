@@ -57,9 +57,12 @@ const DEEPSEEK_RESPONSES_CONTRACT: PiRuntimeContract = {
   api: "openai-responses",
   providerCompatibilityContract: "deepseek-responses-v1",
   modelId: "deepseek-v4-flash",
-  contextWindow: 128_000,
-  maxOutputTokens: 8_192,
-  compatibility: { supportsUsageInStreaming: true },
+  contextWindow: 1_000_000,
+  maxOutputTokens: 384_000,
+  compatibility: {
+    requiresReasoningContentOnAssistantMessages: true,
+    thinkingFormat: "deepseek",
+  },
 };
 
 describe("persisted Pi runtime registry", () => {

@@ -28,9 +28,10 @@ import {
   type ProviderKind,
 } from "../../domain/model-registry.js";
 import type { ModelVerification } from "../../domain/model-verification.js";
-import type {
-  PiRuntimeContract,
-  ProviderDriverId,
+import {
+  isValidProviderCompatibilityRuntime,
+  type PiRuntimeContract,
+  type ProviderDriverId,
 } from "../../domain/pi-runtime.js";
 import type {
   ProviderAuth,
@@ -2009,10 +2010,14 @@ function parsePiRuntime(serialized: string): PiRuntimeContract {
 
 function normalizePiRuntime(value: unknown): PiRuntimeContract {
   assertPiRuntime(value);
-  return {
+  const normalized: PiRuntimeContract = {
     ...value,
     providerCompatibilityContract: value.providerCompatibilityContract ?? "none",
   };
+  if (!isValidProviderCompatibilityRuntime(normalized)) {
+    throw new DomainError("invalid_model_profile");
+  }
+  return normalized;
 }
 
 function assertPiRuntime(value: unknown): asserts value is Omit<PiRuntimeContract, "providerCompatibilityContract"> & {

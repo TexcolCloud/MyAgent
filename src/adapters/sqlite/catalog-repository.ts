@@ -52,11 +52,15 @@ export class SqliteCatalogRepository implements CatalogRevisionStore {
 
     return row === undefined
       ? null
-      : normalizeSnapshot(JSON.parse(row.content_json) as AgentRevisionSnapshot);
+      : normalizeAgentRevisionSnapshot(
+          JSON.parse(row.content_json) as AgentRevisionSnapshot,
+        );
   }
 }
 
-function normalizeSnapshot(snapshot: AgentRevisionSnapshot): AgentRevisionSnapshot {
+export function normalizeAgentRevisionSnapshot(
+  snapshot: AgentRevisionSnapshot,
+): AgentRevisionSnapshot {
   const runtime = snapshot.model.piRuntime;
   if (runtime === undefined || runtime.providerCompatibilityContract !== undefined) {
     return snapshot;

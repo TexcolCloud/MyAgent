@@ -276,6 +276,58 @@ describe("PiAiModelAdapter", () => {
     expect(routeCalls).toBe(0);
   });
 
+  it.each([
+    ["driver", { driverId: "pi/openai" }],
+    ["provider", { catalogProviderId: "openai" }],
+    ["API", { api: "openai-completions" }],
+    ["model", { modelId: "deepseek-chat" }],
+    ["Pi version", { piVersion: "0.74.0" }],
+    ["context window", { contextWindow: 128_000 }],
+    ["output limit", { maxOutputTokens: 8_192 }],
+    ["compatibility", { compatibility: { supportsUsageInStreaming: true } }],
+  ] as const)(
+    "rejects a captured DeepSeek Responses contract paired with another %s before egress",
+    async (_case, override) => {
+      let clientCalls = 0;
+      let routeCalls = 0;
+      const request = deepSeekResponsesRequest("https://provider.invalid/v1");
+      const model = new PiAiModelAdapter({
+        client: {
+          async *stream() {
+            clientCalls += 1;
+            yield { type: "text_delta", text: "must-not-run" };
+            yield {
+              type: "done",
+              reason: "stop",
+              usage: { inputTokens: 1, outputTokens: 1 },
+            };
+          },
+        },
+        gateway: {
+          routeFor() {
+            routeCalls += 1;
+            return { baseUrl: "unreachable", apiKey: "unreachable" };
+          },
+        },
+      });
+      const captured = {
+        ...request,
+        model: {
+          ...request.model,
+          piRuntime: { ...request.model.piRuntime!, ...override },
+        },
+      } as unknown as ModelRequest;
+
+      const rejection = await collect(model.streamAttempt(captured, signal())).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(rejection).toMatchObject({ code: "model_protocol_error", transient: false });
+      expect(clientCalls).toBe(0);
+      expect(routeCalls).toBe(0);
+    },
+  );
+
   it("rejects a second Pi function call before emitting a terminal chunk", async () => {
     const chunks: ModelChunk[] = [];
     const model = new PiAiModelAdapter({
@@ -516,6 +568,115 @@ describe("PiAiModelAdapter", () => {
 });
 
 describe("PiAiSdkClient", () => {
+  it.each([
+    ["a non-object body", "malformed"],
+    ["an array body", [{ store: true }]],
+    ["a missing model", { input: [], stream: true }],
+    ["a missing input", { model: "deepseek-v4-flash", stream: true }],
+    ["a missing stream flag", { model: "deepseek-v4-flash", input: [] }],
+    ["non-array input", { model: "deepseek-v4-flash", input: {}, stream: true }],
+    ["a non-array tools field", {
+      model: "deepseek-v4-flash", input: [], stream: true, tools: {},
+    }],
+    ["a non-object tool", {
+      model: "deepseek-v4-flash", input: [], stream: true, tools: ["bad-tool"],
+    }],
+  ] as const)("rejects %s in the DeepSeek payload hook", async (_case, payload) => {
+    const client = new PiAiSdkClient({
+      stream: async function* (model, _context, options) {
+        await options?.onPayload?.(payload, model);
+        yield { type: "text_delta", delta: "accepted" } as never;
+        yield piDoneEvent(model, { input: 1, cacheRead: 0, cacheWrite: 0 });
+      },
+    });
+    const request = deepSeekResponsesRequest("https://provider.invalid/v1");
+
+    await expect(collect(new PiAiModelAdapter({
+      client,
+      gateway: gatewayRoute(),
+    }).streamAttempt(request, signal()))).rejects.toMatchObject({
+      code: "model_protocol_error",
+      transient: false,
+    });
+  });
+
+  it("does not forward an unwhitelisted malformed body through the gateway", async () => {
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{ type: "text", text: "must-not-run" }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const malformedPayload = [{ store: true, future_field: "must-not-cross" }];
+    const client = new PiAiSdkClient({
+      stream: async function* (model, _context, options) {
+        const transformed = await options?.onPayload?.(malformedPayload, model);
+        const response = await fetch(`${model.baseUrl}/responses`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${options?.apiKey ?? ""}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(transformed ?? malformedPayload),
+        });
+        await response.text();
+        yield { type: "text_delta", delta: "accepted" } as never;
+        yield piDoneEvent(model, { input: 1, cacheRead: 0, cacheWrite: 0 });
+      },
+    });
+    const request = deepSeekResponsesRequest(provider.baseUrl);
+
+    try {
+      await expect(collect(new PiAiModelAdapter({ client, gateway }).streamAttempt(
+        request,
+        signal(),
+      ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+      expect(provider.responsesRequests).toHaveLength(0);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
+  it("maps Pi's swallowed payload validation error to a non-transient protocol error", async () => {
+    const client = new PiAiSdkClient({
+      stream: async function* (model) {
+        yield {
+          type: "error",
+          reason: "error",
+          error: {
+            role: "assistant",
+            content: [],
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "error",
+            errorMessage: "pi_payload_protocol_error",
+            timestamp: 0,
+          },
+        } as never;
+      },
+    });
+
+    await expect(collect(new PiAiModelAdapter({
+      client,
+      gateway: gatewayRoute(),
+    }).streamAttempt(
+      deepSeekResponsesRequest("https://provider.invalid/v1"),
+      signal(),
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
   it("whitelists the DeepSeek Responses verification payload after Pi serialization", async () => {
     const provider = await FakeOpenAiProvider.start({
       responses: [{
@@ -943,6 +1104,12 @@ function deepSeekResponsesRequest(
         ...base.model.piRuntime!,
         api: "openai-responses",
         providerCompatibilityContract: "deepseek-responses-v1",
+        contextWindow: 1_000_000,
+        maxOutputTokens: 384_000,
+        compatibility: {
+          requiresReasoningContentOnAssistantMessages: true,
+          thinkingFormat: "deepseek",
+        },
       },
     },
     ...overrides,

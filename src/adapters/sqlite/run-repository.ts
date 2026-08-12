@@ -20,7 +20,10 @@ import type {
   RunStore,
   StartDelegationInput,
 } from "../../ports/run-store.js";
-import type { SqliteCatalogRepository } from "./catalog-repository.js";
+import {
+  normalizeAgentRevisionSnapshot,
+  type SqliteCatalogRepository,
+} from "./catalog-repository.js";
 
 interface IdempotencyRow {
   request_digest: string;
@@ -408,7 +411,9 @@ export class SqliteRunRepository implements RunStore {
     }
     return {
       run: mapRun(row),
-      revision: JSON.parse(row.revision_json) as RunExecutionContext["revision"],
+      revision: normalizeAgentRevisionSnapshot(
+        JSON.parse(row.revision_json) as RunExecutionContext["revision"],
+      ),
       input: JSON.parse(row.input_json) as RunExecutionContext["input"],
       leaseOwner: row.lease_owner,
       leaseExpiresAt:

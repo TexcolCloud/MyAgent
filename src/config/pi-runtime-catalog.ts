@@ -104,11 +104,13 @@ function invocationMatches(
   candidate: Omit<PiRuntimeContract, "kind">,
   runtime: Omit<PiRuntimeContract, "kind">,
 ): boolean {
+  const providerCompatibilityContract =
+    runtime.providerCompatibilityContract ?? "none";
   return candidate.piVersion === runtime.piVersion &&
     candidate.driverId === runtime.driverId &&
     candidate.catalogProviderId === runtime.catalogProviderId &&
     candidate.api === runtime.api &&
-    candidate.providerCompatibilityContract === runtime.providerCompatibilityContract &&
+    candidate.providerCompatibilityContract === providerCompatibilityContract &&
     candidate.modelId === runtime.modelId &&
     candidate.contextWindow === runtime.contextWindow &&
     candidate.maxOutputTokens === runtime.maxOutputTokens &&
