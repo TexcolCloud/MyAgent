@@ -1,6 +1,7 @@
 import { truncateToWidth, type Component, type Focusable } from "@mariozechner/pi-tui";
 
 import type { WorkbenchDestination } from "./navigation.js";
+import { safeDisplayLines } from "../safe-display-text.js";
 
 export class ChatScreen implements Component, Focusable {
   focused = false;
@@ -9,7 +10,8 @@ export class ChatScreen implements Component, Focusable {
 
   show(destination: WorkbenchDestination, lines?: readonly string[]): void {
     this.destination = destination;
-    this.lines = lines ?? noSelection(destination);
+    const safe = (lines ?? noSelection(destination)).flatMap(safeDisplayLines);
+    this.lines = safe.length === 0 ? noSelection(destination) : safe;
   }
 
   render(width: number): string[] {

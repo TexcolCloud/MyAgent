@@ -51,6 +51,41 @@ describe("TUI workbench", () => {
     expect(terminal.frames.at(-1)).toContain("Model One");
   });
 
+  it("does not render control sequences or credential lines from typed list summaries", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const client = safeClient({
+      agents: [{ id: "research", displayName: "Research\u001b[31m Agent\nAuthorization: Bearer hidden-agent", revisionId: "rev_1" }],
+      connections: [{ connectionId: "provider-one", displayName: "Provider One\nAPI key: hidden-provider", activeRevisionId: "pcr_1", retiredAt: null }],
+      profiles: [{ profileId: "model-one", displayName: "Model One\nBearer\ntoken=hidden-model", activeRevisionId: "mpr_1", retiredAt: null }],
+    });
+    const workbench = runWorkbench({ client, terminal });
+
+    await terminal.ready();
+    terminal.input("\u001b[A");
+    terminal.input("\r");
+    await terminal.waitForFrame("Research Agent");
+    terminal.input("\u001b[B");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await terminal.waitForFrame("Provider One");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await terminal.waitForFrame("Model One");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    const output = plainLines(terminal.frames.join("\n")).join("\n");
+    expect(output).toContain("Research Agent");
+    expect(output).toContain("Provider One");
+    expect(output).toContain("Model One");
+    expect(output).not.toContain("Authorization");
+    expect(output).not.toContain("hidden-agent");
+    expect(output).not.toContain("API key");
+    expect(output).not.toContain("hidden-provider");
+    expect(output).not.toContain("Bearer");
+    expect(output).not.toContain("token=hidden-model");
+  });
+
   it("opens the existing masked model-setup workflow with m", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const workbench = runWorkbench({ client: safeClient(), terminal });
@@ -62,6 +97,96 @@ describe("TUI workbench", () => {
     terminal.input("\u0003");
 
     await expect(workbench).resolves.toBe(0);
+  });
+
+  it("waits for Ctrl+C to cancel active model setup without later polling or mutations", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const requests: { path: string; body: unknown }[] = [];
+    let pollStarted: (() => void) | undefined;
+    const pollStartedPromise = new Promise<void>((resolve) => { pollStarted = resolve; });
+    const setup = setupClient(requests, () => "running");
+    const client = safeClient({
+      adminRequest: async <T>(path: string, init?: { readonly method?: string }) => {
+        if (path === "/v1/admin/provider-drivers") return {
+          piVersion: "0.73.1",
+          drivers: [{
+            driverId: "pi/openai",
+            candidates: [{
+              candidateId: "pi/openai:gpt-4.1-mini",
+              displayName: "GPT-4.1 mini",
+              modelId: "gpt-4.1-mini",
+              credentialSupport: "bearer",
+            }],
+          }],
+        } as T;
+        if (path === "/v1/admin/model-verifications/ver_1") pollStarted?.();
+        return setup.adminRequest<T>(path, init);
+      },
+    });
+    const workbench = runWorkbench({ client, terminal });
+
+    await terminal.ready();
+    terminal.input("m");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    terminal.input("\r");
+    await terminal.waitForFrame("Provider slug");
+    terminal.input("\r");
+    await terminal.waitForFrame("Provider display name");
+    terminal.input("\r");
+    await terminal.waitForFrame("Base URL");
+    terminal.input("\r");
+    await terminal.waitForFrame("Catalog model");
+    terminal.input("\r");
+    await terminal.waitForFrame("Provider auth");
+    terminal.input("\r");
+    await terminal.waitForFrame("API key environment variable");
+    terminal.input("OPENAI_API_KEY");
+    terminal.input("\r");
+    await terminal.waitForFrame("Model profile slug");
+    terminal.input("\r");
+    await terminal.waitForFrame("Model profile display name");
+    terminal.input("\r");
+    await terminal.waitForFrame("Context source");
+    terminal.input("\r");
+    await terminal.waitForFrame("Use resolved context limit");
+    terminal.input("\r");
+    await pollStartedPromise;
+    const requestCountAtCancel = requests.length;
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    await new Promise<void>((resolve) => setTimeout(resolve, 300));
+    expect(requests).toHaveLength(requestCountAtCancel);
+    expect(requests.some((request) => request.path.includes("/promotions"))).toBe(false);
+    expect(requests.some((request) => request.path.includes("model-assignment"))).toBe(false);
+  });
+
+  it("cancels model setup polling before later Admin mutations", async () => {
+    const requests: { path: string; body: unknown }[] = [];
+    const controller = new AbortController();
+    let sleepStarted: (() => void) | undefined;
+    const sleepStartedPromise = new Promise<void>((resolve) => { sleepStarted = resolve; });
+    const outcome = runModelSetupScreen({
+      client: setupClient(requests, () => "running"),
+      prompt: scriptedPrompt({
+        selects: ["deepseek", "pi/deepseek:deepseek-chat", "environment", "preset"],
+        inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", "deepseek-chat", "DeepSeek Chat"],
+        confirmations: [true],
+      }),
+      write: vi.fn(),
+      signal: controller.signal,
+      sleep: async () => {
+        sleepStarted?.();
+        await new Promise<void>(() => undefined);
+      },
+    });
+
+    await sleepStartedPromise;
+    controller.abort();
+
+    await expect(outcome).resolves.toEqual({ status: "cancelled" });
+    expect(requests.some((request) => request.path.includes("/promotions"))).toBe(false);
+    expect(requests.some((request) => request.path.includes("model-assignment"))).toBe(false);
   });
 
   it("stops the terminal once when startup fails", async () => {
@@ -208,17 +333,23 @@ class FakeTuiTerminal implements Terminal {
   setProgress(): void {}
 }
 
-function safeClient() {
+function safeClient(overrides: Partial<{
+  agents: readonly { readonly id: string; readonly displayName: string; readonly revisionId: string }[];
+  connections: readonly { readonly connectionId: string; readonly displayName: string; readonly activeRevisionId: string | null; readonly retiredAt: string | null }[];
+  profiles: readonly { readonly profileId: string; readonly displayName: string; readonly activeRevisionId: string | null; readonly retiredAt: string | null }[];
+  adminRequest: <T>(path: string, init?: { readonly method?: string }) => Promise<T>;
+}> = {}) {
   return {
-    listAgents: async () => ({ agents: [{ id: "research", displayName: "Research Agent", revisionId: "rev_1" }], unavailable: [] }),
-    listProviderConnections: async () => ({ connections: [{ connectionId: "provider-one", displayName: "Provider One", activeRevisionId: "pcr_1", retiredAt: null }] }),
-    listModelProfiles: async () => ({ profiles: [{ profileId: "model-one", displayName: "Model One", activeRevisionId: "mpr_1", retiredAt: null }] }),
+    listAgents: async () => ({ agents: overrides.agents ?? [{ id: "research", displayName: "Research Agent", revisionId: "rev_1" }], unavailable: [] }),
+    listProviderConnections: async () => ({ connections: overrides.connections ?? [{ connectionId: "provider-one", displayName: "Provider One", activeRevisionId: "pcr_1", retiredAt: null }] }),
+    listModelProfiles: async () => ({ profiles: overrides.profiles ?? [{ profileId: "model-one", displayName: "Model One", activeRevisionId: "mpr_1", retiredAt: null }] }),
     listProviderDrivers: async () => ({ piVersion: "0.73.1" as const, drivers: [] }),
-    adminRequest: async <T>(path: string) => (path === "/v1/admin/provider-drivers"
+    adminRequest: overrides.adminRequest ?? (async <T>(path: string) => (path === "/v1/admin/provider-drivers"
       ? { piVersion: "0.73.1", drivers: [] } as T
-      : {} as T),
+      : {} as T)),
   };
 }
+
 
 function plainLines(frame: string): string[] {
   let text = "";

@@ -31,10 +31,14 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   const chat = new ChatScreen();
   let closed = false;
   let modelSetupPending = false;
+  let modelSetup: { readonly controller: AbortController; readonly prompt: PiTuiPrompt; readonly done: Promise<void> } | undefined;
+  let latestModelSetup: Promise<void> | undefined;
   let resolveExit: (() => void) | undefined;
   const stopped = () => {
     if (closed) return;
     closed = true;
+    modelSetup?.controller.abort();
+    modelSetup?.prompt.cancel();
     if (tui.hasOverlay()) tui.hideOverlay();
     resolveExit?.();
   };
@@ -54,9 +58,12 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
       }
       if (!matchesKey(data, "m") || modelSetupPending) return undefined;
       modelSetupPending = true;
-      void runModelSetupScreen({
-        prompt: new PiTuiPrompt(tui),
+      const controller = new AbortController();
+      const prompt = new PiTuiPrompt(tui);
+      const done = runModelSetupScreen({
+        prompt,
         client: options.client,
+        signal: controller.signal,
         write: () => undefined,
         onProgress: (progress) => {
           chat.show("profiles", [modelSetupLabel(progress)]);
@@ -71,14 +78,18 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
         }),
       ).finally(() => {
         modelSetupPending = false;
+        modelSetup = undefined;
         tui.setFocus(navigation);
         tui.requestRender();
       });
+      modelSetup = { controller, prompt, done };
+      latestModelSetup = done;
       return { consume: true };
     });
     tui.start();
     tui.requestRender(true);
     await finished;
+    await latestModelSetup;
     return 0;
   } finally {
     if (!closed && tui.hasOverlay()) tui.hideOverlay();

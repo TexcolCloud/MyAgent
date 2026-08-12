@@ -75,6 +75,20 @@ describe("PiTuiPrompt", () => {
     expect(dialogs.renderedHidden()).not.toContain("*");
   });
 
+  it("scrubs a pending secret before programmatic cancellation hides the overlay", async () => {
+    const dialogs = fakeDialogs();
+    const prompt = new PiTuiPrompt(dialogs);
+
+    const answer = prompt.secret("API key");
+    dialogs.type("provider-key");
+    prompt.cancel();
+
+    await expect(answer).rejects.toMatchObject({ code: "prompt_cancelled" });
+    expect(dialogs.renderedAtHide()).not.toContain("*");
+    dialogs.interactHidden("\u001a");
+    expect(dialogs.renderedHidden()).not.toContain("*");
+  });
+
   it("renders disabled catalog choices but cannot select them", async () => {
     const dialogs = fakeDialogs();
     const prompt = new PiTuiPrompt(dialogs);

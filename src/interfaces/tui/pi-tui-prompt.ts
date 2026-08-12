@@ -37,6 +37,7 @@ const theme: SelectListTheme = {
 
 export class PiTuiPrompt implements CliPrompt {
   private pending = false;
+  private cancelPending: (() => void) | undefined;
 
   constructor(private readonly dialogs: PiTuiDialogHost) {}
 
@@ -72,10 +73,11 @@ export class PiTuiPrompt implements CliPrompt {
   }
 
   secret(message: string): Promise<string> {
-    return this.open<string>((finish, cancel) => modal(
-      "",
-      new MaskedSecretInput(message, finish, cancel),
-    ));
+    return this.open<string>((finish, cancel, setCancellationCleanup) => {
+      const input = new MaskedSecretInput(message, finish, cancel);
+      setCancellationCleanup(() => input.scrub());
+      return modal("", input);
+    });
   }
 
   confirm(message: string): Promise<boolean> {
@@ -84,6 +86,8 @@ export class PiTuiPrompt implements CliPrompt {
       { value: "no", label: "No" },
     ] as const).then((value) => value === "yes");
   }
+
+  cancel(): void { this.cancelPending?.(); }
 
   private editor(message: string, initial: string): Promise<string> {
     return this.open<string>((finish, cancel) => {
@@ -99,11 +103,13 @@ export class PiTuiPrompt implements CliPrompt {
   private open<T>(create: (
     finish: (value: T, clear?: () => void) => void,
     cancel: (clear?: () => void) => void,
+    setCancellationCleanup: (clear: () => void) => void,
   ) => Component): Promise<T> {
     if (this.pending) return Promise.reject(new Error("pi_tui_prompt_already_pending"));
     this.pending = true;
     return new Promise<T>((resolve, reject) => {
       let settled = false;
+      let cancellationCleanup: (() => void) | undefined;
       const overlay: { handle?: OverlayHandle } = {};
       const close = (complete: () => void, clear?: () => void) => {
         if (settled) return;
@@ -111,13 +117,16 @@ export class PiTuiPrompt implements CliPrompt {
         clear?.();
         overlay.handle?.hide();
         this.pending = false;
+        this.cancelPending = undefined;
         complete();
       };
       const dialog = create(
         (value, clear) => close(() => resolve(value), clear),
         (clear) => close(() => reject(new CliPromptCancelledError()), clear),
+        (clear) => { cancellationCleanup = clear; },
       );
       overlay.handle = this.dialogs.showOverlay(dialog);
+      this.cancelPending = () => close(() => reject(new CliPromptCancelledError()), cancellationCleanup);
       this.dialogs.setFocus(dialog);
       this.dialogs.requestRender();
     });
@@ -248,7 +257,7 @@ class MaskedSecretInput implements Component, Focusable {
     this.cursor += text.length;
   }
 
-  private scrub(): void {
+  scrub(): void {
     this.value = "";
     this.cursor = 0;
     this.pasteBuffer = "";
