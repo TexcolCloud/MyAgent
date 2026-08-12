@@ -33,7 +33,8 @@ Model setup uses the lifecycle below. `Catalog model` identifies static
 metadata from the pinned Pi package; `Discovered model` identifies a model
 reported by the configured Provider endpoint. Selection, discovery, and
 Verification are separate states, and none implicitly promotes or assigns a
-model. Every mutation uses the record revision returned by the control plane.
+model. Every mutation of an existing record uses the record revision returned
+by the control plane.
 If a mutation returns `revision_conflict`, the TUI clears the stale setup
 review and confirmation state, sends no automatic retry, and displays `Reload
 required`. Reload Providers or Profiles successfully, inspect the current

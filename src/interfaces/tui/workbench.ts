@@ -34,6 +34,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   let closed = false;
   let modelSetupPending = false;
   let modelSetupReloadRequired = false;
+  let modelSetupReloadEpoch = 0;
   let modelSetup: { readonly controller: AbortController; readonly prompt: PiTuiPrompt; readonly done: Promise<void> } | undefined;
   let latestModelSetup: Promise<void> | undefined;
   let chatPrompt: PiTuiPrompt | undefined;
@@ -51,8 +52,13 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     resolveExit?.();
   };
   const refresh = (destination: WorkbenchDestination) => {
+    const startedAtReloadEpoch = modelSetupReloadEpoch;
     void loadDestination(options.client, destination, chat, inspector).then((loaded) => {
-      if (loaded && (destination === "providers" || destination === "profiles")) {
+      if (
+        loaded &&
+        startedAtReloadEpoch === modelSetupReloadEpoch &&
+        (destination === "providers" || destination === "profiles")
+      ) {
         modelSetupReloadRequired = false;
       }
     }).finally(() => tui.requestRender());
@@ -128,14 +134,19 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
       }).then((outcome) => {
         if (outcome.status === "conflict") {
           prompt.cancel();
+          modelSetupReloadEpoch += 1;
           modelSetupReloadRequired = true;
           chat.show("profiles", ["Model setup stopped. Reload required."]);
           inspector.showConflict();
           return;
         }
         refresh("profiles");
-      }, (error: unknown) => {
-        inspector.showProblem(safeProblem(error, "service_unavailable", "Model setup is unavailable."));
+      }, () => {
+        inspector.showProblem({
+          code: "service_unavailable",
+          detail: "Model setup is unavailable.",
+          traceId: "tui",
+        });
       }).finally(() => {
         modelSetupPending = false;
         modelSetup = undefined;

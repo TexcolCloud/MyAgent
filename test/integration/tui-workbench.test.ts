@@ -453,6 +453,78 @@ describe("TUI workbench", () => {
     await expect(workbench).resolves.toBe(0);
   });
 
+  it("does not let a pre-conflict Profile reload clear the reload requirement", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    let resolvePreConflictReload: (() => void) | undefined;
+    const preConflictReload = new Promise<void>((resolve) => { resolvePreConflictReload = resolve; });
+    let profileLoads = 0;
+    const setupRequests: string[] = [];
+    const client = {
+      ...safeClient(),
+      listModelProfiles: async () => {
+        profileLoads += 1;
+        if (profileLoads === 1) await preConflictReload;
+        return { profiles: [{
+          profileId: "model-one",
+          displayName: profileLoads === 1 ? "Model One" : "Fresh Model",
+          activeRevisionId: "mpr_1",
+          retiredAt: null,
+        }] };
+      },
+      adminRequest: async (path: string) => {
+        setupRequests.push(path);
+        throw new CliHttpError(409, "revision_conflict", "stale", "trace_1");
+      },
+    };
+    const workbench = runWorkbench({ client, terminal });
+
+    await terminal.ready();
+    terminal.input("\u001b[B");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await vi.waitFor(() => { expect(profileLoads).toBe(1); });
+    terminal.input("m");
+    await terminal.waitForFrame("Reload required");
+    const requestsAtConflict = setupRequests.length;
+
+    resolvePreConflictReload?.();
+    await terminal.waitForFrame("Model One");
+    terminal.input("m");
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    expect(setupRequests).toHaveLength(requestsAtConflict);
+
+    terminal.input("\r");
+    await terminal.waitForFrame("Fresh Model");
+    terminal.input("m");
+    await vi.waitFor(() => { expect(setupRequests).toHaveLength(requestsAtConflict + 1); });
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+  });
+
+  it("renders fixed safe text for non-conflict model setup failures", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const client = safeClient({
+      adminRequest: async () => {
+        throw new CliHttpError(503, "provider_unavailable", "provider-secret stale response", "trace-secret");
+      },
+    });
+    const workbench = runWorkbench({ client, terminal });
+
+    await terminal.ready();
+    terminal.input("m");
+    await terminal.waitForFrame("Model setup is unavailable.");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    const output = plainLines(terminal.frames.join("\n")).join("\n");
+    expect(output).toContain("service_unavailable");
+    expect(output).toContain("Model setup is unavailable.");
+    expect(output).not.toContain("provider_unavailable");
+    expect(output).not.toContain("provider-secret");
+    expect(output).not.toContain("trace-secret");
+  });
+
   it("waits for Ctrl+C to cancel active model setup without later polling or mutations", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const requests: { path: string; body: unknown }[] = [];
