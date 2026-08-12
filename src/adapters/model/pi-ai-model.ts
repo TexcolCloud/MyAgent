@@ -1,4 +1,5 @@
 import type { JsonValue } from "../../domain/json.js";
+import type { ProviderCompatibilityContract } from "../../domain/pi-runtime.js";
 import {
   ModelProviderError,
   type ModelChunk,
@@ -24,6 +25,9 @@ export class PiAiModelAdapter implements ModelPort {
     if (signal.aborted) throw abortError();
     const contract = request.model.piRuntime;
     if (contract === undefined) throw protocolError();
+    if (!isProviderCompatibilityContract(contract.providerCompatibilityContract)) {
+      throw protocolError();
+    }
     if (!isValidPiContextInput(request.input)) throw protocolError();
     const route = this.options.gateway.routeFor(request.model);
     let toolCall: { id: string; name: string; arguments: string } | undefined;
@@ -180,6 +184,12 @@ function isAbortError(error: unknown): boolean {
 
 function isTokenCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isProviderCompatibilityContract(
+  value: unknown,
+): value is ProviderCompatibilityContract {
+  return value === "none" || value === "deepseek-responses-v1";
 }
 
 function isJsonValue(value: unknown): value is JsonValue {

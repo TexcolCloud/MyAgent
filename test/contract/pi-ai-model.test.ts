@@ -232,6 +232,50 @@ describe("PiAiModelAdapter", () => {
     expect(routeCalls).toBe(0);
   });
 
+  it("rejects an unknown captured compatibility contract before provider egress", async () => {
+    let clientCalls = 0;
+    let routeCalls = 0;
+    const request = piRequest();
+    const model = new PiAiModelAdapter({
+      client: {
+        async *stream() {
+          clientCalls += 1;
+          yield { type: "text_delta", text: "must-not-run" };
+          yield {
+            type: "done",
+            reason: "stop",
+            usage: { inputTokens: 1, outputTokens: 1 },
+          };
+        },
+      },
+      gateway: {
+        routeFor() {
+          routeCalls += 1;
+          return { baseUrl: "unreachable", apiKey: "unreachable" };
+        },
+      },
+    });
+    const captured = {
+      ...request,
+      model: {
+        ...request.model,
+        piRuntime: {
+          ...request.model.piRuntime!,
+          providerCompatibilityContract: "unknown-v9",
+        },
+      },
+    } as unknown as ModelRequest;
+
+    const rejection = await collect(model.streamAttempt(captured, signal())).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(rejection).toMatchObject({ code: "model_protocol_error", transient: false });
+    expect(String(rejection)).not.toContain("unknown-v9");
+    expect(clientCalls).toBe(0);
+    expect(routeCalls).toBe(0);
+  });
+
   it("rejects a second Pi function call before emitting a terminal chunk", async () => {
     const chunks: ModelChunk[] = [];
     const model = new PiAiModelAdapter({
