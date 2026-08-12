@@ -1,5 +1,7 @@
 import {
   Box,
+  CURSOR_MARKER,
+  decodeKittyPrintable,
   Editor,
   matchesKey,
   SelectList,
@@ -66,11 +68,14 @@ export class PiTuiPrompt implements CliPrompt {
   }
 
   input(message: string, initial?: string): Promise<string> {
-    return this.editor(message, initial ?? "", false);
+    return this.editor(message, initial ?? "");
   }
 
   secret(message: string): Promise<string> {
-    return this.editor(message, "", true);
+    return this.open<string>((finish, cancel) => modal(
+      "",
+      new MaskedSecretInput(message, finish, cancel),
+    ));
   }
 
   confirm(message: string): Promise<boolean> {
@@ -80,17 +85,14 @@ export class PiTuiPrompt implements CliPrompt {
     ] as const).then((value) => value === "yes");
   }
 
-  private editor(message: string, initial: string, masked: boolean): Promise<string> {
+  private editor(message: string, initial: string): Promise<string> {
     return this.open<string>((finish, cancel) => {
       const editor = new Editor(this.dialogs as unknown as TUI, {
         borderColor: (value) => value,
         selectList: theme,
       }, { paddingX: 0 });
       editor.setText(initial);
-      const component = masked
-        ? new MaskedEditor(message, editor, finish, cancel)
-        : new DialogEditor(message, editor, finish, cancel);
-      return modal("", component);
+      return modal("", new DialogEditor(message, editor, finish, cancel));
     });
   }
 
@@ -154,23 +156,104 @@ class DialogEditor implements Component, Focusable {
   }
 }
 
-class MaskedEditor extends DialogEditor {
+class MaskedSecretInput implements Component, Focusable {
+  focused = false;
+  private value = "";
+  private cursor = 0;
+  private pasteBuffer = "";
+  private receivingPaste = false;
+  private scrubbed = false;
+
   constructor(
-    message: string,
-    editor: Editor,
-    finish: (value: string, clear?: () => void) => void,
-    cancel: (clear?: () => void) => void,
-  ) {
-    super(
-      message,
-      editor,
-      (value) => finish(value, () => editor.setText("")),
-      () => cancel(() => editor.setText("")),
-    );
+    private readonly message: string,
+    private readonly finish: (value: string) => void,
+    private readonly cancel: () => void,
+  ) {}
+
+  handleInput(data: string): void {
+    if (this.scrubbed) return;
+    if (matchesKey(data, "escape")) {
+      this.scrub();
+      this.cancel();
+      return;
+    }
+    if (this.consumePaste(data)) return;
+    if (matchesKey(data, "enter") || data === "\n") {
+      const answer = this.value;
+      this.scrub();
+      this.finish(answer);
+      return;
+    }
+    if (matchesKey(data, "backspace")) {
+      if (this.cursor > 0) {
+        this.value = this.value.slice(0, this.cursor - 1) + this.value.slice(this.cursor);
+        this.cursor -= 1;
+      }
+      return;
+    }
+    if (matchesKey(data, "delete")) {
+      this.value = this.value.slice(0, this.cursor) + this.value.slice(this.cursor + 1);
+      return;
+    }
+    if (matchesKey(data, "left")) {
+      this.cursor = Math.max(0, this.cursor - 1);
+      return;
+    }
+    if (matchesKey(data, "right")) {
+      this.cursor = Math.min(this.value.length, this.cursor + 1);
+      return;
+    }
+    if (matchesKey(data, "home")) {
+      this.cursor = 0;
+      return;
+    }
+    if (matchesKey(data, "end")) {
+      this.cursor = this.value.length;
+      return;
+    }
+    const printable = decodeKittyPrintable(data) ?? printableText(data);
+    if (printable !== undefined) this.insert(printable);
   }
 
-  override render(): string[] {
-    return [this.message, "*".repeat(this.editor.getText().length)];
+  render(): string[] {
+    if (this.scrubbed) return [this.message, ""];
+    const masked = "*".repeat(this.value.length);
+    if (!this.focused) return [this.message, masked];
+    return [this.message, `${masked.slice(0, this.cursor)}${CURSOR_MARKER}${masked.slice(this.cursor)}`];
+  }
+
+  invalidate(): void {}
+
+  private consumePaste(data: string): boolean {
+    if (data.includes("\u001b[200~")) {
+      this.receivingPaste = true;
+      this.pasteBuffer = "";
+      data = data.replace("\u001b[200~", "");
+    }
+    if (!this.receivingPaste) return false;
+    this.pasteBuffer += data;
+    const end = this.pasteBuffer.indexOf("\u001b[201~");
+    if (end === -1) return true;
+    const pasted = this.pasteBuffer.slice(0, end);
+    const remaining = this.pasteBuffer.slice(end + 6);
+    this.pasteBuffer = "";
+    this.receivingPaste = false;
+    this.insert(pasted);
+    if (remaining.length > 0) this.handleInput(remaining);
+    return true;
+  }
+
+  private insert(text: string): void {
+    this.value = this.value.slice(0, this.cursor) + text + this.value.slice(this.cursor);
+    this.cursor += text.length;
+  }
+
+  private scrub(): void {
+    this.value = "";
+    this.cursor = 0;
+    this.pasteBuffer = "";
+    this.receivingPaste = false;
+    this.scrubbed = true;
   }
 }
 
@@ -207,4 +290,10 @@ class DialogOverlay implements Component, Focusable {
 
 function modal(title: string, child: Component): DialogOverlay {
   return new DialogOverlay(title, child);
+}
+
+function printableText(data: string): string | undefined {
+  return data.length > 0 && !data.includes("\u001b") && [...data].every((character) => character >= " ")
+    ? data
+    : undefined;
 }

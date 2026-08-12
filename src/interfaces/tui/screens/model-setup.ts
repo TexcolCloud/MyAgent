@@ -39,7 +39,7 @@ export async function runModelSetupScreen(options: RunModelSetupScreenOptions): 
   const exitCode = await setupModel(
     client,
     options.prompt,
-    options.sleep ?? (async () => undefined),
+    options.sleep ?? delay,
     (line) => {
       output.push(line);
       options.write(line);
@@ -59,4 +59,8 @@ export async function runModelSetupScreen(options: RunModelSetupScreenOptions): 
     }
   }
   return { status: "configured" };
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

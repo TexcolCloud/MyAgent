@@ -32,6 +32,12 @@ GREEN:
 - `npm run build`: passed.
 - `git diff --check`: passed.
 
+Round 1 full-suite evidence:
+
+- `npm test`: 884 passed, 5 skipped, 1 failed. The unrelated `ModelVerificationWorker` shutdown/reclaim test timed out waiting for a condition under the full serialized run; all changed TUI tests passed.
+- The exact unchanged worker test passed in isolation: 1 passed, 7 skipped, 164 milliseconds.
+- No worker, lease, or test-fixture code was changed.
+
 ## Full-Suite Residual
 
 `npm test` did not produce a fully green all-repository run on Windows:
@@ -45,3 +51,19 @@ Both exact failing cases passed unchanged in isolation:
 - composed-system managed plaintext containment: 1 passed, 11 skipped, 1.068 seconds.
 
 Neither failure traverses the changed CLI/TUI files. No fixture or unrelated production change was made. Residual risk is the existing Windows shared-temp/e2e contention under the serialized all-suite run; Task 3 focused, static, and build gates are green.
+
+## Review Fix Round 1
+
+Addressed two review findings with RED/GREEN tests:
+
+- Replaced the Secret `Editor` with a purpose-built `MaskedSecretInput`. It has no undo stack, history, paste map, autocomplete task, or kill ring. Before submit or Escape closes the overlay, `scrub()` clears the value, cursor, incomplete bracketed-paste buffer, and paste mode, then permanently ignores later input. Tests retain the removed dialog and verify that undo input and completion of an interrupted paste cannot restore masked content after either submit or cancellation.
+- Restored the existing verification polling cadence in the TUI screen. Without an injected test sleep, polling now uses a real timer and waits the `250` milliseconds requested by `pollVerification()`; focused tests verify that the second read cannot occur at 249 milliseconds. Existing zero-delay injection remains available to tests.
+
+Round 1 verification:
+
+- `npm run test:unit -- test/unit/pi-tui-prompt.test.ts`: 6 passed.
+- `npm run test:integration -- test/integration/model-cli.test.ts test/integration/tui-workbench.test.ts test/integration/tui-client.test.ts`: 56 passed.
+- `npm run lint`: passed.
+- `npm run typecheck`: passed.
+- `npm run build`: passed.
+- `git diff --check`: passed.

@@ -4,6 +4,33 @@ import type { CliPrompt } from "../../src/interfaces/cli/commands/model-setup.js
 import { runModelSetupScreen } from "../../src/interfaces/tui/screens/model-setup.js";
 
 describe("model setup screen", () => {
+  it("waits 250ms between verification reads by default", async () => {
+    vi.useFakeTimers();
+    try {
+      const requests: { path: string; body: unknown }[] = [];
+      let verificationReads = 0;
+      const client = setupClient(requests, () => {
+        verificationReads += 1;
+        return verificationReads === 1 ? "running" : "passed";
+      });
+      const prompt = scriptedPrompt({
+        selects: ["deepseek", "pi/deepseek:deepseek-chat", "environment", "preset"],
+        inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", "deepseek-chat", "DeepSeek Chat", ""],
+        confirmations: [true, false, false],
+      });
+
+      const outcome = runModelSetupScreen({ prompt, client, write: vi.fn() });
+      await vi.advanceTimersByTimeAsync(249);
+      expect(verificationReads).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(outcome).resolves.toEqual({ status: "cancelled" });
+      expect(verificationReads).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("requires explicit promotion after successful verification", async () => {
     const requests: { path: string; body: unknown }[] = [];
     const client = setupClient(requests);
@@ -70,7 +97,10 @@ function scriptedPrompt(values: {
   } as CliPrompt;
 }
 
-function setupClient(requests: { path: string; body: unknown }[]) {
+function setupClient(
+  requests: { path: string; body: unknown }[],
+  verificationStatus: () => "running" | "passed" = () => "passed",
+) {
   return {
     adminRequest: async <T>(path: string, options: { method?: string; body?: unknown } = {}) => {
       requests.push({ path, body: options.body });
@@ -88,7 +118,7 @@ function setupClient(requests: { path: string; body: unknown }[]) {
       if (path.endsWith("/discover")) return { recordRevision: 1, state: "fresh", models: [{ id: "remote-only" }], error: null } as T;
       if (path === "/v1/admin/model-profiles") return { profileId: "deepseek-chat", recordRevision: 0, revisions: [{ revisionId: "mpr_1", invocationProtocol: "responses", maxInputTokens: 65536, contextWindowSource: "preset" }] } as T;
       if (path.endsWith("/verifications")) return { operationUrl: "/v1/admin/model-verifications/ver_1" } as T;
-      if (path === "/v1/admin/model-verifications/ver_1") return { verificationId: "ver_1", profileRevisionId: "mpr_1", status: "passed", resultCode: null, capabilities: [], traceId: "trace", fallbackProfileRevisionId: null, fallbackVerificationId: null } as T;
+      if (path === "/v1/admin/model-verifications/ver_1") return { verificationId: "ver_1", profileRevisionId: "mpr_1", status: verificationStatus(), resultCode: null, capabilities: [], traceId: "trace", fallbackProfileRevisionId: null, fallbackVerificationId: null } as T;
       if (path === "/v1/admin/model-profiles/deepseek-chat") return { profileId: "deepseek-chat", recordRevision: 1, revisions: [{ revisionId: "mpr_1", invocationProtocol: "responses", maxInputTokens: 65536, contextWindowSource: "preset" }] } as T;
       return {} as T;
     },

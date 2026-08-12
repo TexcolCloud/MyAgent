@@ -19,6 +19,8 @@ describe("PiTuiPrompt", () => {
     await expect(answer).resolves.toBe("provider-key");
     expect(dialogs.renderedAtHide()).not.toContain("provider-key");
     expect(dialogs.renderedText()).not.toContain("provider-key");
+    dialogs.interactHidden("\u001a");
+    expect(dialogs.renderedHidden()).not.toContain("*");
   });
 
   it("maps Escape to one safe cancellation and accepts a later prompt", async () => {
@@ -45,7 +47,7 @@ describe("PiTuiPrompt", () => {
     expect(dialogs.focusRestored()).toBe(true);
   });
 
-  it("clears a cancelled secret before hiding the overlay", async () => {
+  it("scrubs cancelled secret value, undo, and pending paste state before hiding", async () => {
     const dialogs = fakeDialogs();
     const prompt = new PiTuiPrompt(dialogs);
 
@@ -55,7 +57,22 @@ describe("PiTuiPrompt", () => {
 
     await expect(answer).rejects.toMatchObject({ code: "prompt_cancelled" });
     expect(dialogs.renderedAtHide()).not.toContain("*");
+    dialogs.interactHidden("\u001a");
+    expect(dialogs.renderedHidden()).not.toContain("*");
     expect(dialogs.renderedText()).not.toContain("provider-key");
+  });
+
+  it("scrubs an incomplete secret paste before Escape removes the overlay", async () => {
+    const dialogs = fakeDialogs();
+    const prompt = new PiTuiPrompt(dialogs);
+
+    const answer = prompt.secret("API key");
+    dialogs.startPaste("provider-key");
+    dialogs.escape();
+
+    await expect(answer).rejects.toMatchObject({ code: "prompt_cancelled" });
+    dialogs.interactHidden("\u001b[201~");
+    expect(dialogs.renderedHidden()).not.toContain("*");
   });
 
   it("renders disabled catalog choices but cannot select them", async () => {
@@ -88,15 +105,20 @@ function fakeDialogs(): PiTuiDialogHost & {
   renderedAtHide(): string;
   hasOverlay(): boolean;
   focusRestored(): boolean;
+  startPaste(value: string): void;
+  interactHidden(value: string): void;
+  renderedHidden(): string;
 } {
   let component: Component | undefined;
   let focused: Component | undefined;
   const previousFocus: Component = { render: () => [], invalidate: () => undefined };
   focused = previousFocus;
   let hiddenRender = "";
+  let hiddenComponent: Component | undefined;
   const handle: OverlayHandle = {
     hide: () => {
       hiddenRender = component?.render(80).join("\n") ?? "";
+      hiddenComponent = component;
       if (focused === component) focused = previousFocus;
       component = undefined;
     },
@@ -135,5 +157,8 @@ function fakeDialogs(): PiTuiDialogHost & {
     renderedAtHide: () => hiddenRender,
     hasOverlay: () => component !== undefined,
     focusRestored: () => focused === previousFocus,
+    startPaste: (value) => focused?.handleInput?.(`\u001b[200~${value}`),
+    interactHidden: (value) => hiddenComponent?.handleInput?.(value),
+    renderedHidden: () => hiddenComponent?.render(80).join("\n") ?? "",
   };
 }
