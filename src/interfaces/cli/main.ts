@@ -14,6 +14,7 @@ import { deleteSession, listSessions } from "./commands/sessions.js";
 import { reconcileTool } from "./commands/tools.js";
 import { getVerification } from "./commands/verifications.js";
 import { writeProblem, type CliProblemOutput, type CliWrite } from "./formatters.js";
+import { assertInteractiveTty, InteractiveTtyRequiredError } from "../tui/tty.js";
 
 export type { CliPrompt } from "./commands/model-setup.js";
 
@@ -25,6 +26,9 @@ export interface ExecuteCliOptions {
   sleep?: (milliseconds: number) => Promise<void>;
   write?: CliWrite;
   writeError?: CliWrite;
+  stdinIsTTY?: boolean;
+  stdoutIsTTY?: boolean;
+  runTui?: () => Promise<void>;
 }
 
 export async function executeCli(argumentsList: readonly string[], options: ExecuteCliOptions = {}): Promise<number> {
@@ -37,6 +41,17 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     json = booleanFlag(flags, "json");
     const command = positional[0] === "backup" ? "backup" : positional.slice(0, 2).join(" ");
     assertCommandGrammar(command, positional.length, flags);
+    if (command === "tui") {
+      assertInteractiveTty({
+        stdinIsTTY: options.stdinIsTTY ?? process.stdin.isTTY === true,
+        stdoutIsTTY: options.stdoutIsTTY ?? process.stdout.isTTY === true,
+      });
+      if (options.runTui !== undefined) {
+        await options.runTui();
+        return 0;
+      }
+      throw new CliUsageError("tui_unavailable", "The interactive workbench is not available.");
+    }
     if (command === "serve") {
       await serve(stringFlag(flags, "config") ?? "myagent.yaml");
       return 0;
@@ -261,6 +276,7 @@ function modelSelection(flags: CliFlags):
 
 function cliFailure(error: unknown): { exitCode: number; problem: CliProblemOutput } {
   if (error instanceof CliUsageError) return { exitCode: 2, problem: error };
+  if (error instanceof InteractiveTtyRequiredError) return { exitCode: 2, problem: error };
   if (error instanceof CliValidationError) return { exitCode: 2, problem: error };
   if (error instanceof CliCredentialError) return { exitCode: 3, problem: error };
   if (error instanceof CliHttpError) {
@@ -291,11 +307,13 @@ const ADMIN_COMMANDS = new Set([
 
 const RUN_FLAGS = ["api-url", "token", "json"] as const;
 const ADMIN_FLAGS = ["api-url", "admin-token", "json"] as const;
+const TUI_FLAGS = ["api-url", "token", "admin-token"] as const;
 const COMMAND_GRAMMAR: Readonly<Record<string, {
   readonly positional: number;
   readonly flags: readonly string[];
 }>> = {
   serve: { positional: 1, flags: ["config"] },
+  tui: { positional: 1, flags: TUI_FLAGS },
   "config validate": { positional: 2, flags: ["config", "json"] },
   "config reload": { positional: 2, flags: RUN_FLAGS },
   "agents list": { positional: 2, flags: RUN_FLAGS },

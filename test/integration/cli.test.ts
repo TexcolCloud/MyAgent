@@ -9,6 +9,55 @@ import { startTestApp } from "../helpers/start-test-app.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
 describe("CLI HTTP boundary", () => {
+  it("returns one Problem and does not invoke the TUI boundary without an interactive terminal", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const output: string[] = [];
+    const runTui = vi.fn();
+
+    await expect(executeCli(["tui"], {
+      stdinIsTTY: false,
+      stdoutIsTTY: false,
+      runTui,
+      write: (line) => output.push(line),
+      writeError: (line) => output.push(line),
+    })).resolves.toBe(2);
+
+    expect(output).toEqual([
+      "interactive_tty_required: An interactive TTY is required. (traceId: cli)",
+    ]);
+    expect(runTui).not.toHaveBeenCalled();
+  });
+
+  it("validates TUI flags before acquiring the terminal and keeps configured tokens out of output", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const output: string[] = [];
+    const environment = {
+      MYAGENT_RUN_TOKEN: "run-token-must-not-appear",
+      MYAGENT_ADMIN_TOKEN: "admin-token-must-not-appear",
+    };
+
+    await expect(executeCli(["tui", "--unsupported", "value"], {
+      environment,
+      stdinIsTTY: false,
+      stdoutIsTTY: false,
+      write: (line) => output.push(line),
+      writeError: (line) => output.push(line),
+    })).resolves.toBe(2);
+    await expect(executeCli(["tui", "--token", "override-run-token", "--admin-token", "override-admin-token"], {
+      environment,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      write: (line) => output.push(line),
+      writeError: (line) => output.push(line),
+    })).resolves.toBe(2);
+
+    expect(output).toEqual([
+      "invalid_cli_command: The CLI command is invalid. (traceId: cli)",
+      "tui_unavailable: The interactive workbench is not available. (traceId: cli)",
+    ]);
+    expect(output.join("\n")).not.toContain("token");
+  });
+
   it("loads local config validation without importing SQLite", async () => {
     vi.resetModules();
     vi.doMock("node:sqlite", () => {
