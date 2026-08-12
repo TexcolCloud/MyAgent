@@ -244,7 +244,7 @@ describe("CLI HTTP boundary", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
-  it("reconnects a non-terminal watch with the latest Event ID", async () => {
+  it("returns after a non-terminal stream EOF without reconnecting", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
     const delta = JSON.stringify({
       runId: "run-cli-1",
@@ -253,43 +253,26 @@ describe("CLI HTTP boundary", () => {
       occurredAt: "2026-08-12T00:00:00.000Z",
       payload: { text: "hello" },
     });
-    const failed = JSON.stringify({
-      runId: "run-cli-1",
-      sequence: 5,
-      type: "run.failed",
-      occurredAt: "2026-08-12T00:00:01.000Z",
-      payload: { code: "run_failed" },
-    });
-    const fetcher = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      if (fetcher.mock.calls.length === 1) {
-        expect(new Headers(init?.headers).get("last-event-id")).toBeNull();
-        return new Response(
-          `id: 4\nevent: message.delta\ndata: ${delta}\n\n`,
-          { status: 200, headers: { "content-type": "text/event-stream" } },
-        );
-      }
-      expect(new Headers(init?.headers).get("last-event-id")).toBe("4");
-      return new Response(
-        `id: 5\nevent: run.failed\ndata: ${failed}\n\n`,
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(
+        `id: 4\nevent: message.delta\ndata: ${delta}\n\n`,
         { status: 200, headers: { "content-type": "text/event-stream" } },
-      );
-    });
+      ))
+      .mockRejectedValue(new Error("unexpected_eof_reconnect"));
     const write = vi.fn();
 
-    await executeCli(["run", "watch", "run-cli-1"], {
+    await expect(executeCli(["run", "watch", "run-cli-1"], {
       environment: {
         MYAGENT_API_URL: "http://127.0.0.1:8787",
         MYAGENT_BEARER_TOKEN: "operator-token",
       },
       fetcher,
       write,
-    });
+    })).resolves.toBe(0);
 
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(write.mock.calls.map(([line]) => line)).toEqual([
-      delta,
-      failed,
-    ]);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledWith(delta);
   });
 
   it("parses Problem Details when explicit connection options are rejected", async () => {
