@@ -11,7 +11,13 @@ import { OpenAiChatCompletionsModel } from "./adapters/model/openai-chat-complet
 import { OpenAiModelDiscovery } from "./adapters/model/openai-model-discovery.js";
 import { OpenAiResponsesModel } from "./adapters/model/openai-responses.js";
 import { ModelRuntimeRouter } from "./adapters/model/model-runtime-router.js";
+import { PiAiSdkClient } from "./adapters/model/pi-ai-client.js";
+import { PiAiModelAdapter } from "./adapters/model/pi-ai-model.js";
 import { NodeProviderHttpTransport } from "./adapters/provider-http-transport.js";
+import {
+  ProviderEgressGateway,
+  type ProviderEgressGatewayListen,
+} from "./adapters/provider-egress-gateway.js";
 import { SqliteApprovalRepository } from "./adapters/sqlite/approval-repository.js";
 import { SqliteBackupWriter } from "./adapters/sqlite/backup.js";
 import { SqliteCatalogRepository } from "./adapters/sqlite/catalog-repository.js";
@@ -82,6 +88,10 @@ export interface BootstrapOptions {
     leaseDurationMs?: number;
     idleDelayMs?: number;
   };
+  providerGateway?: {
+    listen?: ProviderEgressGatewayListen;
+    onStopped?: () => void | Promise<void>;
+  };
 }
 
 export interface BootstrappedService {
@@ -134,6 +144,7 @@ export async function bootstrap(
   let runWorker: RunWorker | undefined;
   let verificationWorker: ModelVerificationWorker | undefined;
   let expirer: ApprovalExpirer | undefined;
+  let providerGateway: ProviderEgressGateway | undefined;
   let closed = false;
   let detachSignals = (): void => {};
   try {
@@ -186,7 +197,28 @@ export async function bootstrap(
     const providerTransport = new NodeProviderHttpTransport({
       secretResolver: secrets,
     });
+    providerGateway = new ProviderEgressGateway({
+      transport: providerTransport,
+      ...(options.providerGateway?.listen === undefined
+        ? {}
+        : { listen: options.providerGateway.listen }),
+      ...(options.providerGateway?.onStopped === undefined
+        ? {}
+        : { onStopped: options.providerGateway.onStopped }),
+    });
+    try {
+      await providerGateway.start();
+    } catch (error) {
+      logger.error(
+        { code: "provider_gateway_unavailable", error },
+        "Pi provider egress gateway is unavailable",
+      );
+    }
     const providerModel = new ModelRuntimeRouter({
+      piAi: new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway: providerGateway,
+      }),
       chatCompletions: new OpenAiChatCompletionsModel({
         transport: providerTransport,
       }),
@@ -360,8 +392,9 @@ export async function bootstrap(
       await cleanupResources([
         () => app?.close(),
         () => verificationWorker?.stop(),
-        () => runWorker?.stop(),
         () => expirer?.stop(),
+        () => runWorker?.stop(),
+        () => providerGateway?.stop(),
         () => connection.close(),
       ]);
     };
@@ -385,8 +418,9 @@ export async function bootstrap(
       await cleanupResources([
         () => app?.close(),
         () => verificationWorker?.stop(),
-        () => runWorker?.stop(),
         () => expirer?.stop(),
+        () => runWorker?.stop(),
+        () => providerGateway?.stop(),
         () => connection.close(),
       ]);
     } catch (cleanupError) {

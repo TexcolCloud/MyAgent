@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { SqliteCatalogRepository } from "../../src/adapters/sqlite/catalog-repository.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
 import { ImportLegacyModelsService } from "../../src/application/import-legacy-models.js";
@@ -47,6 +48,7 @@ describe("legacy model migration", () => {
       expect(alphaConnection).toMatchObject({
         displayName: "alpha",
         providerKind: "openai",
+        providerDriver: "pi/openai",
         activeRevisionId: alphaConnection.revisions[0]?.revisionId,
         recordRevision: 0,
       });
@@ -77,6 +79,7 @@ describe("legacy model migration", () => {
           verifiedCapabilities: [],
         }),
       ]);
+      expect(alphaProfile.revisions[0]?.piRuntime).toBeUndefined();
       expect(first.assignments).toEqual([
         expect.objectContaining({
           agentId: "primary",
@@ -109,6 +112,27 @@ describe("legacy model migration", () => {
       ).get() as { payload_json: string };
       expect(audit.payload_json).not.toContain("API_KEY");
       expect(audit.payload_json).not.toContain("fromEnvironment");
+    });
+  });
+
+  it("reads a fixed pre-0003 Agent snapshot without rewriting its JSON", () => {
+    usingFixture("legacy-agent-snapshot", ({ db }) => {
+      db.prepare(
+        `INSERT INTO agent_revisions (
+           revision_id, agent_id, content_json, content_sha256, created_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        "rev_pre_0003", "primary", PRE_0003_AGENT_REVISION_CONTENT_JSON,
+        "0".repeat(64), NOW.toISOString(),
+      );
+
+      const decoded = new SqliteCatalogRepository(db).get("rev_pre_0003");
+      const stored = db.prepare(
+        "SELECT content_json FROM agent_revisions WHERE revision_id = ?",
+      ).get("rev_pre_0003") as { content_json: string };
+
+      expect(decoded?.model.piRuntime).toBeUndefined();
+      expect(stored.content_json).toBe(PRE_0003_AGENT_REVISION_CONTENT_JSON);
     });
   });
 
@@ -195,6 +219,8 @@ const SEED: LegacyModelImportSeed = {
   },
   agentAliases: { researcher: "beta", primary: "alpha" },
 };
+
+const PRE_0003_AGENT_REVISION_CONTENT_JSON = `{"revisionId":"rev_pre_0003","agentId":"primary","model":{"providerConnectionRevisionId":"pcr_pre_0003","providerKind":"openai","baseUrl":"https://api.openai.example/v1","providerAuth":{"type":"none"},"allowInsecureHttp":false,"modelId":"gpt-4.1-mini","invocationProtocol":"chat_completions","maxInputTokens":128000,"verifiedCapabilities":["streaming_text","single_tool_call"],"compatibilityPresetVersion":"openai-v1"},"contentSha256":"${"0".repeat(64)}"}`;
 
 function importer(
   repository: SqliteModelRegistryRepository,

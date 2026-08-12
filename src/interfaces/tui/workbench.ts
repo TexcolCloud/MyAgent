@@ -1,0 +1,281 @@
+import {
+  ProcessTerminal,
+  TUI,
+  matchesKey,
+  truncateToWidth,
+  visibleWidth,
+  type Component,
+  type Terminal,
+} from "@mariozechner/pi-tui";
+
+import { PiTuiPrompt } from "./pi-tui-prompt.js";
+import { ApprovalScreen } from "./screens/approvals.js";
+import { ChatScreen } from "./screens/chat.js";
+import { InspectorScreen } from "./screens/inspector.js";
+import { NavigationScreen, type WorkbenchDestination } from "./screens/navigation.js";
+import { runModelSetupScreen } from "./screens/model-setup.js";
+import type { TuiClient } from "./tui-client.js";
+
+type WorkbenchClient = Pick<TuiClient,
+  "listAgents" | "listProviderConnections" | "listModelProfiles" | "adminRequest" |
+  "createRun" | "stream" | "listPendingApprovals" | "decideApproval"
+>;
+
+export interface RunWorkbenchOptions {
+  readonly client: WorkbenchClient;
+  readonly terminal?: Terminal;
+}
+
+export async function runWorkbench(options: RunWorkbenchOptions): Promise<number> {
+  const terminal = options.terminal ?? new ProcessTerminal();
+  const tui = new TUI(terminal);
+  const inspector = new InspectorScreen();
+  const chat = new ChatScreen({ client: options.client, onChange: () => tui.requestRender() });
+  let closed = false;
+  let modelSetupPending = false;
+  let modelSetupReloadRequired = false;
+  let modelSetupReloadEpoch = 0;
+  let modelSetup: { readonly controller: AbortController; readonly prompt: PiTuiPrompt; readonly done: Promise<void> } | undefined;
+  let latestModelSetup: Promise<void> | undefined;
+  let chatPrompt: PiTuiPrompt | undefined;
+  let latestChatAction: Promise<void> | undefined;
+  let approvals: ApprovalScreen | undefined;
+  let resolveExit: (() => void) | undefined;
+  const stopped = () => {
+    if (closed) return;
+    closed = true;
+    modelSetup?.controller.abort();
+    modelSetup?.prompt.cancel();
+    chat.cancel();
+    chatPrompt?.cancel();
+    if (tui.hasOverlay()) tui.hideOverlay();
+    resolveExit?.();
+  };
+  const refresh = (destination: WorkbenchDestination) => {
+    const startedAtReloadEpoch = modelSetupReloadEpoch;
+    void loadDestination(options.client, destination, chat, inspector).then((loaded) => {
+      if (
+        loaded &&
+        startedAtReloadEpoch === modelSetupReloadEpoch &&
+        (destination === "providers" || destination === "profiles")
+      ) {
+        modelSetupReloadRequired = false;
+      }
+    }).finally(() => tui.requestRender());
+  };
+  const navigation = new NavigationScreen(refresh);
+  tui.addChild(new WorkbenchLayout(navigation, chat, inspector));
+  tui.setFocus(navigation);
+  const finished = new Promise<void>((resolve) => { resolveExit = resolve; });
+
+  try {
+    tui.addInputListener((data) => {
+      if (matchesKey(data, "ctrl+c")) {
+        stopped();
+        return { consume: true };
+      }
+      if (matchesKey(data, "c") && chatPrompt === undefined && !modelSetupPending && !tui.hasOverlay()) {
+        const prompt = new PiTuiPrompt(tui);
+        chatPrompt = prompt;
+        const action = submitChat(prompt, chat).catch((error: unknown) => {
+          if (!closed) inspector.showProblem(safeProblem(error, "run_create_failed", "The Run could not be created."));
+        }).finally(() => {
+          if (chatPrompt === prompt) chatPrompt = undefined;
+          tui.setFocus(navigation);
+          tui.requestRender();
+        });
+        latestChatAction = action;
+        return { consume: true };
+      }
+      if (matchesKey(data, "r") && !tui.hasOverlay()) {
+        if (chat.busy) return { consume: true };
+        const action = chat.reconnect().then(() => undefined).catch((error: unknown) => {
+          inspector.showProblem(safeProblem(error, "run_stream_failed", "The committed Run stream is unavailable."));
+        }).finally(() => tui.requestRender());
+        latestChatAction = action;
+        return { consume: true };
+      }
+      if (matchesKey(data, "a") && !modelSetupPending && !tui.hasOverlay()) {
+        const screen = new ApprovalScreen({
+          client: options.client,
+          onChange: () => tui.requestRender(),
+          onExit: () => {
+            if (approvals !== screen) return;
+            approvals = undefined;
+            if (tui.hasOverlay()) tui.hideOverlay();
+            tui.setFocus(navigation);
+            tui.requestRender();
+          },
+        });
+        approvals = screen;
+        tui.showOverlay(screen, { width: "75%", maxHeight: "80%" });
+        tui.setFocus(screen);
+        void screen.load();
+        return { consume: true };
+      }
+      if (!matchesKey(data, "m") || modelSetupPending) return undefined;
+      if (modelSetupReloadRequired) {
+        inspector.showConflict();
+        tui.requestRender();
+        return { consume: true };
+      }
+      modelSetupPending = true;
+      const controller = new AbortController();
+      const prompt = new PiTuiPrompt(tui);
+      const done = runModelSetupScreen({
+        prompt,
+        client: options.client,
+        signal: controller.signal,
+        write: () => undefined,
+        onProgress: (progress) => {
+          chat.show("profiles", [modelSetupLabel(progress)]);
+          tui.requestRender();
+        },
+      }).then((outcome) => {
+        if (outcome.status === "conflict") {
+          prompt.cancel();
+          modelSetupReloadEpoch += 1;
+          modelSetupReloadRequired = true;
+          chat.show("profiles", ["Model setup stopped. Reload required."]);
+          inspector.showConflict();
+          return;
+        }
+        refresh("profiles");
+      }, () => {
+        inspector.showProblem({
+          code: "service_unavailable",
+          detail: "Model setup is unavailable.",
+          traceId: "tui",
+        });
+      }).finally(() => {
+        modelSetupPending = false;
+        modelSetup = undefined;
+        tui.setFocus(navigation);
+        tui.requestRender();
+      });
+      modelSetup = { controller, prompt, done };
+      latestModelSetup = done;
+      return { consume: true };
+    });
+    tui.start();
+    tui.requestRender(true);
+    await finished;
+    await latestModelSetup;
+    await latestChatAction;
+    await approvals?.settled();
+    return 0;
+  } finally {
+    if (!closed && tui.hasOverlay()) tui.hideOverlay();
+    closed = true;
+    tui.stop();
+  }
+}
+
+async function submitChat(prompt: PiTuiPrompt, chat: ChatScreen): Promise<void> {
+  const agentId = await prompt.input("Agent ID");
+  const sessionKey = await prompt.input("Session Key");
+  const text = await prompt.input("Message");
+  await chat.submit({ agentId, sessionKey, text });
+}
+
+function safeProblem(
+  error: unknown,
+  fallbackCode: string,
+  fallbackDetail: string,
+): { readonly code: string; readonly detail: string; readonly traceId: string } {
+  if (typeof error !== "object" || error === null) {
+    return { code: fallbackCode, detail: fallbackDetail, traceId: "tui" };
+  }
+  const candidate = error as { code?: unknown; detail?: unknown; traceId?: unknown };
+  return {
+    code: typeof candidate.code === "string" ? candidate.code : fallbackCode,
+    detail: typeof candidate.detail === "string" ? candidate.detail : fallbackDetail,
+    traceId: typeof candidate.traceId === "string" ? candidate.traceId : "tui",
+  };
+}
+
+async function loadDestination(
+  client: WorkbenchClient,
+  destination: WorkbenchDestination,
+  chat: ChatScreen,
+  inspector: InspectorScreen,
+): Promise<boolean> {
+  chat.show(destination, ["Loading..."]);
+  inspector.clear();
+  try {
+    if (destination === "agents") {
+      const response = await client.listAgents();
+      chat.show(destination, response.agents.length === 0
+        ? ["No Agents are available."]
+        : response.agents.map((agent) => `${agent.displayName} (${agent.id})`));
+      return true;
+    }
+    if (destination === "providers") {
+      const response = await client.listProviderConnections();
+      chat.show(destination, response.connections.length === 0
+        ? ["No Provider Connections are available."]
+        : response.connections.map((connection) => `${connection.displayName} (${connection.connectionId})`));
+      return true;
+    }
+    if (destination === "profiles") {
+      const response = await client.listModelProfiles();
+      chat.show(destination, response.profiles.length === 0
+        ? ["No Model Profiles are available. Press m to set up a model."]
+        : response.profiles.map((profile) => `${profile.displayName} (${profile.profileId})`));
+      return true;
+    }
+    chat.show(destination);
+    return true;
+  } catch {
+    inspector.showProblem({
+      code: "service_unavailable",
+      detail: "The control plane is unavailable.",
+      traceId: "tui",
+    });
+    return false;
+  }
+}
+
+function modelSetupLabel(progress: string): string {
+  return `Model setup: ${progress.replace(/_/gu, " ")}`;
+}
+
+class WorkbenchLayout implements Component {
+  constructor(
+    private readonly navigation: NavigationScreen,
+    private readonly chat: ChatScreen,
+    private readonly inspector: InspectorScreen,
+  ) {}
+
+  render(width: number): string[] {
+    if (width < 36) return [
+      ...this.navigation.render(width),
+      ...this.chat.render(width),
+      ...this.inspector.render(width),
+    ];
+    const navigationWidth = Math.max(14, Math.floor(width * 0.22));
+    const inspectorWidth = Math.max(18, Math.floor(width * 0.28));
+    const chatWidth = Math.max(1, width - navigationWidth - inspectorWidth - 2);
+    const navigation = this.navigation.render(navigationWidth);
+    const chat = this.chat.render(chatWidth);
+    const inspector = this.inspector.render(inspectorWidth);
+    const height = Math.max(navigation.length, chat.length, inspector.length);
+    return Array.from({ length: height }, (_, index) => line(
+      navigation[index] ?? "", navigationWidth, chat[index] ?? "", chatWidth,
+      inspector[index] ?? "", inspectorWidth, width,
+    ));
+  }
+
+  invalidate(): void {}
+}
+
+function line(navigation: string, navigationWidth: number, chat: string, chatWidth: number, inspector: string, inspectorWidth: number, width: number): string {
+  return truncateToWidth([
+    pad(navigation, navigationWidth), pad(chat, chatWidth), pad(inspector, inspectorWidth),
+  ].join(" "), width);
+}
+
+function pad(value: string, width: number): string {
+  const truncated = truncateToWidth(value, width);
+  return `${truncated}${" ".repeat(Math.max(0, width - visibleWidth(truncated)))}`;
+}

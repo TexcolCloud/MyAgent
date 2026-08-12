@@ -9,6 +9,7 @@ import type {
   ProviderKind,
   RegistryRevisionState,
 } from "./model-registry.js";
+import type { ProviderDriverId } from "./pi-runtime.js";
 
 export type ProviderAuth =
   | { readonly type: "bearer"; readonly secret: Readonly<SecretRef> }
@@ -30,6 +31,7 @@ export interface ProviderConnectionView {
   readonly connectionId: ProviderConnectionId;
   readonly displayName: string;
   readonly providerKind: ProviderKind;
+  readonly providerDriver?: ProviderDriverId;
   readonly activeRevisionId: ProviderConnectionRevisionId | null;
   readonly retiredAt: Date | null;
   readonly recordRevision: number;

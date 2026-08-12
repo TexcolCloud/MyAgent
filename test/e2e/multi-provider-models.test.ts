@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
+import { bootstrap } from "../../src/bootstrap.js";
+import type { ProviderEgressGatewayListen } from "../../src/adapters/provider-egress-gateway.js";
 import { executeCli } from "../../src/interfaces/cli/main.js";
 import { FakeOpenAiProvider } from "../helpers/fake-openai-provider.js";
 import {
@@ -14,6 +18,362 @@ import {
 } from "../helpers/start-test-app.js";
 
 describe("multi-provider model registry release isolation", () => {
+  it("closes the provider gateway when later service startup fails", async () => {
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const occupied = cleanup.use(
+        await FakeOpenAiProvider.start({ models: ["occupied"] }),
+        (active) => active.close(),
+      );
+      const fixture = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await fixture.stop();
+      let gatewayUrl = "";
+      let gatewayStops = 0;
+
+      const startup = await bootstrap(fixture.configPath, {
+        listen: {
+          host: "127.0.0.1",
+          port: Number(new URL(occupied.baseUrl).port),
+        },
+        signals: false,
+        providerGateway: {
+          listen: captureGatewayUrl((url) => { gatewayUrl = url; }),
+          onStopped: () => { gatewayStops += 1; },
+        },
+      }).then(
+        (service) => ({ service }),
+        (error: unknown) => ({ error }),
+      );
+      if ("service" in startup) await startup.service.shutdown();
+
+      expect("error" in startup).toBe(true);
+      expect(gatewayUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/u);
+      expect(gatewayStops).toBe(1);
+      await expect(fetch(gatewayUrl, { signal: AbortSignal.timeout(1_000) }))
+        .rejects.toThrow();
+    } finally {
+      await cleanup.dispose();
+    }
+  });
+
+  it("closes the provider gateway during normal service shutdown", async () => {
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const fixture = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await fixture.stop();
+      let gatewayUrl = "";
+      let gatewayStops = 0;
+      const service = await bootstrap(fixture.configPath, {
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        providerGateway: {
+          listen: captureGatewayUrl((url) => { gatewayUrl = url; }),
+          onStopped: () => { gatewayStops += 1; },
+        },
+      });
+
+      await service.shutdown();
+      await service.shutdown();
+
+      expect(gatewayStops).toBe(1);
+      await expect(fetch(gatewayUrl, { signal: AbortSignal.timeout(1_000) }))
+        .rejects.toThrow();
+    } finally {
+      await cleanup.dispose();
+    }
+  });
+
+  it("keeps HTTP controls available when the Pi gateway listener cannot start", async () => {
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const fixture = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await fixture.stop();
+      let gatewayStops = 0;
+      const service = await bootstrap(fixture.configPath, {
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        providerGateway: {
+          listen: async () => { throw new Error("gateway_listener_unavailable"); },
+          onStopped: () => { gatewayStops += 1; },
+        },
+      });
+
+      const ready = await fetch(`${service.url}/readyz`);
+      await service.shutdown();
+
+      expect(ready.status).toBe(200);
+      expect(await ready.json()).toEqual({ ready: true });
+      expect(gatewayStops).toBe(1);
+    } finally {
+      await cleanup.dispose();
+    }
+  });
+
+  it("keeps an active Pi assignment byte-stable when gateway startup fails", async () => {
+    const providerSecret = "PI_GATEWAY_FAILURE_SECRET_MARKER";
+    const previousSecret = process.env.RELEASE_PI_API_KEY;
+    process.env.RELEASE_PI_API_KEY = providerSecret;
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["deepseek-v4-flash"],
+        expectedApiKey: providerSecret,
+        chat: [
+          { type: "verification_text", text: "Pi verification passed" },
+          { type: "verification_tool", callId: "verify-pi-gateway-failure" },
+        ],
+      }), (active) => active.close());
+      const fixture = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await fixture.setupVerifiedModel({
+        connectionSlug: "pi-gateway-failure",
+        profileSlug: "pi-gateway-failure",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "deepseek-v4-flash",
+        protocol: "responses",
+        driverId: "pi/deepseek",
+        catalogCandidateId: "pi/deepseek:deepseek-v4-flash",
+        apiKeyEnvironment: "RELEASE_PI_API_KEY",
+        agentId: "primary",
+      });
+      const frozenAssignment = assignmentSnapshot(fixture.databasePath, "primary");
+      await fixture.stop();
+      provider.clearCapturedRequests();
+      let gatewayStops = 0;
+      const service = await bootstrap(fixture.configPath, {
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        providerGateway: {
+          listen: async () => { throw new Error("gateway_listener_unavailable"); },
+          onStopped: () => { gatewayStops += 1; },
+        },
+      });
+      cleanup.use(service, (active) => active.shutdown());
+
+      const ready = await fetch(`${service.url}/readyz`);
+      const assignmentResponse = await serviceRequest(
+        service.url,
+        "admin-test-token",
+        "/v1/admin/agents/primary/model-assignment",
+      );
+      const run = await jsonRequest(serviceRequest(
+        service.url,
+        "run-test-token",
+        "/v1/runs",
+        {
+          method: "POST",
+          headers: { "idempotency-key": "pi-gateway-failure-run" },
+          body: JSON.stringify({
+            agentId: "primary",
+            sessionKey: "release:pi-gateway-failure",
+            input: { type: "text", text: "This must fail closed." },
+          }),
+        },
+      ), 202) as { runId: string };
+      const failed = await waitForRunState(service.url, run.runId, "failed");
+
+      expect({ status: ready.status, body: await ready.json() }).toEqual({
+        status: 200,
+        body: { ready: true },
+      });
+      expect({ status: assignmentResponse.status, body: await assignmentResponse.json() })
+        .toMatchObject({ status: 200, body: { state: "assigned" } });
+      expect(failed).toMatchObject({
+        status: "failed",
+        failure: { code: "provider_unavailable" },
+      });
+      expect(assignmentSnapshot(fixture.databasePath, "primary"))
+        .toBe(frozenAssignment);
+      expect(provider.chatRequests).toEqual([]);
+      expect(provider.responsesRequests).toEqual([]);
+      await service.shutdown();
+      expect(gatewayStops).toBe(1);
+    } finally {
+      restoreEnvironment("RELEASE_PI_API_KEY", previousSecret);
+      await cleanup.dispose();
+    }
+  }, 25_000);
+
+  it("runs a new Pi profile through the gateway without exposing its Secret", async () => {
+    const providerSecret = "PI_PROVIDER_SECRET_RELEASE_MARKER";
+    const previousSecret = process.env.RELEASE_PI_API_KEY;
+    process.env.RELEASE_PI_API_KEY = providerSecret;
+    const gatewayRequests: string[] = [];
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["deepseek-v4-flash"],
+        expectedApiKey: providerSecret,
+        chat: [
+          { type: "verification_text", text: "Pi text verification passed" },
+          { type: "verification_tool", callId: "verify-pi-gateway" },
+          { type: "text", text: "Pi gateway run completed" },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp({
+        providerGateway: {
+          listen: captureGatewayTraffic(gatewayRequests),
+        },
+      }), (active) => active.close());
+      const setup = await service.setupVerifiedModel({
+        connectionSlug: "pi-gateway-release",
+        profileSlug: "pi-gateway-release",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "deepseek-v4-flash",
+        protocol: "responses",
+        driverId: "pi/deepseek",
+        catalogCandidateId: "pi/deepseek:deepseek-v4-flash",
+        apiKeyEnvironment: "RELEASE_PI_API_KEY",
+        agentId: "primary",
+      });
+      const run = await service.createRun({
+        agentId: "primary",
+        sessionKey: "release:pi-gateway",
+        text: "Complete through the controlled Pi route.",
+        idempotencyKey: "pi-gateway-release-run",
+      });
+      await service.waitForRunStatus(run.runId, "completed");
+      const events = await service.readRunEvents(run.runId);
+      const runResponse = await service.runRequest(`/v1/runs/${run.runId}`);
+      const runView = await runResponse.json();
+
+      expect(gatewayRequests.length).toBeGreaterThanOrEqual(3);
+      expect(gatewayRequests.every((requestPath) => requestPath.startsWith("/pi/")))
+        .toBe(true);
+      expect(provider.chatRequests).toHaveLength(3);
+      expect(provider.chatRequests.every(({ credentialMatched }) => credentialMatched))
+        .toBe(true);
+      expect(JSON.stringify({
+        setup,
+        setupResponses: service.setupResponseBodies,
+        events,
+        runView,
+        logs: service.logs,
+        gatewayRequests,
+        providerRequests: provider.chatRequests,
+      })).not.toContain(providerSecret);
+      expect((await readFile(service.databasePath)).includes(Buffer.from(providerSecret)))
+        .toBe(false);
+    } finally {
+      restoreEnvironment("RELEASE_PI_API_KEY", previousSecret);
+      await cleanup.dispose();
+    }
+  }, 30_000);
+
+  it("runs a manually selected OpenAI-compatible Profile through the Pi gateway", async () => {
+    const gatewayRequests: string[] = [];
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["manual-compatible-model"],
+        chat: [
+          { type: "verification_text", text: "Manual verification passed" },
+          { type: "verification_tool", callId: "verify-manual-compatible" },
+          { type: "text", text: "Manual Pi gateway run completed" },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp({
+        providerGateway: {
+          listen: captureGatewayTraffic(gatewayRequests),
+        },
+      }), (active) => active.close());
+      await service.setupVerifiedModel({
+        connectionSlug: "manual-pi-gateway",
+        profileSlug: "manual-pi-gateway",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "manual-compatible-model",
+        protocol: "chat_completions",
+        agentId: "primary",
+      });
+      const run = await service.createRun({
+        agentId: "primary",
+        sessionKey: "release:manual-pi-gateway",
+        text: "Use the persisted Pi runtime.",
+        idempotencyKey: "manual-pi-gateway-run",
+      });
+
+      await service.waitForRunStatus(run.runId, "completed");
+
+      expect(gatewayRequests).toHaveLength(3);
+      expect(gatewayRequests.every((requestPath) => requestPath.startsWith("/pi/")))
+        .toBe(true);
+      expect(provider.chatRequests).toHaveLength(3);
+      const manualRunPayload = provider.chatRequests[2]?.body;
+      expect(manualRunPayload).toMatchObject({
+        model: "manual-compatible-model",
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            role: "user",
+            content: expect.stringContaining("Use the persisted Pi runtime."),
+          }),
+        ]),
+        stream: true,
+        tools: expect.arrayContaining([
+          expect.objectContaining({
+            type: "function",
+            function: expect.objectContaining({ name: "read_file" }),
+          }),
+        ]),
+      });
+      expect(manualRunPayload).not.toHaveProperty("store");
+      expect(manualRunPayload).not.toHaveProperty("tools[0].function.strict");
+    } finally {
+      await cleanup.dispose();
+    }
+  }, 30_000);
+
+  it("keeps a manual Responses payload compatible through the Pi gateway", async () => {
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["manual-compatible-responses"],
+        responses: [
+          { type: "verification_text", text: "Manual Responses verification passed" },
+          { type: "verification_tool", callId: "verify-manual-responses" },
+          { type: "text", text: "Manual Responses gateway run completed" },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await service.setupVerifiedModel({
+        connectionSlug: "manual-responses-gateway",
+        profileSlug: "manual-responses-gateway",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "manual-compatible-responses",
+        protocol: "responses",
+        agentId: "primary",
+      });
+      const run = await service.createRun({
+        agentId: "primary",
+        sessionKey: "release:manual-responses-gateway",
+        text: "Use the persisted manual Responses runtime.",
+        idempotencyKey: "manual-responses-gateway-run",
+      });
+
+      await service.waitForRunStatus(run.runId, "completed");
+
+      expect(provider.responsesRequests).toHaveLength(3);
+      const manualRunPayload = provider.responsesRequests[2]?.body;
+      expect(manualRunPayload).toMatchObject({
+        model: "manual-compatible-responses",
+        input: expect.arrayContaining([
+          expect.objectContaining({
+            role: "user",
+          }),
+        ]),
+        stream: true,
+        tools: expect.arrayContaining([
+          expect.objectContaining({ type: "function", name: "read_file" }),
+        ]),
+      });
+      expect(JSON.stringify(manualRunPayload)).toContain(
+        "Use the persisted manual Responses runtime.",
+      );
+      expect(manualRunPayload).not.toHaveProperty("store");
+      expect(manualRunPayload).not.toHaveProperty("tools[0].strict");
+    } finally {
+      await cleanup.dispose();
+    }
+  }, 30_000);
+
   it("cleans partial service startup before closing an earlier provider", async () => {
     const cleanup = createAsyncCleanupStack();
     let providerModelsUrl = "";
@@ -682,7 +1042,7 @@ describe("multi-provider model registry release isolation", () => {
       );
       expect(redirectFailure).toMatchObject({
         status: "failed",
-        resultCode: "model_protocol_error",
+        resultCode: "provider_unavailable",
       });
       expect(redirectSource.responsesRequests.length).toBeGreaterThan(0);
       expect(redirectTarget.requests).toEqual([]);
@@ -818,10 +1178,84 @@ describe("multi-provider model registry release isolation", () => {
   }, 35_000);
 });
 
+function captureGatewayUrl(capture: (url: string) => void): ProviderEgressGatewayListen {
+  return async (server, address) => {
+    await listen(server, address.host, address.port);
+    const actual = server.address() as AddressInfo;
+    capture(`http://${address.host}:${String(actual.port)}`);
+  };
+}
+
+function captureGatewayTraffic(requestPaths: string[]): ProviderEgressGatewayListen {
+  return async (server, address) => {
+    server.on("request", (request) => {
+      requestPaths.push(request.url ?? "");
+    });
+    await listen(server, address.host, address.port);
+  };
+}
+
+async function listen(server: Server, host: string, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
 async function jsonRequest(responsePromise: Promise<Response>, status: number): Promise<unknown> {
   const response = await responsePromise;
   expect(response.status).toBe(status);
   return response.status === 204 ? null : response.json();
+}
+
+function assignmentSnapshot(databasePath: string, agentId: string): string {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    return JSON.stringify(database.prepare(
+      "SELECT * FROM model_assignments WHERE agent_id = ?",
+    ).get(agentId));
+  } finally {
+    database.close();
+  }
+}
+
+function serviceRequest(
+  serviceUrl: string,
+  token: string,
+  pathname: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  return fetch(`${serviceUrl}${pathname}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(init.body === undefined ? {} : { "content-type": "application/json" }),
+      ...init.headers,
+    },
+  });
+}
+
+async function waitForRunState(
+  serviceUrl: string,
+  runId: string,
+  expected: string,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    const response = await serviceRequest(
+      serviceUrl,
+      "run-test-token",
+      `/v1/runs/${runId}`,
+    );
+    expect(response.status).toBe(200);
+    const run = await response.json() as Record<string, unknown>;
+    if (run.status === expected) return run;
+    if (Date.now() >= deadline) throw new Error(`run_status_timeout:${String(run.status)}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 async function waitForVerificationFailure(
@@ -890,4 +1324,9 @@ async function queueCandidateVerification(
     },
   ), 202) as { verificationId: string };
   return queued.verificationId;
+}
+
+function restoreEnvironment(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
 }

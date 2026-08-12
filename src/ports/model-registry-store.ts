@@ -22,6 +22,7 @@ import type {
 } from "../domain/model-profile.js";
 import type { DiscoveryView, ProviderKind } from "../domain/model-registry.js";
 import type { ModelVerification } from "../domain/model-verification.js";
+import type { ProviderDriverId } from "../domain/pi-runtime.js";
 import type {
   ProviderConnectionRevision,
   ProviderConnectionView,
@@ -37,6 +38,7 @@ export interface CreateConnectionRecord extends MutationContext {
   readonly connectionId: ProviderConnectionId;
   readonly displayName: string;
   readonly providerKind: ProviderKind;
+  readonly providerDriver?: ProviderDriverId;
   readonly revision: ProviderConnectionRevision;
 }
 
@@ -191,6 +193,7 @@ export interface RecordProviderHealthInput {
 
 export interface ExactProviderConnectionRevision {
   readonly providerKind: ProviderKind;
+  readonly providerDriver?: ProviderDriverId;
   readonly revision: ProviderConnectionRevision;
 }
 

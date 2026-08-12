@@ -2,11 +2,73 @@ import { describe, expect, it } from "vitest";
 
 import { DomainError } from "../../src/domain/errors.js";
 import { ModelProviderError } from "../../src/ports/model.js";
+import { CliHttpError } from "../../src/interfaces/cli/client.js";
+import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
 import { startTestApp } from "../helpers/start-test-app.js";
 
 const adminHeaders = { authorization: "Bearer test-admin-token" } as const;
 
 describe("HTTP model control plane", () => {
+  it("exposes revision conflicts to the TUI as typed HTTP errors without credential content", async () => {
+    const harness = await startTestApp();
+    try {
+      const client = new TuiClient({
+        apiUrl: "http://tui.test",
+        runToken: "test-run-token",
+        adminToken: "test-admin-token",
+        fetcher: async (input, init) => {
+          const url = new URL(String(input));
+          const response = await harness.app.inject({
+            method: (init?.method ?? "GET") as "GET" | "POST",
+            url: `${url.pathname}${url.search}`,
+            remoteAddress: "127.0.0.1",
+            headers: Object.fromEntries(new Headers(init?.headers).entries()),
+            ...(init?.body === undefined ? {} : { payload: String(init.body) }),
+          });
+          return new Response(response.payload, {
+            status: response.statusCode,
+          });
+        },
+      });
+      await client.adminRequest("/v1/admin/provider-connections", {
+        method: "POST",
+        body: {
+          slug: "tui-conflict-provider",
+          displayName: "TUI Conflict Provider",
+          kind: "openai_compatible",
+          baseUrl: "https://models.example.test/v1",
+          auth: { type: "none" },
+          allowInsecureHttp: false,
+          protocolPreference: "chat_completions",
+        },
+      });
+      const revision = {
+        expectedRevision: 0,
+        displayName: "TUI Conflict Provider v2",
+        baseUrl: "https://models.example.test/v2",
+        auth: { type: "api_key" },
+        apiKey: "provider-secret",
+        allowInsecureHttp: false,
+        protocolPreference: "responses",
+      } as const;
+      await client.adminRequest("/v1/admin/provider-connections/tui-conflict-provider/revisions", {
+        method: "POST",
+        body: revision,
+      });
+
+      const conflict = await client.adminRequest("/v1/admin/provider-connections/tui-conflict-provider/revisions", {
+        method: "POST",
+        body: revision,
+      }).then(() => undefined, (error: unknown) => error);
+
+      expect(conflict).toBeInstanceOf(CliHttpError);
+      expect(conflict).toMatchObject({ status: 409, code: "revision_conflict" });
+      expect(String(conflict)).not.toContain("provider-secret");
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("maps missing control-plane resources to generic typed Problems", async () => {
     const harness = await startTestApp();
     try {
@@ -220,6 +282,144 @@ describe("HTTP model control plane", () => {
         ],
       });
       expect(response.payload).not.toContain("needle-provider-secret");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("creates a native Provider Connection from a server-resolved Driver", async () => {
+    const harness = await startTestApp();
+    try {
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "native-openai",
+          displayName: "Native OpenAI",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toMatchObject({
+        connectionId: "native-openai",
+        providerKind: "openai",
+        providerDriver: "pi/openai",
+      });
+      expect(harness.modelRegistry.getConnection("native-openai" as never))
+        .toMatchObject({ providerDriver: "pi/openai" });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a bearer-only native Driver Connection without its required credential", async () => {
+    const harness = await startTestApp();
+    try {
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "deepseek-without-bearer",
+          displayName: "DeepSeek Without Bearer",
+          driverId: "pi/deepseek",
+          auth: { type: "none" },
+        },
+      });
+
+      expect(response.statusCode).toBe(422);
+      expect(response.json()).toMatchObject({ code: "invalid_provider_connection" });
+      expect(harness.modelRegistry.listConnections()).not.toContainEqual(
+        expect.objectContaining({ connectionId: "deepseek-without-bearer" }),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a bearer-only native Driver Connection revision without its required credential", async () => {
+    const harness = await startTestApp();
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "deepseek-revision-bearer",
+          displayName: "DeepSeek Revision Bearer",
+          driverId: "pi/deepseek",
+          auth: { type: "environment", fromEnvironment: "DEEPSEEK_API_KEY" },
+        },
+      });
+      expect(created.statusCode).toBe(201);
+
+      const revised = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections/deepseek-revision-bearer/revisions",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          expectedRevision: 0,
+          displayName: "DeepSeek Revision Bearer",
+          baseUrl: "https://api.deepseek.com/v1",
+          auth: { type: "none" },
+          allowInsecureHttp: false,
+          protocolPreference: "responses",
+        },
+      });
+
+      expect(revised.statusCode).toBe(422);
+      expect(revised.json()).toMatchObject({ code: "invalid_provider_connection" });
+      expect(harness.modelRegistry.getConnection("deepseek-revision-bearer" as never))
+        .toMatchObject({ recordRevision: 0 });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a mismatched Driver on a Provider Connection revision", async () => {
+    const harness = await startTestApp();
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "immutable-driver",
+          displayName: "Immutable Driver",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+      expect(created.statusCode).toBe(201);
+
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections/immutable-driver/revisions",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          expectedRevision: 0,
+          displayName: "Immutable Driver",
+          driverId: "pi/deepseek",
+          baseUrl: "https://api.openai.com/v1",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+          allowInsecureHttp: false,
+          protocolPreference: "responses",
+        },
+      });
+
+      expect(response.statusCode).toBe(422);
+      expect(response.json()).toMatchObject({ code: "invalid_provider_connection" });
+      expect(harness.modelRegistry.getConnection("immutable-driver" as never))
+        .toMatchObject({ recordRevision: 0, providerDriver: "pi/openai" });
     } finally {
       await harness.close();
     }
@@ -617,8 +817,7 @@ describe("HTTP model control plane", () => {
           slug: "gpt-mini",
           displayName: "GPT Mini",
           connectionRevisionId,
-          modelId: "gpt-4o-mini",
-          protocol: "auto",
+          catalogCandidateId: "pi/openai:gpt-4o-mini",
         },
       });
       expect(created.statusCode).toBe(201);
@@ -631,7 +830,8 @@ describe("HTTP model control plane", () => {
           expect.objectContaining({
             connectionRevisionId,
             providerModelId: "gpt-4o-mini",
-            invocationProtocol: "responses",
+            catalogCandidateId: "pi/openai:gpt-4o-mini",
+            invocationProtocol: "pi_ai",
             maxInputTokens: 128_000,
             contextWindowSource: "preset",
             state: "draft",
@@ -666,12 +866,260 @@ describe("HTTP model control plane", () => {
           slug: "gpt-mini",
           displayName: "Duplicate GPT Mini",
           connectionRevisionId,
-          modelId: "gpt-4o-mini",
-          protocol: "responses",
+          catalogCandidateId: "pi/openai:gpt-4o-mini",
         },
       });
       expect(duplicate.statusCode).toBe(409);
       expect(duplicate.json()).toMatchObject({ code: "resource_conflict" });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("creates a Pi Model Profile from a server-resolved catalog Candidate", async () => {
+    const harness = await startTestApp({
+      modelDiscovery: {
+        discover: async () => ({
+          state: "fresh",
+          models: [{ id: "gpt-4.1-mini", owner: "openai" }],
+          fetchedAt: new Date("2026-08-07T00:00:00.000Z"),
+        }),
+      },
+    });
+    try {
+      const connection = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "catalog-openai",
+          displayName: "Catalog OpenAI",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+      const connectionRevisionId = connection.json().revisions[0].revisionId as string;
+      const discovery = await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/provider-connection-revisions/${connectionRevisionId}/discover`,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: { expectedRevision: 0 },
+      });
+      expect(discovery.statusCode).toBe(200);
+
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/model-profiles",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "catalog-gpt-mini",
+          displayName: "Catalog GPT Mini",
+          connectionRevisionId,
+          catalogCandidateId: "pi/openai:gpt-4.1-mini",
+          maxInputTokens: 65_536,
+          contextWindowSource: "operator",
+        },
+      });
+
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toMatchObject({
+        revisions: [expect.objectContaining({
+          providerModelId: "gpt-4.1-mini",
+          catalogCandidateId: "pi/openai:gpt-4.1-mini",
+          invocationProtocol: "pi_ai",
+          maxInputTokens: 65_536,
+          contextWindowSource: "operator",
+        })],
+      });
+      expect(harness.modelRegistry.getProfile("catalog-gpt-mini" as never))
+        .toMatchObject({
+          revisions: [expect.objectContaining({
+            piRuntime: expect.objectContaining({
+              kind: "pi_ai",
+              piVersion: "0.73.1",
+              driverId: "pi/openai",
+              modelId: "gpt-4.1-mini",
+              api: expect.any(String),
+            }),
+          })],
+        });
+
+      for (const [slug, catalogCandidateId, code] of [
+        ["unknown-candidate", "pi/openai:not-in-catalog", "invalid_model_profile"],
+        ["mismatched-candidate", "pi/deepseek:deepseek-chat", "invalid_model_profile"],
+        ["undiscovered-candidate", "pi/openai:gpt-4o-mini", "manual_model_entry_required"],
+      ] as const) {
+        const rejected = await harness.app.inject({
+          method: "POST",
+          url: "/v1/admin/model-profiles",
+          remoteAddress: "127.0.0.1",
+          headers: adminHeaders,
+          payload: {
+            slug,
+            displayName: slug,
+            connectionRevisionId,
+            catalogCandidateId,
+          },
+        });
+        expect(rejected.statusCode).toBe(422);
+        expect(rejected.json()).toMatchObject({ code });
+      }
+      expect(harness.modelRegistry.listProfiles()).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ profileId: "unknown-candidate" }),
+          expect.objectContaining({ profileId: "mismatched-candidate" }),
+          expect.objectContaining({ profileId: "undiscovered-candidate" }),
+        ]),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a catalog Candidate when an inconsistent native Connection has no bearer credential", async () => {
+    const harness = await startTestApp({
+      modelDiscovery: {
+        discover: async () => ({
+          state: "fresh",
+          models: [{ id: "gpt-4.1-mini", owner: "openai" }],
+          fetchedAt: new Date("2026-08-07T00:00:00.000Z"),
+        }),
+      },
+    });
+    try {
+      const connection = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "inconsistent-native-auth",
+          displayName: "Inconsistent Native Auth",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+      expect(connection.statusCode).toBe(201);
+      const connectionRevisionId = connection.json().revisions[0].revisionId as string;
+      harness.connection.db.exec(
+        "DROP TRIGGER provider_connection_revisions_content_immutable",
+      );
+      harness.connection.db.prepare(
+        "UPDATE provider_connection_revisions SET auth_json = ? WHERE revision_id = ?",
+      ).run('{"type":"none"}', connectionRevisionId);
+      const discovery = await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/provider-connection-revisions/${connectionRevisionId}/discover`,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: { expectedRevision: 0 },
+      });
+      expect(discovery.statusCode).toBe(200);
+
+      const profile = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/model-profiles",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "inconsistent-native-profile",
+          displayName: "Inconsistent Native Profile",
+          connectionRevisionId,
+          catalogCandidateId: "pi/openai:gpt-4.1-mini",
+        },
+      });
+
+      expect(profile.statusCode).toBe(422);
+      expect(profile.json()).toMatchObject({ code: "invalid_model_profile" });
+      expect(harness.modelRegistry.listProfiles()).not.toContainEqual(
+        expect.objectContaining({ profileId: "inconsistent-native-profile" }),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects the manual Model Profile shape for a native Driver", async () => {
+    const harness = await startTestApp({
+      modelDiscovery: {
+        discover: async () => ({
+          state: "fresh",
+          models: [{ id: "gpt-4.1-mini" }],
+          fetchedAt: new Date("2026-08-07T00:00:00.000Z"),
+        }),
+      },
+    });
+    try {
+      const connection = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "strict-native",
+          displayName: "Strict Native",
+          driverId: "pi/openai",
+          auth: { type: "environment", fromEnvironment: "OPENAI_API_KEY" },
+        },
+      });
+      const connectionRevisionId = connection.json().revisions[0].revisionId as string;
+      await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/provider-connection-revisions/${connectionRevisionId}/discover`,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: { expectedRevision: 0 },
+      });
+
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/model-profiles",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "forbidden-native-manual",
+          displayName: "Forbidden Native Manual",
+          connectionRevisionId,
+          modelId: "gpt-4.1-mini",
+          protocol: "responses",
+        },
+      });
+
+      expect(response.statusCode).toBe(422);
+      expect(response.json()).toMatchObject({ code: "invalid_model_profile" });
+      expect(harness.modelRegistry.listProfiles()).not.toContainEqual(
+        expect.objectContaining({ profileId: "forbidden-native-manual" }),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects a client-supplied Pi invocation instead of persisting it", async () => {
+    const harness = await startTestApp();
+    try {
+      const response = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/model-profiles",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "forged-pi-profile",
+          displayName: "Forged Pi Profile",
+          connectionRevisionId: "pcr_forged",
+          catalogCandidateId: "pi/openai:gpt-4.1-mini",
+          invocation: { kind: "pi_ai", api: "made-up-api" },
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({ code: "invalid_request" });
+      expect(harness.modelRegistry.listProfiles()).not.toContainEqual(
+        expect.objectContaining({ profileId: "forged-pi-profile" }),
+      );
     } finally {
       await harness.close();
     }
@@ -755,6 +1203,37 @@ describe("HTTP model control plane", () => {
           contextWindowSource: "assumed_32768",
         })],
       });
+      expect(assumed.json().revisions[0]).not.toHaveProperty("catalogCandidateId");
+      expect(harness.modelRegistry.getProfile("manual-profile" as never)).toMatchObject({
+        revisions: [expect.objectContaining({
+          piRuntime: {
+            kind: "pi_ai",
+            piVersion: "0.73.1",
+            driverId: "pi/openai-compatible",
+            catalogProviderId: "openai-compatible",
+            api: "openai-completions",
+            modelId: "custom-model",
+            contextWindow: 32_768,
+            compatibility: {
+              supportsStore: false,
+              supportsDeveloperRole: false,
+              supportsReasoningEffort: false,
+              supportsUsageInStreaming: false,
+              maxTokensField: "max_tokens",
+              requiresToolResultName: false,
+              requiresAssistantAfterToolResult: false,
+              requiresThinkingAsText: false,
+              requiresReasoningContentOnAssistantMessages: false,
+              thinkingFormat: "openai",
+              zaiToolStream: false,
+              supportsStrictMode: false,
+              sendSessionAffinityHeaders: false,
+              sendSessionIdHeader: false,
+              supportsLongCacheRetention: false,
+            },
+          },
+        })],
+      });
 
       const operator = await harness.app.inject({
         method: "POST",
@@ -777,6 +1256,37 @@ describe("HTTP model control plane", () => {
           invocationProtocol: "responses",
           maxInputTokens: 12_345,
           contextWindowSource: "operator",
+        })],
+      });
+      expect(operator.json().revisions[0]).not.toHaveProperty("catalogCandidateId");
+      expect(harness.modelRegistry.getProfile("operator-profile" as never)).toMatchObject({
+        revisions: [expect.objectContaining({
+          piRuntime: {
+            kind: "pi_ai",
+            piVersion: "0.73.1",
+            driverId: "pi/openai-compatible",
+            catalogProviderId: "openai-compatible",
+            api: "openai-responses",
+            modelId: "custom-model",
+            contextWindow: 12_345,
+            compatibility: {
+              supportsStore: false,
+              supportsDeveloperRole: false,
+              supportsReasoningEffort: false,
+              supportsUsageInStreaming: false,
+              maxTokensField: "max_tokens",
+              requiresToolResultName: false,
+              requiresAssistantAfterToolResult: false,
+              requiresThinkingAsText: false,
+              requiresReasoningContentOnAssistantMessages: false,
+              thinkingFormat: "openai",
+              zaiToolStream: false,
+              supportsStrictMode: false,
+              sendSessionAffinityHeaders: false,
+              sendSessionIdHeader: false,
+              supportsLongCacheRetention: false,
+            },
+          },
         })],
       });
     } finally {

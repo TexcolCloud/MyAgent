@@ -9,6 +9,7 @@ import type {
   ModelProfileRevision,
   ModelProfileView,
 } from "../domain/model-profile.js";
+import type { PiRuntimeContract } from "../domain/pi-runtime.js";
 import type { Clock } from "../ports/clock.js";
 import type { IdGenerator } from "../ports/id-generator.js";
 import type { ModelRegistryStore } from "../ports/model-registry-store.js";
@@ -27,6 +28,7 @@ export interface ModelProfileDraftValues {
   readonly connectionRevisionId: ProviderConnectionRevisionId;
   readonly providerModelId: string;
   readonly invocationProtocol: InvocationProtocol;
+  readonly piRuntime?: PiRuntimeContract;
   readonly maxInputTokens: number;
   readonly contextWindowSource: ModelProfileRevision["contextWindowSource"];
 }
@@ -176,6 +178,9 @@ export class ManageModelProfilesService {
       connectionRevisionId: input.connectionRevisionId,
       providerModelId: requiredText(input.providerModelId),
       invocationProtocol: input.invocationProtocol,
+      ...(input.piRuntime === undefined
+        ? {}
+        : { piRuntime: freezePiRuntime(input.piRuntime) }),
       maxInputTokens: input.maxInputTokens,
       contextWindowSource: input.contextWindowSource,
       capabilityBaseline: MODEL_CAPABILITY_BASELINE,
@@ -189,4 +194,11 @@ export class ManageModelProfilesService {
 function requiredText(value: string): string {
   if (value.trim().length === 0) throw new DomainError("invalid_model_profile");
   return value;
+}
+
+function freezePiRuntime(runtime: PiRuntimeContract): PiRuntimeContract {
+  return Object.freeze({
+    ...runtime,
+    compatibility: Object.freeze({ ...runtime.compatibility }),
+  });
 }

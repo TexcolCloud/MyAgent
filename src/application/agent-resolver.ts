@@ -11,6 +11,7 @@ import {
 import { ApplicationError } from "../domain/errors.js";
 import type { AgentId } from "../domain/ids.js";
 import { assertExistingAssignmentUsable } from "../domain/model-assignment.js";
+import type { PiRuntimeContract } from "../domain/pi-runtime.js";
 import type { ModelRegistryStore } from "../ports/model-registry-store.js";
 import type { SecretResolver } from "../ports/secret-resolver.js";
 
@@ -86,6 +87,9 @@ export class AgentResolver implements AgentResolverPort {
       maxInputTokens: profileRevision.maxInputTokens,
       verifiedCapabilities: profileRevision.verifiedCapabilities,
       compatibilityPresetVersion: connectionRevision.presetVersion,
+      ...(profileRevision.piRuntime === undefined
+        ? {}
+        : { piRuntime: snapshotPiRuntime(profileRevision.piRuntime) }),
     };
     const content = {
       ...definition,
@@ -101,6 +105,13 @@ export class AgentResolver implements AgentResolverPort {
       contentSha256,
     });
   }
+}
+
+function snapshotPiRuntime(runtime: PiRuntimeContract): PiRuntimeContract {
+  return Object.freeze({
+    ...runtime,
+    compatibility: Object.freeze({ ...runtime.compatibility }),
+  });
 }
 
 function deepFreeze<T>(value: T): T {

@@ -25,8 +25,13 @@ import type {
 import {
   MODEL_CAPABILITY_BASELINE,
   type DiscoveryView,
+  type ProviderKind,
 } from "../../domain/model-registry.js";
 import type { ModelVerification } from "../../domain/model-verification.js";
+import type {
+  PiRuntimeContract,
+  ProviderDriverId,
+} from "../../domain/pi-runtime.js";
 import type {
   ProviderAuth,
   ProviderConnectionRevision,
@@ -67,6 +72,7 @@ interface ConnectionRow {
   connection_id: string;
   display_name: string;
   provider_kind: ProviderConnectionView["providerKind"];
+  provider_driver: ProviderDriverId | null;
   active_revision_id: string | null;
   retired_at: string | null;
   record_revision: number;
@@ -99,6 +105,7 @@ interface ProfileRevisionRow {
   state: ModelProfileRevision["state"];
   provider_model_id: string;
   invocation_protocol: ModelProfileRevision["invocationProtocol"];
+  runtime_contract_json: string | null;
   max_input_tokens: number;
   context_window_source: ModelProfileRevision["contextWindowSource"];
   capability_baseline: ModelProfileRevision["capabilityBaseline"];
@@ -197,12 +204,20 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
     assertConnectionRevisionOwner(input.connectionId, input.revision);
     return this.immediate(() => {
       const now = input.now.toISOString();
+      const providerDriver = input.providerDriver ?? providerDriverForKind(input.providerKind);
       this.db.prepare(
         `INSERT INTO provider_connections (
-           connection_id, display_name, provider_kind, active_revision_id,
+           connection_id, display_name, provider_kind, provider_driver, active_revision_id,
            retired_at, record_revision, created_at, updated_at
-         ) VALUES (?, ?, ?, NULL, NULL, 0, ?, ?)`,
-      ).run(input.connectionId, input.displayName, input.providerKind, now, now);
+         ) VALUES (?, ?, ?, ?, NULL, NULL, 0, ?, ?)`,
+      ).run(
+        input.connectionId,
+        input.displayName,
+        compatibilityKindForDriver(providerDriver),
+        providerDriver,
+        now,
+        now,
+      );
       this.insertConnectionRevision(input.revision);
       this.appendAudit(input, "provider_connection", input.connectionId, "connection.created", {
         previousRecordRevision: null,
@@ -262,7 +277,7 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
 
   getConnection(id: ProviderConnectionId): ProviderConnectionView {
     const row = this.db.prepare(
-      `SELECT connection_id, display_name, provider_kind, active_revision_id,
+      `SELECT connection_id, display_name, provider_kind, provider_driver, active_revision_id,
               retired_at, record_revision
        FROM provider_connections WHERE connection_id = ?`,
     ).get(id) as unknown as ConnectionRow | undefined;
@@ -277,6 +292,7 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
       connectionId: row.connection_id as ProviderConnectionId,
       displayName: row.display_name,
       providerKind: row.provider_kind,
+      ...(row.provider_driver === null ? {} : { providerDriver: row.provider_driver }),
       activeRevisionId: row.active_revision_id as ProviderConnectionRevisionId | null,
       retiredAt: parseNullableDate(row.retired_at),
       recordRevision: row.record_revision,
@@ -288,6 +304,7 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
     id: ProviderConnectionRevisionId,
   ): {
     providerKind: ProviderConnectionView["providerKind"];
+    providerDriver?: ProviderDriverId;
     revision: ProviderConnectionRevision;
   } | null {
     const row = this.db.prepare(
@@ -295,17 +312,22 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
               revision.base_url, revision.auth_json,
               revision.allow_insecure_http, revision.protocol_preference,
               revision.preset_version, revision.created_at,
-              connection.provider_kind
+              connection.provider_kind, connection.provider_driver
        FROM provider_connection_revisions AS revision
        JOIN provider_connections AS connection
          ON connection.connection_id = revision.connection_id
        WHERE revision.revision_id = ?`,
     ).get(id) as (ConnectionRevisionRow & {
       provider_kind: ProviderConnectionView["providerKind"];
+      provider_driver: ProviderDriverId | null;
     }) | undefined;
     return row === undefined
       ? null
-      : { providerKind: row.provider_kind, revision: mapConnectionRevision(row) };
+      : {
+          providerKind: row.provider_kind,
+          ...(row.provider_driver === null ? {} : { providerDriver: row.provider_driver }),
+          revision: mapConnectionRevision(row),
+        };
   }
 
   listConnections(): readonly ProviderConnectionView[] {
@@ -493,7 +515,7 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
     const revisions = this.db.prepare(
       `SELECT revision_id, profile_id, connection_revision_id, state,
               provider_model_id, invocation_protocol, max_input_tokens,
-              context_window_source, capability_baseline,
+              runtime_contract_json, context_window_source, capability_baseline,
               verified_capabilities_json, created_at
        FROM model_profile_revisions
        WHERE profile_id = ? ORDER BY created_at, revision_id`,
@@ -814,10 +836,17 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
         const ids = legacyIds(input.sourceSha256, model.alias);
         this.db.prepare(
           `INSERT INTO provider_connections (
-             connection_id, display_name, provider_kind, active_revision_id,
+             connection_id, display_name, provider_kind, provider_driver, active_revision_id,
              retired_at, record_revision, created_at, updated_at
-           ) VALUES (?, ?, ?, NULL, NULL, 0, ?, ?)`,
-        ).run(ids.connectionId, model.alias, model.providerKind, now, now);
+           ) VALUES (?, ?, ?, ?, NULL, NULL, 0, ?, ?)`,
+        ).run(
+          ids.connectionId,
+          model.alias,
+          model.providerKind,
+          providerDriverForKind(model.providerKind),
+          now,
+          now,
+        );
         this.insertConnectionRevision({
           revisionId: ids.connectionRevisionId,
           connectionId: ids.connectionId,
@@ -1530,10 +1559,10 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
     this.db.prepare(
       `INSERT INTO model_profile_revisions (
          revision_id, profile_id, connection_revision_id, state,
-         provider_model_id, invocation_protocol, max_input_tokens,
+         provider_model_id, invocation_protocol, runtime_contract_json, max_input_tokens,
          context_window_source, capability_baseline,
          verified_capabilities_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       revision.revisionId,
       revision.profileId,
@@ -1541,6 +1570,7 @@ export class SqliteModelRegistryRepository implements ModelRegistryStore {
       revision.state,
       revision.providerModelId,
       revision.invocationProtocol,
+      revision.piRuntime === undefined ? null : serializePiRuntime(revision.piRuntime),
       revision.maxInputTokens,
       revision.contextWindowSource,
       revision.capabilityBaseline,
@@ -1946,6 +1976,119 @@ function serialize(value: unknown): string {
   return result;
 }
 
+function providerDriverForKind(kind: ProviderKind): ProviderDriverId {
+  switch (kind) {
+    case "openai":
+      return "pi/openai";
+    case "deepseek":
+      return "pi/deepseek";
+    case "openai_compatible":
+      return "pi/openai-compatible";
+  }
+}
+
+function compatibilityKindForDriver(driver: ProviderDriverId): ProviderKind {
+  if (driver === "pi/openai") return "openai";
+  if (driver === "pi/deepseek") return "deepseek";
+  return "openai_compatible";
+}
+
+function serializePiRuntime(value: PiRuntimeContract): string {
+  assertPiRuntime(value);
+  return serialize(value);
+}
+
+function parsePiRuntime(serialized: string): PiRuntimeContract {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    throw new DomainError("invalid_model_profile");
+  }
+  assertPiRuntime(parsed);
+  return parsed;
+}
+
+function assertPiRuntime(value: unknown): asserts value is PiRuntimeContract {
+  if (!isRecord(value)) throw new DomainError("invalid_model_profile");
+  const allowedKeys = new Set([
+    "api",
+    "catalogProviderId",
+    "compatibility",
+    "contextWindow",
+    "driverId",
+    "kind",
+    "maxOutputTokens",
+    "modelId",
+    "piVersion",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key)) ||
+    value.kind !== "pi_ai" || value.piVersion !== "0.73.1" ||
+    typeof value.driverId !== "string" || !value.driverId.startsWith("pi/") ||
+    !isNonEmptyString(value.catalogProviderId) || !isNonEmptyString(value.api) ||
+    !isNonEmptyString(value.modelId) || !isPositiveInteger(value.contextWindow) ||
+    (value.maxOutputTokens !== undefined && !isPositiveInteger(value.maxOutputTokens)) ||
+    !isPiRuntimeCompatibility(value.compatibility)) {
+    throw new DomainError("invalid_model_profile");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+const PI_RUNTIME_BOOLEAN_COMPATIBILITY_KEYS = new Set([
+  "requiresAssistantAfterToolResult",
+  "requiresReasoningContentOnAssistantMessages",
+  "requiresThinkingAsText",
+  "requiresToolResultName",
+  "sendSessionAffinityHeaders",
+  "sendSessionIdHeader",
+  "supportsDeveloperRole",
+  "supportsEagerToolInputStreaming",
+  "supportsLongCacheRetention",
+  "supportsReasoningEffort",
+  "supportsStore",
+  "supportsStrictMode",
+  "supportsUsageInStreaming",
+  "zaiToolStream",
+]);
+
+const PI_RUNTIME_MAX_TOKENS_FIELDS = new Set([
+  "max_completion_tokens",
+  "max_tokens",
+]);
+
+const PI_RUNTIME_THINKING_FORMATS = new Set([
+  "openai",
+  "openrouter",
+  "deepseek",
+  "zai",
+  "qwen",
+  "qwen-chat-template",
+]);
+
+function isPiRuntimeCompatibility(
+  value: unknown,
+): value is Record<string, boolean | string> {
+  if (!isRecord(value)) return false;
+  return Object.entries(value).every(([key, entry]) =>
+    (PI_RUNTIME_BOOLEAN_COMPATIBILITY_KEYS.has(key) && typeof entry === "boolean") ||
+    (key === "maxTokensField" && typeof entry === "string" &&
+      PI_RUNTIME_MAX_TOKENS_FIELDS.has(entry)) ||
+    (key === "thinkingFormat" && typeof entry === "string" &&
+      PI_RUNTIME_THINKING_FORMATS.has(entry))
+  );
+}
+
 function parseNullableDate(value: string | null): Date | null {
   return value === null ? null : new Date(value);
 }
@@ -1972,6 +2115,9 @@ function mapProfileRevision(row: ProfileRevisionRow): ModelProfileRevision {
     state: row.state,
     providerModelId: row.provider_model_id,
     invocationProtocol: row.invocation_protocol,
+    ...(row.runtime_contract_json === null
+      ? {}
+      : { piRuntime: parsePiRuntime(row.runtime_contract_json) }),
     maxInputTokens: row.max_input_tokens,
     contextWindowSource: row.context_window_source,
     capabilityBaseline: row.capability_baseline,

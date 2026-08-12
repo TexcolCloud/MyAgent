@@ -52,6 +52,7 @@ export class CliClient {
     body?: unknown;
     idempotencyKey?: string;
     authority?: "run" | "admin";
+    signal?: AbortSignal;
   } = {}): Promise<T> {
     const authority = init.authority ?? "run";
     const token = authority === "admin" ? this.options.adminToken : this.options.bearerToken;
@@ -64,13 +65,14 @@ export class CliClient {
         ...(init.body === undefined ? {} : { "content-type": "application/json" }),
       },
       ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      ...(init.signal === undefined ? {} : { signal: init.signal }),
     });
     if (!response.ok) throw await problem(response);
     if (response.status === 204) return undefined as T;
     return await response.json() as T;
   }
 
-  stream(path: string, lastEventId?: string): Promise<Response> {
+  stream(path: string, lastEventId?: string, signal?: AbortSignal): Promise<Response> {
     const token = this.options.bearerToken;
     if (token === undefined || token.length === 0) {
       return Promise.reject(new CliCredentialError("run"));
@@ -80,6 +82,7 @@ export class CliClient {
         authorization: `Bearer ${token}`,
         ...(lastEventId === undefined ? {} : { "last-event-id": lastEventId }),
       },
+      ...(signal === undefined ? {} : { signal }),
     });
   }
 }

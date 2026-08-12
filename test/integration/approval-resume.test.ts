@@ -31,6 +31,9 @@ import { resolvedAgents } from "../helpers/resolved-agents.js";
 import { ScriptedModel } from "../helpers/scripted-model.js";
 import { tempPath } from "../helpers/temp-dir.js";
 import { ApprovalExpirer } from "../../src/runtime/approval-expirer.js";
+import { ApprovalScreen } from "../../src/interfaces/tui/screens/approvals.js";
+import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
+import { startTestApp } from "../helpers/start-test-app.js";
 
 describe("Approval and reconciliation resume", () => {
   let snapshot: CatalogSnapshot;
@@ -39,6 +42,62 @@ describe("Approval and reconciliation resume", () => {
     snapshot = await loadCatalog(
       path.resolve("test/fixtures/config/valid/myagent.yaml"),
     );
+  });
+
+  it("keeps a TUI decision exact and server-authoritative through the Run API", async () => {
+    const harness = await startTestApp();
+    try {
+      const created = await harness.app.inject({
+        method: "POST",
+        url: "/v1/runs",
+        headers: {
+          authorization: "Bearer test-token",
+          "idempotency-key": "tui-approval-resume-0001",
+        },
+        payload: {
+          agentId: "primary",
+          sessionKey: "tui:approval-resume",
+          input: { type: "text", text: "check exact approval" },
+        },
+      });
+      const runId = created.json().runId as string;
+      seedTuiApproval(harness.connection.db, runId);
+      const decisionAuthorizations: (string | null)[] = [];
+      const client = new TuiClient({
+        runToken: "test-token",
+        adminToken: "test-admin-token",
+        fetcher: async (input, init) => {
+          const url = new URL(String(input));
+          if (url.pathname.endsWith("/decision")) {
+            decisionAuthorizations.push(new Headers(init?.headers).get("authorization"));
+          }
+          const response = await harness.app.inject({
+            method: (init?.method ?? "GET") as never,
+            url: `${url.pathname}${url.search}`,
+            headers: Object.fromEntries(new Headers(init?.headers).entries()),
+            ...(typeof init?.body === "string" ? { payload: init.body } : {}),
+          });
+          return new Response(response.payload, {
+            status: response.statusCode,
+            headers: response.headers as Record<string, string>,
+          });
+        },
+      });
+      const approvals = new ApprovalScreen({ client });
+
+      await approvals.load();
+      await approvals.select("approval-tui-1");
+      expect(approvals.render(120).join("\n")).toContain("This command runs on the host");
+      await expect(approvals.decide("approved")).resolves.toBe(true);
+      await expect(approvals.decide("denied")).resolves.toBe(false);
+
+      const rendered = approvals.render(120).join("\n");
+      expect(decisionAuthorizations).toEqual(["Bearer test-token"]);
+      expect(rendered).toContain("Server state: approved");
+      expect(rendered).not.toContain("Server state: denied");
+    } finally {
+      await harness.close();
+    }
   });
 
   it.each(["succeeded", "failed"] as const)(
@@ -486,3 +545,19 @@ describe("Approval and reconciliation resume", () => {
     }
   });
 });
+
+function seedTuiApproval(db: import("node:sqlite").DatabaseSync, runId: string): void {
+  const now = "2026-08-07T00:00:00.000Z";
+  db.prepare("UPDATE runs SET state = 'waiting_approval' WHERE run_id = ?").run(runId);
+  db.prepare(`INSERT INTO tool_calls (
+    tool_call_id, run_id, state, tool_name, effect, arguments_json,
+    canonical_arguments, arguments_sha256, policy_effect, matched_rule,
+    policy_facts_json, created_at, updated_at
+  ) VALUES ('tool-tui-1', ?, 'waiting_approval', 'run_command', 'side_effect',
+    ?, ?, 'hash-tui-1', 'ask', 0, '{}', ?, ?)`)
+    .run(runId, '{"args":["status"],"program":"git"}', '{"args":["status"],"program":"git"}', now, now);
+  db.prepare(`INSERT INTO approvals (
+    approval_id, run_id, tool_call_id, state, arguments_sha256, expires_at, created_at
+  ) VALUES ('approval-tui-1', ?, 'tool-tui-1', 'pending', 'hash-tui-1', ?, ?)`)
+    .run(runId, "2026-08-13T00:00:00.000Z", now);
+}

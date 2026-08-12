@@ -2,17 +2,21 @@ import type { FastifyInstance } from "fastify";
 import type { z } from "zod";
 
 import type {
+  ListProviderDriversService,
+} from "../../../application/list-provider-drivers.js";
+import type {
   ManageProviderConnectionsService,
   ProviderCredentialInput,
 } from "../../../application/manage-provider-connections.js";
 import type { DiscoverModelsService } from "../../../application/discover-models.js";
-import { ApplicationError } from "../../../domain/errors.js";
+import { ApplicationError, DomainError } from "../../../domain/errors.js";
 import {
   parseProviderConnectionId,
   type ManagedSecretVersionId,
   type ProviderConnectionRevisionId,
 } from "../../../domain/ids.js";
 import type { DiscoveryView } from "../../../domain/model-registry.js";
+import type { ProviderDriverId } from "../../../domain/pi-runtime.js";
 import type {
   ProviderAuth,
   ProviderConnectionRevision,
@@ -40,6 +44,7 @@ export function registerProviderConnectionRoutes(
       "getConnection" | "listConnections" | "getDiscoveredModels"
     >;
     readonly connections: ManageProviderConnectionsService;
+    readonly providerDrivers: ListProviderDriversService;
     readonly discovery: DiscoverModelsService;
     readonly now?: () => Date;
   },
@@ -50,11 +55,23 @@ export function registerProviderConnectionRoutes(
     async (request, reply) => {
       const body = parseSchema(createProviderConnectionSchema, request.body);
       const connectionId = parseProviderConnectionId(body.slug);
+      const providerDriver = body.driverId === undefined
+        ? undefined
+        : services.providerDrivers.resolveSupportedDriver(
+          body.driverId as ProviderDriverId,
+        );
+      if (providerDriver !== undefined) {
+        services.providerDrivers.assertDriverCredentialSupport(
+          providerDriver,
+          credentialSupport(body.auth),
+        );
+      }
       const result = createConnectionOrConflict(services, connectionId, () =>
         services.connections.create({
           connectionId,
           displayName: body.displayName,
-          providerKind: body.kind,
+          providerKind: body.kind ?? "openai_compatible",
+          ...(providerDriver === undefined ? {} : { providerDriver }),
           ...(body.baseUrl === undefined ? {} : { baseUrl: body.baseUrl }),
           credential: credentialInput(body.auth),
           ...(body.apiKey === undefined
@@ -100,6 +117,21 @@ export function registerProviderConnectionRoutes(
         (request.params as { connectionId: string }).connectionId,
       );
       const body = parseSchema(reviseProviderConnectionSchema, request.body);
+      const connection = services.registry.getConnection(connectionId);
+      if (body.driverId !== undefined) {
+        const driverId = services.providerDrivers.resolveSupportedDriver(
+          body.driverId as ProviderDriverId,
+        );
+        if (connection.providerDriver !== driverId) {
+          throw new DomainError("invalid_provider_connection");
+        }
+      }
+      if (connection.providerDriver !== undefined) {
+        services.providerDrivers.assertDriverCredentialSupport(
+          connection.providerDriver,
+          credentialSupport(body.auth),
+        );
+      }
       return connectionResponse(services.connections.revise({
         connectionId,
         expectedRevision: body.expectedRevision,
@@ -222,6 +254,12 @@ function credentialInput(
   }
 }
 
+function credentialSupport(
+  auth: z.infer<typeof createProviderConnectionSchema>["auth"],
+): "bearer" | "none" {
+  return auth.type === "none" ? "none" : "bearer";
+}
+
 export function connectionResponse(connection: ProviderConnectionView) {
   const effective = connection.revisions.at(-1);
   const credential = effective === undefined ? noCredential() : credentialMetadata(effective.auth);
@@ -229,6 +267,9 @@ export function connectionResponse(connection: ProviderConnectionView) {
     connectionId: connection.connectionId,
     displayName: connection.displayName,
     providerKind: connection.providerKind,
+    ...(connection.providerDriver === undefined
+      ? {}
+      : { providerDriver: connection.providerDriver }),
     activeRevisionId: connection.activeRevisionId,
     retiredAt: connection.retiredAt?.toISOString() ?? null,
     recordRevision: connection.recordRevision,

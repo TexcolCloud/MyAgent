@@ -14,6 +14,10 @@ import { deleteSession, listSessions } from "./commands/sessions.js";
 import { reconcileTool } from "./commands/tools.js";
 import { getVerification } from "./commands/verifications.js";
 import { writeProblem, type CliProblemOutput, type CliWrite } from "./formatters.js";
+import { readTuiCredentials, TuiCredentialRequiredError, TuiTokensMustDifferError } from "../tui/credentials.js";
+import { assertInteractiveTty, InteractiveTtyRequiredError } from "../tui/tty.js";
+import { TuiClient } from "../tui/tui-client.js";
+import { runWorkbench, type RunWorkbenchOptions } from "../tui/workbench.js";
 
 export type { CliPrompt } from "./commands/model-setup.js";
 
@@ -25,6 +29,9 @@ export interface ExecuteCliOptions {
   sleep?: (milliseconds: number) => Promise<void>;
   write?: CliWrite;
   writeError?: CliWrite;
+  stdinIsTTY?: boolean;
+  stdoutIsTTY?: boolean;
+  runTui?: (options: RunWorkbenchOptions) => Promise<void>;
 }
 
 export async function executeCli(argumentsList: readonly string[], options: ExecuteCliOptions = {}): Promise<number> {
@@ -37,6 +44,27 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     json = booleanFlag(flags, "json");
     const command = positional[0] === "backup" ? "backup" : positional.slice(0, 2).join(" ");
     assertCommandGrammar(command, positional.length, flags);
+    if (command === "tui") {
+      assertInteractiveTty({
+        stdinIsTTY: options.stdinIsTTY ?? process.stdin.isTTY === true,
+        stdoutIsTTY: options.stdoutIsTTY ?? process.stdout.isTTY === true,
+      });
+      const credentials = await readTuiCredentials({
+        environment,
+        promptSecret: (label) => (options.prompt ?? createConsolePrompt()).secret(label),
+      });
+      const workbenchOptions: RunWorkbenchOptions = {
+        client: new TuiClient({
+          runToken: credentials.runToken,
+          adminToken: credentials.adminToken,
+          ...(stringFlag(flags, "api-url") === undefined ? {} : { apiUrl: requiredFlag(flags, "api-url") }),
+          ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+        }),
+      };
+      if (options.runTui !== undefined) await options.runTui(workbenchOptions);
+      else await runWorkbench(workbenchOptions);
+      return 0;
+    }
     if (command === "serve") {
       await serve(stringFlag(flags, "config") ?? "myagent.yaml");
       return 0;
@@ -68,10 +96,11 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     if (command === "providers add") {
       rejectVisibleApiKey(flags);
       const baseUrl = stringFlag(flags, "base-url");
+      const provider = providerSelection(flags);
       await addProvider(client, {
         slug: requiredFlag(flags, "slug"),
         displayName: requiredFlag(flags, "display-name"),
-        kind: oneOf(requiredFlag(flags, "kind"), ["openai", "deepseek", "openai_compatible"] as const),
+        ...provider,
         ...(baseUrl === undefined ? {} : { baseUrl }),
         auth: await providerAuth(flags, options.readStdin ?? readStandardInput),
         ...(booleanFlag(flags, "allow-insecure-http") ? { allowInsecureHttp: true } : {}),
@@ -88,6 +117,9 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
         auth: await providerAuth(flags, options.readStdin ?? readStandardInput),
         allowInsecureHttp: booleanFlag(flags, "allow-insecure-http"),
         protocolPreference: oneOf(requiredFlag(flags, "protocol"), ["chat_completions", "responses"] as const),
+        ...(stringFlag(flags, "driver") === undefined
+          ? {}
+          : { driverId: requiredFlag(flags, "driver") }),
       }, write);
       return 0;
     }
@@ -96,12 +128,12 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     if (command === "providers promote") { await promoteProvider(client, requiredFlag(flags, "provider"), requiredFlag(flags, "connection-revision"), revisionFlag(flags), write); return 0; }
     if (command === "providers retire") { await retireProvider(client, requiredFlag(flags, "provider"), revisionFlag(flags), write); return 0; }
     if (command === "models create") {
+      const selection = modelSelection(flags);
       await createModel(client, {
         slug: requiredFlag(flags, "slug"),
         displayName: requiredFlag(flags, "display-name"),
         connectionRevisionId: requiredFlag(flags, "connection-revision"),
-        modelId: requiredFlag(flags, "model-id"),
-        protocol: oneOf(requiredFlag(flags, "protocol"), ["auto", "chat_completions", "responses"] as const),
+        ...selection,
         ...(stringFlag(flags, "max-input-tokens") === undefined ? {} : { maxInputTokens: positiveIntegerFlag(flags, "max-input-tokens") }),
         ...(stringFlag(flags, "context-source") === undefined ? {} : { contextWindowSource: oneOf(requiredFlag(flags, "context-source"), ["preset", "operator", "assumed_32768"] as const) }),
         ...(booleanFlag(flags, "manual-entry") ? { manualEntryAcknowledged: true } : {}),
@@ -216,8 +248,50 @@ function oneOf<const T extends readonly string[]>(value: string, allowed: T): T[
   throw new CliUsageError("invalid_cli_option", "A CLI option has an invalid value.");
 }
 
+function providerSelection(flags: CliFlags):
+  | { readonly kind: "openai" | "deepseek" | "openai_compatible" }
+  | { readonly driverId: string } {
+  const kind = stringFlag(flags, "kind");
+  const driverId = stringFlag(flags, "driver");
+  if ((kind === undefined) === (driverId === undefined)) {
+    throw new CliUsageError("invalid_cli_option", "Choose one Provider Driver.");
+  }
+  return driverId === undefined
+    ? { kind: oneOf(kind!, ["openai", "deepseek", "openai_compatible"] as const) }
+    : { driverId };
+}
+
+function modelSelection(flags: CliFlags):
+  | {
+      readonly modelId: string;
+      readonly protocol: "auto" | "chat_completions" | "responses";
+    }
+  | { readonly catalogCandidateId: string } {
+  const modelId = stringFlag(flags, "model-id");
+  const catalogCandidateId = stringFlag(flags, "catalog-candidate");
+  if ((modelId === undefined) === (catalogCandidateId === undefined)) {
+    throw new CliUsageError("invalid_cli_option", "Choose one Model source.");
+  }
+  if (catalogCandidateId !== undefined) {
+    if (stringFlag(flags, "protocol") !== undefined || booleanFlag(flags, "manual-entry")) {
+      throw new CliUsageError("invalid_cli_option", "Catalog models use server-resolved invocation data.");
+    }
+    return { catalogCandidateId };
+  }
+  return {
+    modelId: modelId!,
+    protocol: oneOf(
+      requiredFlag(flags, "protocol"),
+      ["auto", "chat_completions", "responses"] as const,
+    ),
+  };
+}
+
 function cliFailure(error: unknown): { exitCode: number; problem: CliProblemOutput } {
   if (error instanceof CliUsageError) return { exitCode: 2, problem: error };
+  if (error instanceof InteractiveTtyRequiredError) return { exitCode: 2, problem: error };
+  if (error instanceof TuiTokensMustDifferError) return { exitCode: 3, problem: error };
+  if (error instanceof TuiCredentialRequiredError) return { exitCode: 3, problem: error };
   if (error instanceof CliValidationError) return { exitCode: 2, problem: error };
   if (error instanceof CliCredentialError) return { exitCode: 3, problem: error };
   if (error instanceof CliHttpError) {
@@ -248,11 +322,13 @@ const ADMIN_COMMANDS = new Set([
 
 const RUN_FLAGS = ["api-url", "token", "json"] as const;
 const ADMIN_FLAGS = ["api-url", "admin-token", "json"] as const;
+const TUI_FLAGS = ["api-url"] as const;
 const COMMAND_GRAMMAR: Readonly<Record<string, {
   readonly positional: number;
   readonly flags: readonly string[];
 }>> = {
   serve: { positional: 1, flags: ["config"] },
+  tui: { positional: 1, flags: TUI_FLAGS },
   "config validate": { positional: 2, flags: ["config", "json"] },
   "config reload": { positional: 2, flags: RUN_FLAGS },
   "agents list": { positional: 2, flags: RUN_FLAGS },
@@ -267,13 +343,13 @@ const COMMAND_GRAMMAR: Readonly<Record<string, {
   "sessions delete": { positional: 3, flags: RUN_FLAGS },
   backup: { positional: 2, flags: RUN_FLAGS },
   "model setup": { positional: 2, flags: ADMIN_FLAGS },
-  "providers add": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "kind", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
-  "providers update": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision", "display-name", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
+  "providers add": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "kind", "driver", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
+  "providers update": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision", "driver", "display-name", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
   "providers list": { positional: 2, flags: ADMIN_FLAGS },
   "providers discover": { positional: 2, flags: [...ADMIN_FLAGS, "connection-revision", "expected-revision"] },
   "providers promote": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "connection-revision", "expected-revision"] },
   "providers retire": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision"] },
-  "models create": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "connection-revision", "model-id", "protocol", "max-input-tokens", "context-source", "manual-entry"] },
+  "models create": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "connection-revision", "catalog-candidate", "model-id", "protocol", "max-input-tokens", "context-source", "manual-entry"] },
   "models verify": { positional: 2, flags: [...ADMIN_FLAGS, "profile-revision", "expected-revision"] },
   "models promote": { positional: 2, flags: [...ADMIN_FLAGS, "model", "profile-revision", "expected-revision"] },
   "models list": { positional: 2, flags: ADMIN_FLAGS },
@@ -288,6 +364,9 @@ function assertCommandGrammar(command: string, positional: number, flags: CliFla
   const grammar = COMMAND_GRAMMAR[command];
   if (grammar === undefined || positional !== grammar.positional) {
     throw new CliUsageError("invalid_cli_command", "The CLI command is invalid.");
+  }
+  if (command === "tui" && (flags.token !== undefined || flags["admin-token"] !== undefined)) {
+    throw new CliUsageError("visible_tui_token_forbidden", "Use TUI environment variables or masked prompts for tokens.");
   }
   const allowed = new Set(grammar.flags);
   if (Object.keys(flags).some((flag) => !allowed.has(flag))) {

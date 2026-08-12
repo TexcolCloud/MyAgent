@@ -9,6 +9,77 @@ import { startTestApp } from "../helpers/start-test-app.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
 describe("CLI HTTP boundary", () => {
+  it("returns one Problem and does not invoke the TUI boundary without an interactive terminal", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const output: string[] = [];
+    const runTui = vi.fn();
+
+    await expect(executeCli(["tui"], {
+      stdinIsTTY: false,
+      stdoutIsTTY: false,
+      runTui,
+      write: (line) => output.push(line),
+      writeError: (line) => output.push(line),
+    })).resolves.toBe(2);
+
+    expect(output).toEqual([
+      "interactive_tty_required: An interactive TTY is required. (traceId: cli)",
+    ]);
+    expect(runTui).not.toHaveBeenCalled();
+  });
+
+  it("validates TUI flags before acquiring the terminal and keeps configured tokens out of output", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const output: string[] = [];
+    const environment = {
+      MYAGENT_RUN_TOKEN: "run-token-must-not-appear",
+      MYAGENT_ADMIN_TOKEN: "admin-token-must-not-appear",
+    };
+    const runTui = vi.fn();
+
+    await expect(executeCli(["tui", "--unsupported", "value"], {
+      environment,
+      stdinIsTTY: false,
+      stdoutIsTTY: false,
+      write: (line) => output.push(line),
+      writeError: (line) => output.push(line),
+    })).resolves.toBe(2);
+    await expect(executeCli(["tui", "--api-url", "http://127.0.0.1:8787"], {
+      environment,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      runTui,
+      write: (line) => output.push(line),
+      writeError: (line) => output.push(line),
+    })).resolves.toBe(0);
+
+    expect(output).toEqual([
+      "invalid_cli_command: The CLI command is invalid. (traceId: cli)",
+    ]);
+    expect(runTui).toHaveBeenCalledOnce();
+    expect(output.join("\n")).not.toContain("token");
+  });
+
+  it("rejects visible TUI tokens without creating a workbench", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const output: string[] = [];
+    const runTui = vi.fn();
+
+    await expect(executeCli(["tui", "--token", "run-override", "--admin-token", "admin-override"], {
+      environment: { MYAGENT_RUN_TOKEN: "run-environment", MYAGENT_ADMIN_TOKEN: "admin-environment" },
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      runTui,
+      write: (line) => output.push(line),
+      writeError: (line) => output.push(line),
+    })).resolves.toBe(2);
+
+    expect(output).toEqual(["visible_tui_token_forbidden: Use TUI environment variables or masked prompts for tokens. (traceId: cli)"]);
+    expect(runTui).not.toHaveBeenCalled();
+    expect(output.join("\n")).not.toContain("run-override");
+    expect(output.join("\n")).not.toContain("admin-override");
+  });
+
   it("loads local config validation without importing SQLite", async () => {
     vi.resetModules();
     vi.doMock("node:sqlite", () => {
@@ -97,9 +168,16 @@ describe("CLI HTTP boundary", () => {
 
   it("stops watching after a terminal Run event", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const completed = JSON.stringify({
+      runId: "run-cli-1",
+      sequence: 9,
+      type: "run.completed",
+      occurredAt: "2026-08-12T00:00:00.000Z",
+      payload: { result: { type: "text", text: "done" } },
+    });
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(
-        "id: 9\nevent: run.completed\ndata: {\"type\":\"run.completed\"}\n\n",
+        `id: 9\nevent: run.completed\ndata: ${completed}\n\n`,
         { status: 200, headers: { "content-type": "text/event-stream" } },
       ))
       .mockRejectedValue(new Error("unexpected_terminal_reconnect"));
@@ -115,41 +193,108 @@ describe("CLI HTTP boundary", () => {
     })).resolves.toBe(0);
 
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(write).toHaveBeenCalledWith('{"type":"run.completed"}');
+    expect(write).toHaveBeenCalledWith(completed);
   });
 
-  it("reconnects a non-terminal watch with the latest Event ID", async () => {
+  it("preserves validated noncanonical SSE data when watching a Run", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
-    const fetcher = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      if (fetcher.mock.calls.length === 1) {
-        expect(new Headers(init?.headers).get("last-event-id")).toBeNull();
-        return new Response(
-          "id: 4\nevent: message.delta\ndata: {\"type\":\"message.delta\"}\n\n",
-          { status: 200, headers: { "content-type": "text/event-stream" } },
-        );
-      }
-      expect(new Headers(init?.headers).get("last-event-id")).toBe("4");
-      return new Response(
-        "id: 5\nevent: run.failed\ndata: {\"type\":\"run.failed\"}\n\n",
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      );
-    });
+    const completed = [
+      "{",
+      ' "type" : "run.completed", "payload" : {},',
+      ' "occurredAt" : "2026-08-12T00:00:00.000Z", "sequence" : 9, "runId" : "run-cli-1"',
+      "}",
+    ].join("\n");
+    const data = completed.split("\n").map((line) => `data: ${line}`).join("\n");
     const write = vi.fn();
 
-    await executeCli(["run", "watch", "run-cli-1"], {
+    await expect(executeCli(["run", "watch", "run-cli-1"], {
+      environment: {
+        MYAGENT_API_URL: "http://127.0.0.1:8787",
+        MYAGENT_BEARER_TOKEN: "operator-token",
+      },
+      fetcher: async () => new Response(
+        `id: 9\nevent: run.completed\n${data}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+      write,
+    })).resolves.toBe(0);
+
+    expect(write).toHaveBeenCalledWith(completed);
+  });
+
+  it("fails a Run watch with the existing credential exit when its token is absent", async () => {
+    const { CliClient } = await import("../../src/interfaces/cli/client.js");
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const originalStream = CliClient.prototype.stream;
+    let attempts = 0;
+    const stream = vi.spyOn(CliClient.prototype, "stream").mockImplementation(function (this: InstanceType<typeof CliClient>, ...args) {
+      attempts += 1;
+      if (attempts === 1) return originalStream.apply(this, args);
+      return Promise.resolve(new Response(
+        "id: 1\nevent: run.completed\ndata: {\"runId\":\"run-cli-1\",\"sequence\":1,\"type\":\"run.completed\",\"occurredAt\":\"2026-08-12T00:00:00.000Z\",\"payload\":{}}\n\n",
+        { status: 200 },
+      ));
+    });
+    try {
+      await expect(executeCli(["run", "watch", "run-cli-1"], {
+        environment: { MYAGENT_API_URL: "http://127.0.0.1:8787" },
+        writeError: () => undefined,
+      })).resolves.toBe(3);
+      expect(stream).toHaveBeenCalledOnce();
+    } finally {
+      stream.mockRestore();
+    }
+  });
+
+  it("fails a Run watch with the existing service exit after one fetch rejection", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const fetcher = vi.fn()
+      .mockRejectedValueOnce(new TypeError("network unavailable"))
+      .mockResolvedValue(new Response(
+        "id: 1\nevent: run.completed\ndata: {\"runId\":\"run-cli-1\",\"sequence\":1,\"type\":\"run.completed\",\"occurredAt\":\"2026-08-12T00:00:00.000Z\",\"payload\":{}}\n\n",
+        { status: 200 },
+      ));
+
+    await expect(executeCli(["run", "watch", "run-cli-1"], {
+      environment: {
+        MYAGENT_API_URL: "http://127.0.0.1:8787",
+        MYAGENT_BEARER_TOKEN: "operator-token",
+      },
+      fetcher,
+      writeError: () => undefined,
+    })).resolves.toBe(6);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("returns after a non-terminal stream EOF without reconnecting", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const delta = JSON.stringify({
+      runId: "run-cli-1",
+      sequence: 4,
+      type: "message.delta",
+      occurredAt: "2026-08-12T00:00:00.000Z",
+      payload: { text: "hello" },
+    });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(
+        `id: 4\nevent: message.delta\ndata: ${delta}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ))
+      .mockRejectedValue(new Error("unexpected_eof_reconnect"));
+    const write = vi.fn();
+
+    await expect(executeCli(["run", "watch", "run-cli-1"], {
       environment: {
         MYAGENT_API_URL: "http://127.0.0.1:8787",
         MYAGENT_BEARER_TOKEN: "operator-token",
       },
       fetcher,
       write,
-    });
+    })).resolves.toBe(0);
 
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(write.mock.calls.map(([line]) => line)).toEqual([
-      '{"type":"message.delta"}',
-      '{"type":"run.failed"}',
-    ]);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledWith(delta);
   });
 
   it("parses Problem Details when explicit connection options are rejected", async () => {

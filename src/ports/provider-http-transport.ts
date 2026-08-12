@@ -12,6 +12,11 @@ export interface ProviderHttpTransportInput {
   readonly maxResponseBytes: number;
 }
 
+export type ProviderFetch = (
+  requestInfo: string | URL | Request,
+  requestInit?: RequestInit,
+) => Promise<Response>;
+
 export interface ProviderHttpTransport {
-  createFetch(input: ProviderHttpTransportInput): typeof fetch;
+  createFetch(input: ProviderHttpTransportInput): ProviderFetch;
 }

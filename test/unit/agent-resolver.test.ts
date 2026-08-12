@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import { AgentResolver } from "../../src/application/agent-resolver.js";
+import { SqliteCatalogRepository } from "../../src/adapters/sqlite/catalog-repository.js";
+import { openDatabase } from "../../src/adapters/sqlite/database.js";
+import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import type { AgentDefinitionRevision } from "../../src/domain/agent-revision.js";
 import {
   managedSecretVersionIdFromUuid,
@@ -16,6 +19,7 @@ import type { ModelProfileView } from "../../src/domain/model-profile.js";
 import type { RegistryRevisionState } from "../../src/domain/model-registry.js";
 import type { ProviderConnectionView } from "../../src/domain/provider-connection.js";
 import { DEFAULT_RUN_LIMITS } from "../../src/domain/limits.js";
+import { tempPath } from "../helpers/temp-dir.js";
 
 describe("AgentResolver", () => {
   it("snapshots the exact assigned revision and ignores later promotion", () => {
@@ -44,6 +48,61 @@ describe("AgentResolver", () => {
     }).resolve(agentId);
 
     expect(snapshot.model.allowInsecureHttp).toBe(true);
+  });
+
+  it("snapshots a frozen Pi runtime from the exact assigned Profile revision", () => {
+    const piRuntime = {
+      kind: "pi_ai" as const,
+      piVersion: "0.73.1" as const,
+      driverId: "pi/openai" as const,
+      catalogProviderId: "openai",
+      api: "openai-completions",
+      modelId: "gpt-test-old",
+      contextWindow: 8_192,
+      compatibility: {},
+    };
+    const fixture = registryFixture({
+      piRuntime,
+    });
+    const snapshot = new AgentResolver({
+      catalog: { resolve: () => ({ id: agentId, definition }) },
+      registry: fixture.registry,
+      secrets: { resolve: () => "resolved-secret" },
+    }).resolve(agentId);
+
+    expect(snapshot.model.piRuntime).toEqual(piRuntime);
+    expect(Object.isFrozen(snapshot.model.piRuntime)).toBe(true);
+  });
+
+  it("decodes fixed pre-0003 snapshot JSON without adding a Pi runtime", () => {
+    const connection = openDatabase({
+      path: tempPath("agent-resolver-pre-0003.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      connection.db.prepare(
+        `INSERT INTO agent_revisions (
+          revision_id, agent_id, content_json, content_sha256, created_at
+        ) VALUES (?, ?, ?, ?, datetime('now'))`,
+      ).run(
+        "rev_pre_0003",
+        "primary",
+        PRE_0003_AGENT_REVISION_CONTENT_JSON,
+        "0".repeat(64),
+      );
+      const repository = new SqliteCatalogRepository(connection.db);
+
+      const decoded = repository.get("rev_pre_0003");
+      const stored = connection.db.prepare(
+        "SELECT content_json FROM agent_revisions WHERE revision_id = ?",
+      ).get("rev_pre_0003") as { content_json: string };
+
+      expect(decoded?.model.piRuntime).toBeUndefined();
+      expect(stored.content_json).toBe(PRE_0003_AGENT_REVISION_CONTENT_JSON);
+    } finally {
+      connection.close();
+    }
   });
 
   it("rejects an Agent without an exact model assignment", () => {
@@ -212,12 +271,50 @@ const definition: AgentDefinitionRevision = {
   contentSha256: "1".repeat(64),
 };
 
+const PRE_0003_AGENT_REVISION_CONTENT_JSON = `{
+  "revisionId":"rev_pre_0003",
+  "definitionRevisionId":"def_pre_0003",
+  "modelProfileRevisionId":"mpr_pre_0003",
+  "agentId":"primary",
+  "displayName":"Primary",
+  "prompt":"Be precise.",
+  "model":{
+    "providerConnectionRevisionId":"pcr_pre_0003",
+    "providerKind":"openai",
+    "baseUrl":"https://api.openai.example/v1",
+    "providerAuth":{"type":"none"},
+    "allowInsecureHttp":false,
+    "modelId":"gpt-4.1-mini",
+    "invocationProtocol":"chat_completions",
+    "maxInputTokens":128000,
+    "verifiedCapabilities":["streaming_text","single_tool_call"],
+    "compatibilityPresetVersion":"openai-v1"
+  },
+  "workspace":"D:/workspace",
+  "skills":[],
+  "policy":[],
+  "delegates":[],
+  "limits":{
+    "modelTurns":20,
+    "toolCalls":12,
+    "childRuns":4,
+    "delegationDepth":1,
+    "activeExecutionSeconds":900,
+    "defaultToolTimeoutMs":120000,
+    "maxToolTimeoutMs":600000,
+    "maxToolOutputBytes":1048576,
+    "maxRunToolOutputBytes":8388608
+  },
+  "contentSha256":"0000000000000000000000000000000000000000000000000000000000000000"
+}`;
+
 function registryFixture(options: {
   allowInsecureHttp?: boolean;
   connectionState?: RegistryRevisionState;
   profileState?: RegistryRevisionState;
   assignmentSource?: ModelAssignment["source"];
   providerAuth?: ProviderConnectionView["revisions"][number]["auth"];
+  piRuntime?: ModelProfileView["revisions"][number]["piRuntime"];
 } = {}): {
   registry: {
     getAssignment: () => ModelAssignment;
@@ -241,6 +338,7 @@ function registryFixture(options: {
       connectionRevisionId,
       providerModelId: "gpt-test-old",
       invocationProtocol: "chat_completions",
+      ...(options.piRuntime === undefined ? {} : { piRuntime: options.piRuntime }),
       maxInputTokens: 8_192,
       contextWindowSource: "operator",
       capabilityBaseline: "text_and_single_tool_call_v1",
@@ -254,6 +352,7 @@ function registryFixture(options: {
       connectionRevisionId,
       providerModelId: "gpt-test-new",
       invocationProtocol: "chat_completions",
+      ...(options.piRuntime === undefined ? {} : { piRuntime: options.piRuntime }),
       maxInputTokens: 16_384,
       contextWindowSource: "operator",
       capabilityBaseline: "text_and_single_tool_call_v1",

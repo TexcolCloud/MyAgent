@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { readFileSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
@@ -31,6 +32,7 @@ describe("SQLite migrations", () => {
       expect(reopened.db.prepare("SELECT version FROM schema_migrations").all()).toEqual([
         { version: 1 },
         { version: 2 },
+        { version: 3 },
       ]);
     } finally {
       reopened.close();
@@ -48,10 +50,136 @@ describe("SQLite migrations", () => {
       expect(first.db.prepare("SELECT version FROM schema_migrations").all()).toEqual([
         { version: 1 },
         { version: 2 },
+        { version: 3 },
       ]);
     } finally {
       second.close();
       first.close();
+    }
+  });
+
+  it("backfills Provider Drivers when upgrading a version 2 registry", () => {
+    const connection = openDatabase({
+      path: tempPath("pi-runtime-upgrade.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrateThroughVersion2(connection.db);
+      const insert = connection.db.prepare(
+        `INSERT INTO provider_connections (
+           connection_id, display_name, provider_kind, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      );
+      insert.run("legacy-openai", "OpenAI", "openai", NOW, NOW);
+      insert.run("legacy-deepseek", "DeepSeek", "deepseek", NOW, NOW);
+      insert.run("legacy-compatible", "Compatible", "openai_compatible", NOW, NOW);
+
+      migrate(connection.db);
+
+      expect(connection.db.prepare(
+        `SELECT connection_id, provider_driver FROM provider_connections
+         ORDER BY connection_id`,
+      ).all()).toEqual([
+        { connection_id: "legacy-compatible", provider_driver: "pi/openai-compatible" },
+        { connection_id: "legacy-deepseek", provider_driver: "pi/deepseek" },
+        { connection_id: "legacy-openai", provider_driver: "pi/openai" },
+      ]);
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("adds the Pi invocation protocol without losing referenced Profile revisions", () => {
+    const connection = openDatabase({
+      path: tempPath("pi-protocol-upgrade.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrateThroughVersion2(connection.db);
+      connection.db.prepare(
+        `INSERT INTO provider_connections (
+           connection_id, display_name, provider_kind, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run("upgrade-provider", "Upgrade Provider", "openai", NOW, NOW);
+      connection.db.prepare(
+        `INSERT INTO provider_connection_revisions (
+           revision_id, connection_id, state, base_url, auth_json,
+           allow_insecure_http, protocol_preference, preset_version, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "pcr-upgrade", "upgrade-provider", "active", "https://api.example.test/v1",
+        '{"type":"none"}', 0, "responses", "legacy", NOW,
+      );
+      connection.db.prepare(
+        `INSERT INTO model_profiles (
+           profile_id, display_name, created_at, updated_at
+         ) VALUES (?, ?, ?, ?)`,
+      ).run("legacy-profile", "Legacy Profile", NOW, NOW);
+      connection.db.prepare(
+        `INSERT INTO model_profile_revisions (
+           revision_id, profile_id, connection_revision_id, state,
+           provider_model_id, invocation_protocol, max_input_tokens,
+           context_window_source, capability_baseline,
+           verified_capabilities_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "mpr-legacy", "legacy-profile", "pcr-upgrade", "active", "legacy-model",
+        "responses", 32_768, "operator", "text_and_single_tool_call_v1",
+        '["streaming_text","single_tool_call"]', NOW,
+      );
+      connection.db.prepare(
+        `INSERT INTO model_assignments (
+           agent_id, model_profile_revision_id, source, record_revision, updated_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run("primary", "mpr-legacy", "explicit", 0, NOW);
+
+      migrate(connection.db);
+
+      expect(connection.db.prepare(
+        "SELECT model_profile_revision_id FROM model_assignments WHERE agent_id = ?",
+      ).get("primary")).toEqual({ model_profile_revision_id: "mpr-legacy" });
+      connection.db.prepare(
+        `INSERT INTO model_profiles (
+           profile_id, display_name, created_at, updated_at
+         ) VALUES (?, ?, ?, ?)`,
+      ).run("pi-profile", "Pi Profile", NOW, NOW);
+      expect(() => connection.db.prepare(
+        `INSERT INTO model_profile_revisions (
+           revision_id, profile_id, connection_revision_id, state,
+           provider_model_id, invocation_protocol, max_input_tokens,
+           context_window_source, capability_baseline,
+           verified_capabilities_json, runtime_contract_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "mpr-pi", "pi-profile", "pcr-upgrade", "draft", "gpt-4.1-mini",
+        "pi_ai", 1_047_576, "preset", "text_and_single_tool_call_v1", "[]",
+        '{"kind":"pi_ai","piVersion":"0.73.1"}', NOW,
+      )).not.toThrow();
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("restores migration PRAGMAs when version 3 fails after enabling legacy alter mode", () => {
+    const connection = openDatabase({
+      path: tempPath("pi-runtime-pragma-rollback.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrateThroughVersion2(connection.db);
+      connection.db.exec("CREATE TABLE model_profile_revisions_v2 (id TEXT PRIMARY KEY)");
+
+      expect(() => migrate(connection.db)).toThrow();
+
+      expect(connection.db.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+      expect(connection.db.prepare("PRAGMA legacy_alter_table").get())
+        .toEqual({ legacy_alter_table: 0 });
+      expect(connection.db.prepare("SELECT version FROM schema_migrations").all()).toEqual([
+        { version: 1 },
+        { version: 2 },
+      ]);
+    } finally {
+      connection.close();
     }
   });
 
@@ -274,6 +402,10 @@ describe("SQLite migrations", () => {
       ]);
       expect(connection.db.prepare("PRAGMA table_info(tool_calls)").all())
         .toContainEqual(expect.objectContaining({ name: "provider_call_id", notnull: 0 }));
+      expect(connection.db.prepare("PRAGMA table_info(provider_connections)").all())
+        .toContainEqual(expect.objectContaining({ name: "provider_driver", notnull: 0 }));
+      expect(connection.db.prepare("PRAGMA table_info(model_profile_revisions)").all())
+        .toContainEqual(expect.objectContaining({ name: "runtime_contract_json", notnull: 0 }));
       for (const table of [
         "provider_connections",
         "model_profiles",
@@ -315,6 +447,23 @@ describe("SQLite migrations", () => {
         '{"type":"none"}', 0, "responses", "2026-08-09", NOW,
       );
       connection.db.prepare(
+        `INSERT INTO model_profiles (
+           profile_id, display_name, created_at, updated_at
+         ) VALUES (?, ?, ?, ?)`,
+      ).run("profile-a", "Profile A", NOW, NOW);
+      connection.db.prepare(
+        `INSERT INTO model_profile_revisions (
+           revision_id, profile_id, connection_revision_id, state,
+           provider_model_id, invocation_protocol, max_input_tokens,
+           context_window_source, capability_baseline,
+           verified_capabilities_json, runtime_contract_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "mpr-a", "profile-a", "pcr-a", "draft", "claude-test", "responses",
+        200_000, "preset", "text_and_single_tool_call_v1", "[]",
+        '{"kind":"pi_ai","piVersion":"0.73.1"}', NOW,
+      );
+      connection.db.prepare(
         `INSERT INTO model_registry_events (
            event_id, resource_type, resource_id, action, payload_json,
            trace_id, created_at
@@ -330,6 +479,14 @@ describe("SQLite migrations", () => {
         "UPDATE provider_connection_revisions SET base_url = ? WHERE revision_id = ?",
       ).run("https://changed.example.test/v1", "pcr-a"))
         .toThrowError("immutable_provider_connection_revision");
+      expect(() => connection.db.prepare(
+        "UPDATE model_profile_revisions SET runtime_contract_json = ? WHERE revision_id = ?",
+      ).run('{"kind":"changed"}', "mpr-a"))
+        .toThrowError("immutable_model_profile_revision");
+      expect(() => connection.db.prepare(
+        "UPDATE provider_connections SET provider_driver = ? WHERE connection_id = ?",
+      ).run("pi/deepseek", "connection-a"))
+        .toThrowError("immutable_provider_driver");
       expect(() => connection.db.prepare(
         "DELETE FROM model_registry_events WHERE event_id = ?",
       ).run("event-a")).toThrowError("append_only_model_registry_events");
@@ -407,7 +564,7 @@ describe("SQLite migrations", () => {
         .prepare(
           "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
         )
-        .run(3);
+        .run(4);
 
       expect(() => migrate(connection.db)).toThrowError("database_newer_than_binary");
     } finally {
@@ -539,6 +696,27 @@ async function importMigratorWithResources(
 function restoreMigrationResourceMock(): void {
   vi.doUnmock("node:fs");
   vi.resetModules();
+}
+
+function migrateThroughVersion2(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY CHECK (version > 0),
+      applied_at TEXT NOT NULL
+    )
+  `);
+  for (const version of [1, 2]) {
+    const sql = readFileSync(new URL(
+      `../../src/adapters/sqlite/migrations/${String(version).padStart(4, "0")}-${
+        version === 1 ? "m1-kernel" : "model-registry"
+      }.sql`,
+      import.meta.url,
+    ), "utf8");
+    db.exec(sql);
+    db.prepare(
+      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    ).run(version, NOW);
+  }
 }
 
 function beforeFirstBegin(db: DatabaseSync, callback: () => void): DatabaseSync {

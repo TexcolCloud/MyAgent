@@ -24,6 +24,8 @@
     "myagent": "./dist/interfaces/cli/main.js"
   },
   "dependencies": {
+    "@mariozechner/pi-ai": "0.73.1",
+    "@mariozechner/pi-tui": "0.73.1",
     "canonicalize": "^2.1.0",
     "commander": "^14.0.3",
     "fastify": "^5.11.2",

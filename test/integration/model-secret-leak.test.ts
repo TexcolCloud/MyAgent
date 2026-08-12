@@ -47,7 +47,8 @@ describe("Model control Secret containment", () => {
         payload: {
           slug: "leak-provider",
           displayName: "Leak Provider",
-          kind: "openai",
+          kind: "openai_compatible",
+          baseUrl: "https://api.openai.com/v1",
           auth: { type: "api_key" },
           apiKey: plaintext,
         },

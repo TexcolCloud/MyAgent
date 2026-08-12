@@ -13,6 +13,7 @@ import {
   type ValidatedUnsupportedEndpointEvidence,
 } from "../domain/model-verification.js";
 import type { ModelProfileRevision, ModelProfileView } from "../domain/model-profile.js";
+import type { PiRuntimeContract } from "../domain/pi-runtime.js";
 import type { ProviderConnectionRevision, ProviderConnectionView } from "../domain/provider-connection.js";
 import type { Clock } from "../ports/clock.js";
 import type { IdGenerator } from "../ports/id-generator.js";
@@ -444,6 +445,9 @@ export class VerifyModelService {
       maxInputTokens: profileRevision.maxInputTokens,
       verifiedCapabilities: Object.freeze([...profileRevision.verifiedCapabilities]),
       compatibilityPresetVersion: connectionRevision.presetVersion,
+      ...(profileRevision.piRuntime === undefined
+        ? {}
+        : { piRuntime: snapshotPiRuntime(profileRevision.piRuntime) }),
     });
   }
 
@@ -461,6 +465,9 @@ export class VerifyModelService {
       return undefined;
     }
     const target = this.resolveTarget(claimed.profileRevisionId);
+    if (target.profileRevision.piRuntime !== undefined) {
+      return undefined;
+    }
     if (
       target.profileRevision.invocationProtocol !==
       target.connectionRevision.protocolPreference
@@ -660,6 +667,13 @@ function boundedAbortSignal(
       parent.removeEventListener("abort", onParentAbort);
     },
   };
+}
+
+function snapshotPiRuntime(runtime: PiRuntimeContract): PiRuntimeContract {
+  return Object.freeze({
+    ...runtime,
+    compatibility: Object.freeze({ ...runtime.compatibility }),
+  });
 }
 
 function linkedAbortController(parent: AbortSignal): {
