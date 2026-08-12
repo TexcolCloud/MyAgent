@@ -14,7 +14,10 @@ import { deleteSession, listSessions } from "./commands/sessions.js";
 import { reconcileTool } from "./commands/tools.js";
 import { getVerification } from "./commands/verifications.js";
 import { writeProblem, type CliProblemOutput, type CliWrite } from "./formatters.js";
+import { readTuiCredentials, TuiCredentialRequiredError, TuiTokensMustDifferError } from "../tui/credentials.js";
 import { assertInteractiveTty, InteractiveTtyRequiredError } from "../tui/tty.js";
+import { TuiClient } from "../tui/tui-client.js";
+import { runWorkbench, type RunWorkbenchOptions } from "../tui/workbench.js";
 
 export type { CliPrompt } from "./commands/model-setup.js";
 
@@ -28,7 +31,7 @@ export interface ExecuteCliOptions {
   writeError?: CliWrite;
   stdinIsTTY?: boolean;
   stdoutIsTTY?: boolean;
-  runTui?: () => Promise<void>;
+  runTui?: (options: RunWorkbenchOptions) => Promise<void>;
 }
 
 export async function executeCli(argumentsList: readonly string[], options: ExecuteCliOptions = {}): Promise<number> {
@@ -46,11 +49,25 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
         stdinIsTTY: options.stdinIsTTY ?? process.stdin.isTTY === true,
         stdoutIsTTY: options.stdoutIsTTY ?? process.stdout.isTTY === true,
       });
-      if (options.runTui !== undefined) {
-        await options.runTui();
-        return 0;
-      }
-      throw new CliUsageError("tui_unavailable", "The interactive workbench is not available.");
+      const credentials = await readTuiCredentials({
+        environment: {
+          ...environment,
+          ...(stringFlag(flags, "token") === undefined ? {} : { MYAGENT_RUN_TOKEN: requiredFlag(flags, "token") }),
+          ...(stringFlag(flags, "admin-token") === undefined ? {} : { MYAGENT_ADMIN_TOKEN: requiredFlag(flags, "admin-token") }),
+        },
+        promptSecret: (label) => (options.prompt ?? createConsolePrompt()).secret(label),
+      });
+      const workbenchOptions: RunWorkbenchOptions = {
+        client: new TuiClient({
+          runToken: credentials.runToken,
+          adminToken: credentials.adminToken,
+          ...(stringFlag(flags, "api-url") === undefined ? {} : { apiUrl: requiredFlag(flags, "api-url") }),
+          ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+        }),
+      };
+      if (options.runTui !== undefined) await options.runTui(workbenchOptions);
+      else await runWorkbench(workbenchOptions);
+      return 0;
     }
     if (command === "serve") {
       await serve(stringFlag(flags, "config") ?? "myagent.yaml");
@@ -277,6 +294,8 @@ function modelSelection(flags: CliFlags):
 function cliFailure(error: unknown): { exitCode: number; problem: CliProblemOutput } {
   if (error instanceof CliUsageError) return { exitCode: 2, problem: error };
   if (error instanceof InteractiveTtyRequiredError) return { exitCode: 2, problem: error };
+  if (error instanceof TuiTokensMustDifferError) return { exitCode: 3, problem: error };
+  if (error instanceof TuiCredentialRequiredError) return { exitCode: 3, problem: error };
   if (error instanceof CliValidationError) return { exitCode: 2, problem: error };
   if (error instanceof CliCredentialError) return { exitCode: 3, problem: error };
   if (error instanceof CliHttpError) {

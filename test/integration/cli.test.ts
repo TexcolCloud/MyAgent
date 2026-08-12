@@ -35,6 +35,7 @@ describe("CLI HTTP boundary", () => {
       MYAGENT_RUN_TOKEN: "run-token-must-not-appear",
       MYAGENT_ADMIN_TOKEN: "admin-token-must-not-appear",
     };
+    const runTui = vi.fn();
 
     await expect(executeCli(["tui", "--unsupported", "value"], {
       environment,
@@ -47,15 +48,38 @@ describe("CLI HTTP boundary", () => {
       environment,
       stdinIsTTY: true,
       stdoutIsTTY: true,
+      runTui,
       write: (line) => output.push(line),
       writeError: (line) => output.push(line),
-    })).resolves.toBe(2);
+    })).resolves.toBe(0);
 
     expect(output).toEqual([
       "invalid_cli_command: The CLI command is invalid. (traceId: cli)",
-      "tui_unavailable: The interactive workbench is not available. (traceId: cli)",
     ]);
+    expect(runTui).toHaveBeenCalledOnce();
     expect(output.join("\n")).not.toContain("token");
+  });
+
+  it("uses explicit TUI token overrides for their separate authority clients", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const authorizations: string[] = [];
+    const runTui = async (input: { readonly client: { listProviderDrivers(): Promise<unknown> } }) => {
+      await input.client.listProviderDrivers();
+    };
+
+    await expect(executeCli(["tui", "--token", "run-override", "--admin-token", "admin-override"], {
+      environment: { MYAGENT_RUN_TOKEN: "run-environment", MYAGENT_ADMIN_TOKEN: "admin-environment" },
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      fetcher: async (_input, init) => {
+        authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
+        return Response.json({ piVersion: "0.73.1", drivers: [] });
+      },
+      runTui: runTui as never,
+      writeError: () => undefined,
+    })).resolves.toBe(0);
+
+    expect(authorizations).toEqual(["Bearer admin-override"]);
   });
 
   it("loads local config validation without importing SQLite", async () => {

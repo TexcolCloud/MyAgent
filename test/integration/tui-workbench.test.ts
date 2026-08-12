@@ -1,7 +1,46 @@
+import type { Terminal } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
 import type { CliPrompt } from "../../src/interfaces/cli/commands/model-setup.js";
+import { runWorkbench } from "../../src/interfaces/tui/workbench.js";
+import { InspectorScreen } from "../../src/interfaces/tui/screens/inspector.js";
 import { runModelSetupScreen } from "../../src/interfaces/tui/screens/model-setup.js";
+
+describe("TUI workbench", () => {
+  it("renders three bounded regions and restores the terminal on exit", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36, inputs: ["\u0003"] });
+
+    await runWorkbench({ client: safeClient(), terminal });
+
+    expect(terminal.frames.at(-1)).toContain("Runs");
+    expect(terminal.frames.at(-1)).toContain("Inspect");
+    expect(terminal.stopCalls).toBe(1);
+  });
+
+  it("does not render a raw provider response or token in inspector text", () => {
+    const screen = new InspectorScreen();
+    screen.showProblem({ code: "provider_unavailable", detail: "safe detail", traceId: "t_1" });
+
+    const text = screen.render(40).join("\n");
+    expect(text).toContain("provider_unavailable");
+    expect(text).not.toContain("Authorization");
+    expect(text).not.toContain("Bearer");
+  });
+
+  it("keeps every region within a narrow render width", () => {
+    const inspector = new InspectorScreen();
+    inspector.showProblem({
+      code: "provider_unavailable",
+      detail: "A safe diagnostic detail that must be bounded to the inspector column.",
+      traceId: "t_1",
+    });
+
+    for (const line of inspector.render(12)) {
+      expect(visibleWidth(line)).toBeLessThanOrEqual(12);
+    }
+  });
+});
 
 describe("model setup screen", () => {
   it("waits 250ms between verification reads by default", async () => {
@@ -33,14 +72,13 @@ describe("model setup screen", () => {
 
   it("requires explicit promotion after successful verification", async () => {
     const requests: { path: string; body: unknown }[] = [];
-    const client = setupClient(requests);
     const prompt = scriptedPrompt({
       selects: ["deepseek", "pi/deepseek:deepseek-chat", "environment", "preset"],
       inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", "deepseek-chat", "DeepSeek Chat", ""],
       confirmations: [true, false, false],
     });
 
-    const outcome = await runModelSetupScreen({ prompt, client, write: vi.fn(), sleep: async () => undefined });
+    const outcome = await runModelSetupScreen({ prompt, client: setupClient(requests), write: vi.fn(), sleep: async () => undefined });
 
     expect(outcome).toEqual({ status: "cancelled" });
     expect(requests.some((request) => request.path.endsWith("/promotions"))).toBe(false);
@@ -56,12 +94,7 @@ describe("model setup screen", () => {
       selections,
     });
 
-    await runModelSetupScreen({
-      prompt,
-      client: setupClient(requests),
-      write: vi.fn(),
-      sleep: async () => undefined,
-    });
+    await runModelSetupScreen({ prompt, client: setupClient(requests), write: vi.fn(), sleep: async () => undefined });
 
     const catalog = selections.find((entry) => entry.message === "Catalog model");
     expect(catalog?.choices).toEqual([
@@ -75,6 +108,40 @@ describe("model setup screen", () => {
       .toEqual(expect.objectContaining({ catalogCandidateId: "pi/deepseek:deepseek-chat" }));
   });
 });
+
+class FakeTuiTerminal implements Terminal {
+  readonly frames: string[] = [];
+  stopCalls = 0;
+  private onInput: ((data: string) => void) | undefined;
+
+  constructor(private readonly options: { readonly width: number; readonly height: number; readonly inputs?: readonly string[] }) {}
+
+  start(onInput: (data: string) => void): void {
+    this.onInput = onInput;
+    setTimeout(() => this.options.inputs?.forEach((input) => this.onInput?.(input)), 0);
+  }
+
+  stop(): void { this.stopCalls += 1; }
+  async drainInput(): Promise<void> {}
+  write(data: string): void { this.frames.push(`${this.frames.at(-1) ?? ""}${data}`); }
+  get columns(): number { return this.options.width; }
+  get rows(): number { return this.options.height; }
+  get kittyProtocolActive(): boolean { return false; }
+  moveBy(): void {}
+  hideCursor(): void {}
+  showCursor(): void {}
+  clearLine(): void {}
+  clearFromCursor(): void {}
+  clearScreen(): void {}
+  setTitle(): void {}
+  setProgress(): void {}
+}
+
+function safeClient() {
+  return {
+    listProviderDrivers: async () => ({ piVersion: "0.73.1" as const, drivers: [] }),
+  };
+}
 
 function scriptedPrompt(values: {
   selects: string[];
