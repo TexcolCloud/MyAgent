@@ -53,9 +53,10 @@ New native candidate-based Profile Revisions and the Run snapshots derived
 from them persist this value. A stored Pi runtime contract without the field
 is a legacy contract and reads as `"none"`; it is not written back. Any
 unknown value is invalid persisted configuration and fails closed as the
-existing redacted `invalid_model_profile` path. A Run must use its captured
-contract and must never consult mutable catalog metadata to decide
-compatibility behavior.
+existing redacted `invalid_model_profile` control-plane path. A captured Run
+snapshot with an unknown contract cannot execute and terminates through the
+redacted `model_protocol_error` path. A Run must use its captured contract and
+must never consult mutable catalog metadata to decide compatibility behavior.
 
 ## Catalog Identity
 
