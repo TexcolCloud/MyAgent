@@ -297,6 +297,78 @@ describe("multi-provider model registry release isolation", () => {
       expect(gatewayRequests.every((requestPath) => requestPath.startsWith("/pi/")))
         .toBe(true);
       expect(provider.chatRequests).toHaveLength(3);
+      const manualRunPayload = provider.chatRequests[2]?.body;
+      expect(manualRunPayload).toMatchObject({
+        model: "manual-compatible-model",
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            role: "user",
+            content: expect.stringContaining("Use the persisted Pi runtime."),
+          }),
+        ]),
+        stream: true,
+        tools: expect.arrayContaining([
+          expect.objectContaining({
+            type: "function",
+            function: expect.objectContaining({ name: "read_file" }),
+          }),
+        ]),
+      });
+      expect(manualRunPayload).not.toHaveProperty("store");
+      expect(manualRunPayload).not.toHaveProperty("tools[0].function.strict");
+    } finally {
+      await cleanup.dispose();
+    }
+  }, 30_000);
+
+  it("keeps a manual Responses payload compatible through the Pi gateway", async () => {
+    const cleanup = createAsyncCleanupStack();
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["manual-compatible-responses"],
+        responses: [
+          { type: "verification_text", text: "Manual Responses verification passed" },
+          { type: "verification_tool", callId: "verify-manual-responses" },
+          { type: "text", text: "Manual Responses gateway run completed" },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await service.setupVerifiedModel({
+        connectionSlug: "manual-responses-gateway",
+        profileSlug: "manual-responses-gateway",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "manual-compatible-responses",
+        protocol: "responses",
+        agentId: "primary",
+      });
+      const run = await service.createRun({
+        agentId: "primary",
+        sessionKey: "release:manual-responses-gateway",
+        text: "Use the persisted manual Responses runtime.",
+        idempotencyKey: "manual-responses-gateway-run",
+      });
+
+      await service.waitForRunStatus(run.runId, "completed");
+
+      expect(provider.responsesRequests).toHaveLength(3);
+      const manualRunPayload = provider.responsesRequests[2]?.body;
+      expect(manualRunPayload).toMatchObject({
+        model: "manual-compatible-responses",
+        input: expect.arrayContaining([
+          expect.objectContaining({
+            role: "user",
+          }),
+        ]),
+        stream: true,
+        tools: expect.arrayContaining([
+          expect.objectContaining({ type: "function", name: "read_file" }),
+        ]),
+      });
+      expect(JSON.stringify(manualRunPayload)).toContain(
+        "Use the persisted manual Responses runtime.",
+      );
+      expect(manualRunPayload).not.toHaveProperty("store");
+      expect(manualRunPayload).not.toHaveProperty("tools[0].strict");
     } finally {
       await cleanup.dispose();
     }

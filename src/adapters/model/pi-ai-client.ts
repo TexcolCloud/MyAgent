@@ -76,7 +76,7 @@ export class PiAiSdkClient implements PiAiClient {
         : { maxTokens: input.contract.maxOutputTokens }),
       ...(input.toolChoice === undefined ? {} : { toolChoice: input.toolChoice }),
       maxRetries: 0,
-      onPayload: (payload) => disableParallelToolCalls(input.contract.api, payload),
+      onPayload: (payload) => transformPayload(input.contract, payload),
       onResponse(response) {
         status = response.status;
         retryAfterMs = parseRetryAfter(response.headers);
@@ -228,18 +228,42 @@ function assistantMessage(
   };
 }
 
-function disableParallelToolCalls(api: string, payload: unknown): unknown | undefined {
+function transformPayload(
+  contract: PiRuntimeContract,
+  payload: unknown,
+): unknown | undefined {
   if (
-    api !== "openai-completions" &&
-    api !== "openai-responses" &&
-    api !== "openai-codex-responses"
+    contract.api !== "openai-completions" &&
+    contract.api !== "openai-responses" &&
+    contract.api !== "openai-codex-responses"
   ) {
     return undefined;
   }
-  if (typeof payload !== "object" || payload === null || !("tools" in payload)) {
+  if (typeof payload !== "object" || payload === null) {
     return undefined;
   }
-  return { ...payload, parallel_tool_calls: false };
+  const sanitized = contract.driverId === "pi/openai-compatible" &&
+      contract.api === "openai-responses"
+    ? omitManualResponsesCompatibilityFields(payload)
+    : payload;
+  if (!("tools" in sanitized)) return sanitized === payload ? undefined : sanitized;
+  return { ...sanitized, parallel_tool_calls: false };
+}
+
+function omitManualResponsesCompatibilityFields(
+  payload: object,
+): Record<string, unknown> {
+  const sanitized = { ...payload } as Record<string, unknown>;
+  delete sanitized.store;
+  if (Array.isArray(sanitized.tools)) {
+    sanitized.tools = sanitized.tools.map((tool) => {
+      if (typeof tool !== "object" || tool === null || Array.isArray(tool)) return tool;
+      const sanitizedTool = { ...tool } as Record<string, unknown>;
+      delete sanitizedTool.strict;
+      return sanitizedTool;
+    });
+  }
+  return sanitized;
 }
 
 function parseRetryAfter(headers: Record<string, string>): number | undefined {

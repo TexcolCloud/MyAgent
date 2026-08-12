@@ -2046,13 +2046,19 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 const PI_RUNTIME_BOOLEAN_COMPATIBILITY_KEYS = new Set([
+  "requiresAssistantAfterToolResult",
   "requiresReasoningContentOnAssistantMessages",
+  "requiresThinkingAsText",
+  "requiresToolResultName",
   "sendSessionAffinityHeaders",
+  "sendSessionIdHeader",
   "supportsDeveloperRole",
   "supportsEagerToolInputStreaming",
+  "supportsLongCacheRetention",
   "supportsReasoningEffort",
   "supportsStore",
   "supportsStrictMode",
+  "supportsUsageInStreaming",
   "zaiToolStream",
 ]);
 
