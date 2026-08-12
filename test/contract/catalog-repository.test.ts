@@ -69,6 +69,45 @@ describe("SqliteCatalogRepository", () => {
       connection.close();
     }
   });
+
+  it("reads a historical Pi runtime as none without rewriting its snapshot JSON", () => {
+    const connection = openDatabase({
+      path: tempPath("catalog-historical-pi-runtime.db"),
+      busyTimeoutMs: 5_000,
+    });
+    try {
+      migrate(connection.db);
+      const repository = new SqliteCatalogRepository(connection.db);
+      const revision = agentRevisionFixture();
+      const runtime = {
+        kind: "pi_ai",
+        piVersion: "0.73.1",
+        driverId: "pi/deepseek",
+        catalogProviderId: "deepseek",
+        api: "openai-completions",
+        modelId: "deepseek-v4-flash",
+        contextWindow: 8_192,
+        compatibility: {},
+      };
+      const historicalJson = JSON.stringify({
+        ...revision,
+        model: { ...revision.model, piRuntime: runtime },
+      });
+      connection.db.prepare(
+        `INSERT INTO agent_revisions (
+           revision_id, agent_id, content_json, content_sha256, created_at
+         ) VALUES (?, ?, ?, ?, datetime('now'))`,
+      ).run(revision.revisionId, revision.agentId, historicalJson, "a".repeat(64));
+
+      expect(repository.get(revision.revisionId)?.model.piRuntime)
+        .toMatchObject({ providerCompatibilityContract: "none" });
+      expect(connection.db.prepare(
+        "SELECT content_json FROM agent_revisions WHERE revision_id = ?",
+      ).get(revision.revisionId)).toEqual({ content_json: historicalJson });
+    } finally {
+      connection.close();
+    }
+  });
 });
 
 function agentRevisionFixture(): AgentRevisionSnapshot {

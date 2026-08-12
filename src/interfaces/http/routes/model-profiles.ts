@@ -5,7 +5,7 @@ import { manualModelEntryAllowed } from "../../../application/discover-models.js
 import type { ManageModelProfilesService } from "../../../application/manage-model-profiles.js";
 import {
   PI_RUNTIME_VERSION,
-  resolveProviderCatalogCandidate,
+  resolveProviderCatalogCandidateForRuntime,
 } from "../../../config/pi-runtime-catalog.js";
 import { modelContextPreset } from "../../../config/provider-presets.js";
 import { ApplicationError } from "../../../domain/errors.js";
@@ -341,7 +341,7 @@ function profileResponse(profile: ModelProfileView) {
       const { piRuntime, ...safeRevision } = revision;
       const catalogCandidate = piRuntime === undefined
         ? undefined
-        : resolveProviderCatalogCandidate(`${piRuntime.driverId}:${piRuntime.modelId}`);
+        : resolveProviderCatalogCandidateForRuntime(piRuntime);
       return {
         ...safeRevision,
         ...(catalogCandidate === undefined

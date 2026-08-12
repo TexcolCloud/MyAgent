@@ -1994,8 +1994,7 @@ function compatibilityKindForDriver(driver: ProviderDriverId): ProviderKind {
 }
 
 function serializePiRuntime(value: PiRuntimeContract): string {
-  assertPiRuntime(value);
-  return serialize(value);
+  return serialize(normalizePiRuntime(value));
 }
 
 function parsePiRuntime(serialized: string): PiRuntimeContract {
@@ -2005,11 +2004,20 @@ function parsePiRuntime(serialized: string): PiRuntimeContract {
   } catch {
     throw new DomainError("invalid_model_profile");
   }
-  assertPiRuntime(parsed);
-  return parsed;
+  return normalizePiRuntime(parsed);
 }
 
-function assertPiRuntime(value: unknown): asserts value is PiRuntimeContract {
+function normalizePiRuntime(value: unknown): PiRuntimeContract {
+  assertPiRuntime(value);
+  return {
+    ...value,
+    providerCompatibilityContract: value.providerCompatibilityContract ?? "none",
+  };
+}
+
+function assertPiRuntime(value: unknown): asserts value is Omit<PiRuntimeContract, "providerCompatibilityContract"> & {
+  readonly providerCompatibilityContract?: PiRuntimeContract["providerCompatibilityContract"];
+} {
   if (!isRecord(value)) throw new DomainError("invalid_model_profile");
   const allowedKeys = new Set([
     "api",
@@ -2021,6 +2029,7 @@ function assertPiRuntime(value: unknown): asserts value is PiRuntimeContract {
     "maxOutputTokens",
     "modelId",
     "piVersion",
+    "providerCompatibilityContract",
   ]);
   if (Object.keys(value).some((key) => !allowedKeys.has(key)) ||
     value.kind !== "pi_ai" || value.piVersion !== "0.73.1" ||
@@ -2028,9 +2037,17 @@ function assertPiRuntime(value: unknown): asserts value is PiRuntimeContract {
     !isNonEmptyString(value.catalogProviderId) || !isNonEmptyString(value.api) ||
     !isNonEmptyString(value.modelId) || !isPositiveInteger(value.contextWindow) ||
     (value.maxOutputTokens !== undefined && !isPositiveInteger(value.maxOutputTokens)) ||
+    (value.providerCompatibilityContract !== undefined &&
+      !isProviderCompatibilityContract(value.providerCompatibilityContract)) ||
     !isPiRuntimeCompatibility(value.compatibility)) {
     throw new DomainError("invalid_model_profile");
   }
+}
+
+function isProviderCompatibilityContract(
+  value: unknown,
+): value is PiRuntimeContract["providerCompatibilityContract"] {
+  return value === "none" || value === "deepseek-responses-v1";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

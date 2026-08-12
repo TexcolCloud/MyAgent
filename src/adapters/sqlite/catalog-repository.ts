@@ -4,6 +4,7 @@ import canonicalizeModule from "canonicalize";
 import type { DatabaseSync } from "node:sqlite";
 
 import type { AgentRevisionSnapshot } from "../../domain/agent-revision.js";
+import type { PiRuntimeContract } from "../../domain/pi-runtime.js";
 import { DomainError } from "../../domain/errors.js";
 import type { CatalogRevisionStore } from "../../ports/catalog-store.js";
 
@@ -49,6 +50,25 @@ export class SqliteCatalogRepository implements CatalogRevisionStore {
       .prepare("SELECT content_json FROM agent_revisions WHERE revision_id = ?")
       .get(revisionId) as StoredRevision | undefined;
 
-    return row === undefined ? null : (JSON.parse(row.content_json) as AgentRevisionSnapshot);
+    return row === undefined
+      ? null
+      : normalizeSnapshot(JSON.parse(row.content_json) as AgentRevisionSnapshot);
   }
+}
+
+function normalizeSnapshot(snapshot: AgentRevisionSnapshot): AgentRevisionSnapshot {
+  const runtime = snapshot.model.piRuntime;
+  if (runtime === undefined || runtime.providerCompatibilityContract !== undefined) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    model: {
+      ...snapshot.model,
+      piRuntime: {
+        ...runtime,
+        providerCompatibilityContract: "none",
+      } as PiRuntimeContract,
+    },
+  };
 }

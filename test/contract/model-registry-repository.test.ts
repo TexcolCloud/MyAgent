@@ -57,7 +57,7 @@ describe("SqliteModelRegistryRepository", () => {
           '"compatibility":{"supportsDeveloperRole":false,"supportsStrictMode":false},' +
           '"contextWindow":200000,"driverId":"pi/anthropic","kind":"pi_ai",' +
           '"maxOutputTokens":64000,"modelId":"claude-sonnet-4-20250514",' +
-          '"piVersion":"0.73.1"}',
+          '"piVersion":"0.73.1","providerCompatibilityContract":"none"}',
       });
       expect(() => db.prepare(
         "UPDATE model_profile_revisions SET runtime_contract_json = ? WHERE revision_id = ?",
@@ -199,6 +199,37 @@ describe("SqliteModelRegistryRepository", () => {
       );
 
       expect(() => repository.getProfile(profileId("profile-malformed")))
+        .toThrowError(expect.objectContaining({ code: "invalid_model_profile" }));
+    });
+  });
+
+  it("reads a historical Pi contract without a compatibility field as none", () => {
+    usingFixture("historical-pi-runtime-contract", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-pi", "pcr-pi"));
+      insertRawRuntimeContract(db, "profile-historical", "mpr-historical", "pcr-pi", {
+        ...ANTHROPIC_CONTRACT,
+        providerCompatibilityContract: undefined,
+      });
+
+      expect(repository.getProfile(profileId("profile-historical")).revisions[0]?.piRuntime)
+        .toMatchObject({ providerCompatibilityContract: "none" });
+      expect(db.prepare(
+        "SELECT runtime_contract_json FROM model_profile_revisions WHERE revision_id = ?",
+      ).get("mpr-historical")).toEqual({
+        runtime_contract_json: expect.not.stringContaining("providerCompatibilityContract"),
+      });
+    });
+  });
+
+  it("rejects an unknown persisted compatibility contract", () => {
+    usingFixture("unknown-pi-runtime-contract", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-pi", "pcr-pi"));
+      insertRawRuntimeContract(db, "profile-unknown", "mpr-unknown", "pcr-pi", {
+        ...ANTHROPIC_CONTRACT,
+        providerCompatibilityContract: "unreleased-v99",
+      });
+
+      expect(() => repository.getProfile(profileId("profile-unknown")))
         .toThrowError(expect.objectContaining({ code: "invalid_model_profile" }));
     });
   });
@@ -1705,6 +1736,33 @@ function profileRevision(
     createdAt: NOW,
     ...overrides,
   };
+}
+
+function insertRawRuntimeContract(
+  db: DatabaseSync,
+  profile: string,
+  revision: string,
+  connectionRevision: string,
+  runtime: object,
+): void {
+  db.prepare(
+    `INSERT INTO model_profiles (
+       profile_id, display_name, active_revision_id, retired_at,
+       record_revision, created_at, updated_at
+     ) VALUES (?, ?, NULL, NULL, 0, ?, ?)`,
+  ).run(profile, profile, NOW.toISOString(), NOW.toISOString());
+  db.prepare(
+    `INSERT INTO model_profile_revisions (
+       revision_id, profile_id, connection_revision_id, state,
+       provider_model_id, invocation_protocol, max_input_tokens,
+       context_window_source, capability_baseline,
+       verified_capabilities_json, runtime_contract_json, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    revision, profile, connectionRevision, "draft", ANTHROPIC_CONTRACT.modelId,
+    "pi_ai", ANTHROPIC_CONTRACT.contextWindow, "preset",
+    "text_and_single_tool_call_v1", "[]", JSON.stringify(runtime), NOW.toISOString(),
+  );
 }
 
 function context(event: string, now: Date): MutationContext {
