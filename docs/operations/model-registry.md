@@ -6,6 +6,39 @@ Run the service on loopback and configure separate Run and Admin Token Secret re
 
 Use configuration version 2. It contains `server.bearerToken`, `server.adminToken`, `database`, Agent and Skill roots, and `modelControl` limits. Version 2 does not accept legacy `models:` entries or Agent `model:` fields.
 
+## Interactive TUI
+
+Start the workbench with `myagent tui` from a terminal that provides both an
+interactive stdin TTY and stdout TTY. Redirected input/output, CI, and other
+non-interactive invocations fail with `interactive_tty_required` before the
+workbench starts.
+
+The TUI reads its Run credential only from `MYAGENT_RUN_TOKEN` and its Admin
+credential only from `MYAGENT_ADMIN_TOKEN`. If either variable is absent, the
+TUI asks for that value with hidden input. The two values must differ. Do not
+put either token in command arguments: `--token` and `--admin-token` are
+rejected for `myagent tui`. Run creation, Run reads, committed SSE events, and
+Approval decisions use Run authority. Provider Connection and Model Profile
+reads and mutations use Admin authority.
+
+The workbench observes one durable Run created for the Operator's exact Agent,
+Session Key, and message. If its SSE connection is interrupted, use reconnect;
+the TUI resumes that Run after its last committed event cursor and does not
+re-submit the message. The Approvals view lists pending server records and each
+approve or deny action applies to one exact Approval and Tool Call. A decision
+does not create a session-wide permission, and the TUI never executes the Tool
+locally.
+
+Model setup uses the lifecycle below. `Catalog model` identifies static
+metadata from the pinned Pi package; `Discovered model` identifies a model
+reported by the configured Provider endpoint. Selection, discovery, and
+Verification are separate states, and none implicitly promotes or assigns a
+model. Every mutation uses the record revision returned by the control plane.
+If a mutation returns `revision_conflict`, the TUI clears the stale setup
+review and confirmation state, sends no automatic retry, and displays `Reload
+required`. Reload Providers or Profiles successfully, inspect the current
+state, then make a fresh setup and Promotion choice.
+
 ## Initial Setup
 
 Run `myagent model setup` for the guided flow, or use the individual `providers`, `models`, and `agents` commands for automation. The lifecycle order is fixed:

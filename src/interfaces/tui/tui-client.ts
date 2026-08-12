@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { JsonValue } from "../../domain/json.js";
-import { CliClient } from "../cli/client.js";
+import { CliClient, CliHttpError } from "../cli/client.js";
 import { TuiTokensMustDifferError, type TuiCredentials } from "./credentials.js";
 
 export interface TuiClientOptions extends TuiCredentials {
@@ -107,6 +107,10 @@ export interface ModelProfilesView {
     readonly activeRevisionId: string | null;
     readonly retiredAt: string | null;
   }[];
+}
+
+export function isRevisionConflict(error: unknown): error is CliHttpError {
+  return error instanceof CliHttpError && error.code === "revision_conflict";
 }
 
 export class TuiClient {

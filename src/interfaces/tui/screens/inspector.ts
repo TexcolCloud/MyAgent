@@ -10,6 +10,7 @@ export interface SafeProblemView {
 
 export type SafeInspectorView =
   | { readonly kind: "empty" }
+  | { readonly kind: "conflict" }
   | { readonly kind: "problem"; readonly problem: SafeProblemView };
 
 export class InspectorScreen implements Component {
@@ -28,9 +29,18 @@ export class InspectorScreen implements Component {
 
   clear(): void { this.view = { kind: "empty" }; }
 
+  showConflict(): void { this.view = { kind: "conflict" }; }
+
   render(width: number): string[] {
     if (this.view.kind === "empty") {
       return [truncateToWidth("Inspect", width), truncateToWidth("Select an item to inspect.", width)];
+    }
+    if (this.view.kind === "conflict") {
+      return [
+        truncateToWidth("Inspect", width),
+        truncateToWidth("Reload required", width),
+        truncateToWidth("Fetch current registry state before choosing again.", width),
+      ];
     }
     const { code, detail, traceId } = this.view.problem;
     return [

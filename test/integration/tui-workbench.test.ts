@@ -3,6 +3,7 @@ import { visibleWidth } from "@mariozechner/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
 import type { CliPrompt } from "../../src/interfaces/cli/commands/model-setup.js";
+import { CliHttpError } from "../../src/interfaces/cli/client.js";
 import { runWorkbench } from "../../src/interfaces/tui/workbench.js";
 import { ApprovalScreen } from "../../src/interfaces/tui/screens/approvals.js";
 import { InspectorScreen } from "../../src/interfaces/tui/screens/inspector.js";
@@ -417,6 +418,41 @@ describe("TUI workbench", () => {
     await expect(workbench).resolves.toBe(0);
   });
 
+  it("requires a successful registry reload after setup Promotion conflicts", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const requests: string[] = [];
+    const client = safeClient({
+      adminRequest: async (path: string) => {
+        requests.push(path);
+        throw new CliHttpError(409, "revision_conflict", "provider-secret stale response", "trace-secret");
+      },
+    });
+    const workbench = runWorkbench({ client, terminal });
+
+    await terminal.ready();
+    terminal.input("m");
+    await terminal.waitForFrame("Reload required");
+
+    const requestCountAtConflict = requests.length;
+    const conflictFrame = plainLines(terminal.frames.at(-1) ?? "").join("\n");
+    expect(conflictFrame).toContain("Model setup stopped");
+    expect(conflictFrame).not.toContain("promoting model");
+    terminal.input("m");
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    expect(requests).toHaveLength(requestCountAtConflict);
+    expect(plainLines(terminal.frames.join("\n")).join("\n")).not.toContain("provider-secret");
+
+    terminal.input("\u001b[B");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await terminal.waitForFrame("Model One");
+    terminal.input("m");
+    await vi.waitFor(() => { expect(requests).toHaveLength(requestCountAtConflict + 1); });
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+  });
+
   it("waits for Ctrl+C to cancel active model setup without later polling or mutations", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const requests: { path: string; body: unknown }[] = [];
@@ -532,6 +568,15 @@ describe("TUI workbench", () => {
     expect(text).not.toContain("\u001b");
   });
 
+  it("renders a reload-required conflict without server detail or trace content", () => {
+    const screen = new InspectorScreen();
+    screen.showConflict();
+
+    const text = screen.render(80).join("\n");
+    expect(text).toContain("Reload required");
+    expect(text).not.toContain("provider-secret");
+  });
+
   it("keeps the composed three-region layout within a narrow render width", async () => {
     const terminal = new FakeTuiTerminal({ width: 24, height: 36, inputs: ["\u0003"] });
 
@@ -546,6 +591,60 @@ describe("TUI workbench", () => {
 });
 
 describe("model setup screen", () => {
+  it("returns a reload requirement after one conflicting Promotion and clears review output", async () => {
+    const requests: { path: string; body: unknown }[] = [];
+    const output: string[] = [];
+    const setup = setupClient(requests);
+    const client = {
+      adminRequest: async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
+        if (path.endsWith("/promotions")) {
+          requests.push({ path, body: init?.body });
+          throw new CliHttpError(409, "revision_conflict", "provider-secret stale response", "trace-secret");
+        }
+        return setup.adminRequest<T>(path, init);
+      },
+    };
+    const outcome = await runModelSetupScreen({
+      client,
+      prompt: scriptedPrompt({
+        selects: ["deepseek", "pi/deepseek:deepseek-chat", "managed_secret", "preset"],
+        inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "deepseek-chat", "DeepSeek Chat", ""],
+        secrets: ["provider-secret"],
+        confirmations: [true, false, true],
+      }),
+      write: (line) => output.push(line),
+      sleep: async () => undefined,
+    });
+
+    expect(outcome).toEqual({ status: "conflict", reloadRequired: true });
+    expect(requests.filter((request) => request.path.endsWith("/promotions"))).toHaveLength(1);
+    expect(output.join("\n")).not.toContain("provider-secret");
+  });
+
+  it("does not convert unrelated HTTP failures into revision conflicts", async () => {
+    const requests: { path: string; body: unknown }[] = [];
+    const setup = setupClient(requests);
+    const client = {
+      adminRequest: async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
+        if (path.endsWith("/promotions")) {
+          throw new CliHttpError(503, "provider_unavailable", "safe detail", "trace_1");
+        }
+        return setup.adminRequest<T>(path, init);
+      },
+    };
+
+    await expect(runModelSetupScreen({
+      client,
+      prompt: scriptedPrompt({
+        selects: ["deepseek", "pi/deepseek:deepseek-chat", "environment", "preset"],
+        inputs: ["deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", "deepseek-chat", "DeepSeek Chat", ""],
+        confirmations: [true, false, true],
+      }),
+      write: vi.fn(),
+      sleep: async () => undefined,
+    })).rejects.toMatchObject({ code: "provider_unavailable" });
+  });
+
   it("waits 250ms between verification reads by default", async () => {
     vi.useFakeTimers();
     try {
@@ -752,6 +851,7 @@ function isAnsiTerminator(character: string): boolean {
 function scriptedPrompt(values: {
   selects: string[];
   inputs: string[];
+  secrets?: string[];
   confirmations: boolean[];
   selections?: { message: string; choices: readonly unknown[] }[];
 }): CliPrompt {
@@ -765,7 +865,7 @@ function scriptedPrompt(values: {
       return values.selects.shift() as T;
     },
     input: async () => values.inputs.shift() ?? "",
-    secret: async () => { throw new Error("unexpected_secret_prompt"); },
+    secret: async () => values.secrets?.shift() ?? Promise.reject(new Error("unexpected_secret_prompt")),
     confirm: async () => values.confirmations.shift() ?? false,
   } as CliPrompt;
 }

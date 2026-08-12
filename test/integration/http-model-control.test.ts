@@ -2,11 +2,73 @@ import { describe, expect, it } from "vitest";
 
 import { DomainError } from "../../src/domain/errors.js";
 import { ModelProviderError } from "../../src/ports/model.js";
+import { CliHttpError } from "../../src/interfaces/cli/client.js";
+import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
 import { startTestApp } from "../helpers/start-test-app.js";
 
 const adminHeaders = { authorization: "Bearer test-admin-token" } as const;
 
 describe("HTTP model control plane", () => {
+  it("exposes revision conflicts to the TUI as typed HTTP errors without credential content", async () => {
+    const harness = await startTestApp();
+    try {
+      const client = new TuiClient({
+        apiUrl: "http://tui.test",
+        runToken: "test-run-token",
+        adminToken: "test-admin-token",
+        fetcher: async (input, init) => {
+          const url = new URL(String(input));
+          const response = await harness.app.inject({
+            method: (init?.method ?? "GET") as "GET" | "POST",
+            url: `${url.pathname}${url.search}`,
+            remoteAddress: "127.0.0.1",
+            headers: Object.fromEntries(new Headers(init?.headers).entries()),
+            ...(init?.body === undefined ? {} : { payload: String(init.body) }),
+          });
+          return new Response(response.payload, {
+            status: response.statusCode,
+          });
+        },
+      });
+      await client.adminRequest("/v1/admin/provider-connections", {
+        method: "POST",
+        body: {
+          slug: "tui-conflict-provider",
+          displayName: "TUI Conflict Provider",
+          kind: "openai_compatible",
+          baseUrl: "https://models.example.test/v1",
+          auth: { type: "none" },
+          allowInsecureHttp: false,
+          protocolPreference: "chat_completions",
+        },
+      });
+      const revision = {
+        expectedRevision: 0,
+        displayName: "TUI Conflict Provider v2",
+        baseUrl: "https://models.example.test/v2",
+        auth: { type: "api_key" },
+        apiKey: "provider-secret",
+        allowInsecureHttp: false,
+        protocolPreference: "responses",
+      } as const;
+      await client.adminRequest("/v1/admin/provider-connections/tui-conflict-provider/revisions", {
+        method: "POST",
+        body: revision,
+      });
+
+      const conflict = await client.adminRequest("/v1/admin/provider-connections/tui-conflict-provider/revisions", {
+        method: "POST",
+        body: revision,
+      }).then(() => undefined, (error: unknown) => error);
+
+      expect(conflict).toBeInstanceOf(CliHttpError);
+      expect(conflict).toMatchObject({ status: 409, code: "revision_conflict" });
+      expect(String(conflict)).not.toContain("provider-secret");
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("maps missing control-plane resources to generic typed Problems", async () => {
     const harness = await startTestApp();
     try {

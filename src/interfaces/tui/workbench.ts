@@ -33,6 +33,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   const chat = new ChatScreen({ client: options.client, onChange: () => tui.requestRender() });
   let closed = false;
   let modelSetupPending = false;
+  let modelSetupReloadRequired = false;
   let modelSetup: { readonly controller: AbortController; readonly prompt: PiTuiPrompt; readonly done: Promise<void> } | undefined;
   let latestModelSetup: Promise<void> | undefined;
   let chatPrompt: PiTuiPrompt | undefined;
@@ -50,7 +51,11 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     resolveExit?.();
   };
   const refresh = (destination: WorkbenchDestination) => {
-    void loadDestination(options.client, destination, chat, inspector).finally(() => tui.requestRender());
+    void loadDestination(options.client, destination, chat, inspector).then((loaded) => {
+      if (loaded && (destination === "providers" || destination === "profiles")) {
+        modelSetupReloadRequired = false;
+      }
+    }).finally(() => tui.requestRender());
   };
   const navigation = new NavigationScreen(refresh);
   tui.addChild(new WorkbenchLayout(navigation, chat, inspector));
@@ -103,6 +108,11 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
         return { consume: true };
       }
       if (!matchesKey(data, "m") || modelSetupPending) return undefined;
+      if (modelSetupReloadRequired) {
+        inspector.showConflict();
+        tui.requestRender();
+        return { consume: true };
+      }
       modelSetupPending = true;
       const controller = new AbortController();
       const prompt = new PiTuiPrompt(tui);
@@ -115,14 +125,18 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
           chat.show("profiles", [modelSetupLabel(progress)]);
           tui.requestRender();
         },
-      }).then(
-        () => refresh("profiles"),
-        () => inspector.showProblem({
-          code: "service_unavailable",
-          detail: "Model setup is unavailable.",
-          traceId: "tui",
-        }),
-      ).finally(() => {
+      }).then((outcome) => {
+        if (outcome.status === "conflict") {
+          prompt.cancel();
+          modelSetupReloadRequired = true;
+          chat.show("profiles", ["Model setup stopped. Reload required."]);
+          inspector.showConflict();
+          return;
+        }
+        refresh("profiles");
+      }, (error: unknown) => {
+        inspector.showProblem(safeProblem(error, "service_unavailable", "Model setup is unavailable."));
+      }).finally(() => {
         modelSetupPending = false;
         modelSetup = undefined;
         tui.setFocus(navigation);
@@ -174,7 +188,7 @@ async function loadDestination(
   destination: WorkbenchDestination,
   chat: ChatScreen,
   inspector: InspectorScreen,
-): Promise<void> {
+): Promise<boolean> {
   chat.show(destination, ["Loading..."]);
   inspector.clear();
   try {
@@ -183,29 +197,31 @@ async function loadDestination(
       chat.show(destination, response.agents.length === 0
         ? ["No Agents are available."]
         : response.agents.map((agent) => `${agent.displayName} (${agent.id})`));
-      return;
+      return true;
     }
     if (destination === "providers") {
       const response = await client.listProviderConnections();
       chat.show(destination, response.connections.length === 0
         ? ["No Provider Connections are available."]
         : response.connections.map((connection) => `${connection.displayName} (${connection.connectionId})`));
-      return;
+      return true;
     }
     if (destination === "profiles") {
       const response = await client.listModelProfiles();
       chat.show(destination, response.profiles.length === 0
         ? ["No Model Profiles are available. Press m to set up a model."]
         : response.profiles.map((profile) => `${profile.displayName} (${profile.profileId})`));
-      return;
+      return true;
     }
     chat.show(destination);
+    return true;
   } catch {
     inspector.showProblem({
       code: "service_unavailable",
       detail: "The control plane is unavailable.",
       traceId: "tui",
     });
+    return false;
   }
 }
 

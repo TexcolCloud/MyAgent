@@ -6,6 +6,7 @@ import {
   type SetupModelProgressCallback,
 } from "../../cli/commands/model-setup.js";
 import type { AdminClient, AdminRequestInit } from "../../cli/commands/providers.js";
+import { isRevisionConflict } from "../tui-client.js";
 
 export interface ModelSetupAdminClient {
   adminRequest<T>(path: string, init?: {
@@ -27,6 +28,7 @@ export interface RunModelSetupScreenOptions {
 export type ModelSetupScreenOutcome =
   | { readonly status: "configured" }
   | { readonly status: "cancelled" }
+  | { readonly status: "conflict"; readonly reloadRequired: true }
   | { readonly status: "failed"; readonly exitCode: number };
 
 export async function runModelSetupScreen(options: RunModelSetupScreenOptions): Promise<ModelSetupScreenOutcome> {
@@ -43,19 +45,26 @@ export async function runModelSetupScreen(options: RunModelSetupScreenOptions): 
       return result;
     },
   };
-  const exitCode = await setupModel(
-    client,
-    abortablePrompt(options.prompt, options.signal),
-    (milliseconds) => options.sleep === undefined
-      ? delay(milliseconds, options.signal)
-      : awaitCancellation(options.sleep(milliseconds), options.signal),
-    (line) => {
-      output.push(line);
-      options.write(line);
-    },
-    true,
-    options.onProgress,
-  );
+  let exitCode: number;
+  try {
+    exitCode = await setupModel(
+      client,
+      abortablePrompt(options.prompt, options.signal),
+      (milliseconds) => options.sleep === undefined
+        ? delay(milliseconds, options.signal)
+        : awaitCancellation(options.sleep(milliseconds), options.signal),
+      (line) => {
+        output.push(line);
+        options.write(line);
+      },
+      true,
+      options.onProgress,
+    );
+  } catch (error) {
+    output.length = 0;
+    if (isRevisionConflict(error)) return { status: "conflict", reloadRequired: true };
+    throw error;
+  }
   if (exitCode !== 0) return { status: "failed", exitCode };
   const result = output.at(-1);
   if (result !== undefined) {
