@@ -4,6 +4,7 @@ import { truncateToWidth, type Component, type Focusable } from "@mariozechner/p
 
 import {
   consumeRunEvents,
+  RunEventStreamError,
   type RunEventCursor,
   type SafeRunEvent,
 } from "../run-event-stream.js";
@@ -126,6 +127,8 @@ export class ChatScreen implements Component, Focusable {
       }
     }).catch((error: unknown) => {
       if (controller.signal.aborted) return;
+      const recoveredCursor = recoverCursor(error, cursor);
+      if (recoveredCursor !== undefined) this.cursor = recoveredCursor;
       this.lines = [...this.lines, safeProblem(error)];
     });
   }
@@ -163,6 +166,27 @@ function safeProblem(error: unknown): string {
     return safeDisplayLines(`${code}: ${detail}`).join(" ");
   }
   return "run_stream_failed: The committed Run stream is unavailable.";
+}
+
+function recoverCursor(error: unknown, current: RunEventCursor): RunEventCursor | undefined {
+  if (!(error instanceof RunEventStreamError)) return undefined;
+  const candidate = error.cursor;
+  if (candidate.runId !== current.runId) return undefined;
+
+  const currentId = safeEventId(current.lastEventId);
+  const candidateId = safeEventId(candidate.lastEventId);
+  if ((current.lastEventId !== undefined && currentId === undefined) ||
+      (candidate.lastEventId !== undefined && candidateId === undefined)) return undefined;
+  if (candidateId === undefined) return current.lastEventId === undefined ? current : undefined;
+  if (currentId !== undefined && candidateId < currentId) return undefined;
+  return { runId: current.runId, lastEventId: String(candidateId) };
+}
+
+function safeEventId(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^(0|[1-9][0-9]*)$/u.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 function noSelection(destination: WorkbenchDestination): readonly string[] {

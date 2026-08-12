@@ -54,6 +54,48 @@ describe("consumeRunEvents", () => {
     expect(chat.render(100).join("\n")).toContain("run.completed");
   });
 
+  it("reconnects from the committed cursor after a malformed SSE frame", async () => {
+    const createRunBodies: unknown[] = [];
+    const lastEventIds: (string | null)[] = [];
+    const rawMalformedData = "raw-provider-secret";
+    let streamAttempt = 0;
+    const client = new TuiClient({
+      runToken: "run-token",
+      adminToken: "admin-token",
+      fetcher: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/v1/runs") {
+          createRunBodies.push(JSON.parse(String(init?.body)) as unknown);
+          return Response.json({
+            runId: "run_1",
+            status: "queued",
+            eventsUrl: "/v1/runs/run_1/events",
+          }, { status: 202 });
+        }
+        lastEventIds.push(new Headers(init?.headers).get("last-event-id"));
+        streamAttempt += 1;
+        return streamAttempt === 1
+          ? sseResponse([
+            eventFrame(4, "message.delta", { text: "safe status" }),
+            `id: 5\nevent: message.delta\ndata: ${rawMalformedData}\n\n`,
+          ])
+          : sseResponse([eventFrame(5, "run.completed", { result: { type: "text", text: "done" } })]);
+      },
+    });
+    const chat = new ChatScreen({ client });
+
+    await chat.submit({ agentId: "primary", sessionKey: "tui:main", text: "read status" });
+    const afterFailure = chat.render(100).join("\n");
+    expect(afterFailure).toContain("4 message.delta");
+    expect(afterFailure).not.toContain(rawMalformedData);
+
+    await chat.reconnect();
+
+    expect(createRunBodies).toHaveLength(1);
+    expect(lastEventIds).toEqual([null, "4"]);
+    expect(chat.render(100).filter((line) => line === "4 message.delta")).toHaveLength(1);
+  });
+
   it("parses comments and frames split across chunks, then reconnects from the greatest committed ID", async () => {
     const lastEventIds: (string | null)[] = [];
     const responses = [
