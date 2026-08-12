@@ -1,5 +1,15 @@
-import type { CliClient } from "../client.js";
 import { writeJson, type CliWrite } from "../formatters.js";
+
+export interface AdminClient {
+  request<T>(path: string, init?: AdminRequestInit): Promise<T>;
+}
+
+export interface AdminRequestInit {
+  readonly method?: string;
+  readonly body?: unknown;
+  readonly idempotencyKey?: string;
+  readonly authority?: "run" | "admin";
+}
 
 export type ProviderAuthInput =
   | { readonly type: "none" }
@@ -18,7 +28,7 @@ export interface ProviderCreateInput {
 }
 
 export async function addProvider(
-  client: CliClient,
+  client: AdminClient,
   input: ProviderCreateInput,
   write: CliWrite,
 ): Promise<unknown> {
@@ -32,7 +42,7 @@ export async function addProvider(
 }
 
 export async function updateProvider(
-  client: CliClient,
+  client: AdminClient,
   providerId: string,
   input: Omit<ProviderCreateInput, "slug" | "kind"> & { readonly expectedRevision: number },
   write: CliWrite,
@@ -46,12 +56,12 @@ export async function updateProvider(
   return result;
 }
 
-export async function listProviders(client: CliClient, write: CliWrite): Promise<void> {
+export async function listProviders(client: AdminClient, write: CliWrite): Promise<void> {
   writeJson(write, await client.request("/v1/admin/provider-connections", { authority: "admin" }));
 }
 
 export async function discoverProviderModels(
-  client: CliClient,
+  client: AdminClient,
   revisionId: string,
   expectedRevision: number,
   write: CliWrite,
@@ -77,7 +87,7 @@ export async function discoverProviderModels(
 }
 
 export async function promoteProvider(
-  client: CliClient,
+  client: AdminClient,
   providerId: string,
   revisionId: string,
   expectedRevision: number,
@@ -93,7 +103,7 @@ export async function promoteProvider(
 }
 
 export async function retireProvider(
-  client: CliClient,
+  client: AdminClient,
   providerId: string,
   expectedRevision: number,
   write: CliWrite,

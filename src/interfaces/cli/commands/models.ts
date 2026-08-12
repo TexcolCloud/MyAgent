@@ -1,5 +1,5 @@
-import type { CliClient } from "../client.js";
 import { writeJson, type CliWrite } from "../formatters.js";
+import type { AdminClient } from "./providers.js";
 
 export interface ModelCreateInput {
   readonly slug: string;
@@ -26,7 +26,7 @@ export interface VerificationView {
   readonly fallbackVerificationId?: string | null;
 }
 
-export async function createModel(client: CliClient, input: ModelCreateInput, write: CliWrite): Promise<unknown> {
+export async function createModel(client: AdminClient, input: ModelCreateInput, write: CliWrite): Promise<unknown> {
   const result = await client.request("/v1/admin/model-profiles", {
     authority: "admin",
     method: "POST",
@@ -37,7 +37,7 @@ export async function createModel(client: CliClient, input: ModelCreateInput, wr
 }
 
 export async function verifyModel(
-  client: CliClient,
+  client: AdminClient,
   revisionId: string,
   expectedRevision: number,
   sleep: (milliseconds: number) => Promise<void>,
@@ -71,7 +71,7 @@ export function writeVerificationResult(result: VerificationView, write: CliWrit
 }
 
 export async function pollVerification(
-  client: CliClient,
+  client: AdminClient,
   operationUrl: string,
   initialProfileRevisionId: string,
   sleep: (milliseconds: number) => Promise<void>,
@@ -167,7 +167,7 @@ function invalidControlPlaneResponse(): Error {
   return new Error("invalid_control_plane_response");
 }
 
-export async function promoteModel(client: CliClient, profileId: string, revisionId: string, expectedRevision: number, write: CliWrite): Promise<void> {
+export async function promoteModel(client: AdminClient, profileId: string, revisionId: string, expectedRevision: number, write: CliWrite): Promise<void> {
   writeJson(write, await client.request(`/v1/admin/model-profiles/${encodeURIComponent(profileId)}/promotions`, {
     authority: "admin",
     method: "POST",
@@ -175,11 +175,11 @@ export async function promoteModel(client: CliClient, profileId: string, revisio
   }));
 }
 
-export async function listModels(client: CliClient, write: CliWrite): Promise<void> {
+export async function listModels(client: AdminClient, write: CliWrite): Promise<void> {
   writeJson(write, await client.request("/v1/admin/model-profiles", { authority: "admin" }));
 }
 
-export async function retireModel(client: CliClient, profileId: string, expectedRevision: number, write: CliWrite): Promise<void> {
+export async function retireModel(client: AdminClient, profileId: string, expectedRevision: number, write: CliWrite): Promise<void> {
   writeJson(write, await client.request(`/v1/admin/model-profiles/${encodeURIComponent(profileId)}/retirement`, {
     authority: "admin",
     method: "POST",
@@ -187,7 +187,7 @@ export async function retireModel(client: CliClient, profileId: string, expected
   }));
 }
 
-export async function setDefaultModel(client: CliClient, profileId: string, expectedRevision: number, write: CliWrite): Promise<void> {
+export async function setDefaultModel(client: AdminClient, profileId: string, expectedRevision: number, write: CliWrite): Promise<void> {
   writeJson(write, await client.request("/v1/admin/default-model-profile", {
     authority: "admin",
     method: "PUT",

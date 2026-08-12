@@ -44,6 +44,10 @@ describe("TuiClient", () => {
     await client.decideApproval("approval/1", "approve");
     await client.listPendingApprovals();
     await client.listProviderDrivers();
+    await client.adminRequest("/v1/admin/model-profiles", {
+      method: "POST",
+      body: { catalogCandidateId: "pi/deepseek:deepseek-chat" },
+    });
 
     expect(requests).toEqual([
       {
@@ -59,6 +63,11 @@ describe("TuiClient", () => {
       },
       { url: "http://127.0.0.1:8787/v1/approvals?status=pending", authorization: "Bearer run" },
       { url: "http://127.0.0.1:8787/v1/admin/provider-drivers", authorization: "Bearer admin" },
+      {
+        url: "http://127.0.0.1:8787/v1/admin/model-profiles",
+        authorization: "Bearer admin",
+        body: { catalogCandidateId: "pi/deepseek:deepseek-chat" },
+      },
     ]);
   });
 });

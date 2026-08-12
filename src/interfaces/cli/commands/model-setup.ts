@@ -1,16 +1,47 @@
 import { Writable } from "node:stream";
 import { createInterface } from "node:readline/promises";
 
-import { CliValidationError, type CliClient } from "../client.js";
+import { CliValidationError } from "../client.js";
 import { writeJson, writeProblem, type CliWrite } from "../formatters.js";
 import { pollVerification, type VerificationView } from "./models.js";
+import type { AdminClient } from "./providers.js";
 
 export interface CliPrompt {
   select<T extends string>(message: string, choices: readonly T[]): Promise<T>;
+  selectChoice?<T extends string>(message: string, choices: readonly CliPromptChoice<T>[]): Promise<T>;
   input(message: string, initial?: string): Promise<string>;
   secret(message: string): Promise<string>;
   confirm(message: string): Promise<boolean>;
 }
+
+export interface CliPromptChoice<T extends string> {
+  readonly value: T;
+  readonly label: string;
+  readonly description?: string;
+  readonly disabled?: boolean;
+}
+
+export class CliPromptCancelledError extends Error {
+  readonly code = "prompt_cancelled";
+
+  constructor() {
+    super("prompt_cancelled");
+  }
+}
+
+export type SetupModelProgress =
+  | "loading_catalog"
+  | "collecting_provider"
+  | "saving_draft"
+  | "discovering_models"
+  | "creating_profile"
+  | "verifying_model"
+  | "reviewing_changes"
+  | "promoting_model"
+  | "assigning_model"
+  | "complete";
+
+export type SetupModelProgressCallback = (progress: SetupModelProgress) => void;
 
 interface ProviderResponse {
   readonly connectionId: string;
@@ -53,18 +84,38 @@ interface ProfileResponse {
 }
 
 export async function setupModel(
-  client: CliClient,
+  client: AdminClient,
   prompt: CliPrompt,
   sleep: (milliseconds: number) => Promise<void>,
   write: CliWrite,
   json: boolean,
+  onProgress: SetupModelProgressCallback = () => undefined,
 ): Promise<number> {
+  try {
+    return await runSetupModel(client, prompt, sleep, write, json, onProgress);
+  } catch (error) {
+    if (!(error instanceof CliPromptCancelledError)) throw error;
+    writeSetupResult(write, json, { status: "cancelled", traceId: "cli" });
+    return 0;
+  }
+}
+
+async function runSetupModel(
+  client: AdminClient,
+  prompt: CliPrompt,
+  sleep: (milliseconds: number) => Promise<void>,
+  write: CliWrite,
+  json: boolean,
+  onProgress: SetupModelProgressCallback,
+): Promise<number> {
+  onProgress("loading_catalog");
   const catalog = await client.request<ProviderDriverCatalogResponse>(
     "/v1/admin/provider-drivers",
     { authority: "admin" },
   );
 
   // 1. Select a stable Driver and, for native Drivers, a Catalog Model Candidate.
+  onProgress("collecting_provider");
   const selectedKind = await prompt.select("Provider", ["openai", "deepseek", "custom"] as const);
   const driverId = selectedKind === "custom"
     ? "pi/openai-compatible"
@@ -89,6 +140,7 @@ export async function setupModel(
       : { auth: { type: "none" as const } };
 
   // 3. Persist the connection draft and optional managed Secret version.
+  onProgress("saving_draft");
   const connection = await client.request<ProviderResponse>("/v1/admin/provider-connections", {
     authority: "admin",
     method: "POST",
@@ -105,6 +157,7 @@ export async function setupModel(
   if (connectionRevision === undefined) throw new Error("invalid_control_plane_response");
 
   // 4. Discover models; manual entry is offered only for safe terminal discovery states.
+  onProgress("discovering_models");
   const discovery = await client.request<DiscoveryResponse>(`/v1/admin/provider-connection-revisions/${encodeURIComponent(connectionRevision.revisionId)}/discover`, {
     authority: "admin",
     method: "POST",
@@ -134,6 +187,7 @@ export async function setupModel(
     : contextSource === "assumed_32768"
       ? { maxInputTokens: 32_768, contextWindowSource: contextSource }
       : {};
+  onProgress("creating_profile");
   const profile = await client.request<ProfileResponse>("/v1/admin/model-profiles", {
     authority: "admin",
     method: "POST",
@@ -159,6 +213,7 @@ export async function setupModel(
   }
 
   // 6. Queue and poll Verification through the control-plane operation URL.
+  onProgress("verifying_model");
   const queued = await client.request<{ readonly operationUrl: string }>(`/v1/admin/model-profile-revisions/${encodeURIComponent(profileRevision.revisionId)}/verifications`, {
     authority: "admin",
     method: "POST",
@@ -172,6 +227,7 @@ export async function setupModel(
   );
 
   // 7. Resolve the optional post-promotion intent and visibly review every safety field.
+  onProgress("reviewing_changes");
   const makeDefault = await prompt.confirm("Make this model profile the default after Promotion?");
   const affectedAgents = parseAgents(await prompt.input("Agent IDs to bind after Promotion (comma-separated, blank for none)"));
   let currentProfile: ProfileResponse | undefined;
@@ -231,6 +287,7 @@ export async function setupModel(
     writeSetupResult(write, json, { status: "cancelled", traceId: verification.traceId }, review);
     return 0;
   }
+  onProgress("promoting_model");
   if (currentProfile === undefined) throw new Error("invalid_control_plane_response");
   await client.request(`/v1/admin/provider-connections/${encodeURIComponent(slug)}/promotions`, {
     authority: "admin",
@@ -247,6 +304,7 @@ export async function setupModel(
   });
 
   // 9. Default and Agent assignment mutations are separate and explicitly optional.
+  onProgress("assigning_model");
   if (makeDefault) {
     if (defaultExpectedRevision === undefined) throw new Error("invalid_control_plane_response");
     await client.request("/v1/admin/default-model-profile", {
@@ -268,6 +326,7 @@ export async function setupModel(
     });
   }
   writeSetupResult(write, json, { status: "configured", profileId: profileSlug, traceId: verification.traceId }, review);
+  onProgress("complete");
   return 0;
 }
 
@@ -277,18 +336,23 @@ async function selectCatalogCandidate(
   prompt: CliPrompt,
 ): Promise<ProviderDriverCatalogResponse["drivers"][number]["candidates"][number]> {
   const driver = catalog.drivers.find((entry) => entry.driverId === driverId);
-  const candidates = driver?.candidates.filter(
-    (candidate) => candidate.credentialSupport !== "unsupported",
-  ) ?? [];
-  if (candidates.length === 0) throw new Error("invalid_control_plane_response");
-  const selected = await prompt.select(
-    "Catalog model",
-    candidates.map((candidate) => candidate.candidateId),
-  );
+  const candidates = driver?.candidates ?? [];
+  const supported = candidates.filter((candidate) => candidate.credentialSupport !== "unsupported");
+  if (supported.length === 0) throw new Error("invalid_control_plane_response");
+  const selected = prompt.selectChoice === undefined
+    ? await prompt.select("Catalog model", supported.map((candidate) => candidate.candidateId))
+    : await prompt.selectChoice("Catalog model", candidates.map((candidate) => ({
+        value: candidate.candidateId,
+        label: `${candidate.displayName} (${candidate.modelId}) - Pi catalog`,
+        description: `Driver ${driverId}`,
+        disabled: candidate.credentialSupport === "unsupported",
+      })));
   const candidate = candidates.find(
     (entry) => entry.candidateId === selected || entry.modelId === selected,
   );
-  if (candidate === undefined) throw new Error("invalid_control_plane_response");
+  if (candidate === undefined || candidate.credentialSupport === "unsupported") {
+    throw new Error("invalid_control_plane_response");
+  }
   return candidate;
 }
 

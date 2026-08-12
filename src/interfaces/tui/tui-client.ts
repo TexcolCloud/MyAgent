@@ -135,6 +135,14 @@ export class TuiClient {
     return this.adminClient.request("/v1/admin/provider-drivers", { authority: "admin" });
   }
 
+  adminRequest<T>(path: string, init: {
+    method?: string;
+    body?: unknown;
+    idempotencyKey?: string;
+  } = {}): Promise<T> {
+    return this.adminClient.request<T>(path, { ...init, authority: "admin" });
+  }
+
   stream(path: string, lastEventId?: string, signal?: AbortSignal): Promise<Response> {
     return this.runClient.stream(path, lastEventId, signal);
   }
