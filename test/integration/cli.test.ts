@@ -146,9 +146,16 @@ describe("CLI HTTP boundary", () => {
 
   it("stops watching after a terminal Run event", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const completed = JSON.stringify({
+      runId: "run-cli-1",
+      sequence: 9,
+      type: "run.completed",
+      occurredAt: "2026-08-12T00:00:00.000Z",
+      payload: { result: { type: "text", text: "done" } },
+    });
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(
-        "id: 9\nevent: run.completed\ndata: {\"type\":\"run.completed\"}\n\n",
+        `id: 9\nevent: run.completed\ndata: ${completed}\n\n`,
         { status: 200, headers: { "content-type": "text/event-stream" } },
       ))
       .mockRejectedValue(new Error("unexpected_terminal_reconnect"));
@@ -164,22 +171,36 @@ describe("CLI HTTP boundary", () => {
     })).resolves.toBe(0);
 
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(write).toHaveBeenCalledWith('{"type":"run.completed"}');
+    expect(write).toHaveBeenCalledWith(completed);
   });
 
   it("reconnects a non-terminal watch with the latest Event ID", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const delta = JSON.stringify({
+      runId: "run-cli-1",
+      sequence: 4,
+      type: "message.delta",
+      occurredAt: "2026-08-12T00:00:00.000Z",
+      payload: { text: "hello" },
+    });
+    const failed = JSON.stringify({
+      runId: "run-cli-1",
+      sequence: 5,
+      type: "run.failed",
+      occurredAt: "2026-08-12T00:00:01.000Z",
+      payload: { code: "run_failed" },
+    });
     const fetcher = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       if (fetcher.mock.calls.length === 1) {
         expect(new Headers(init?.headers).get("last-event-id")).toBeNull();
         return new Response(
-          "id: 4\nevent: message.delta\ndata: {\"type\":\"message.delta\"}\n\n",
+          `id: 4\nevent: message.delta\ndata: ${delta}\n\n`,
           { status: 200, headers: { "content-type": "text/event-stream" } },
         );
       }
       expect(new Headers(init?.headers).get("last-event-id")).toBe("4");
       return new Response(
-        "id: 5\nevent: run.failed\ndata: {\"type\":\"run.failed\"}\n\n",
+        `id: 5\nevent: run.failed\ndata: ${failed}\n\n`,
         { status: 200, headers: { "content-type": "text/event-stream" } },
       );
     });
@@ -196,8 +217,8 @@ describe("CLI HTTP boundary", () => {
 
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(write.mock.calls.map(([line]) => line)).toEqual([
-      '{"type":"message.delta"}',
-      '{"type":"run.failed"}',
+      delta,
+      failed,
     ]);
   });
 

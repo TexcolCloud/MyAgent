@@ -70,7 +70,7 @@ export class CliClient {
     return await response.json() as T;
   }
 
-  stream(path: string, lastEventId?: string): Promise<Response> {
+  stream(path: string, lastEventId?: string, signal?: AbortSignal): Promise<Response> {
     const token = this.options.bearerToken;
     if (token === undefined || token.length === 0) {
       return Promise.reject(new CliCredentialError("run"));
@@ -80,6 +80,7 @@ export class CliClient {
         authorization: `Bearer ${token}`,
         ...(lastEventId === undefined ? {} : { "last-event-id": lastEventId }),
       },
+      ...(signal === undefined ? {} : { signal }),
     });
   }
 }
