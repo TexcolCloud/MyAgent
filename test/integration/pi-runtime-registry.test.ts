@@ -49,8 +49,21 @@ const ANTHROPIC_CONTRACT: PiRuntimeContract = {
   compatibility: { supportsDeveloperRole: false },
 };
 
+const DEEPSEEK_RESPONSES_CONTRACT: PiRuntimeContract = {
+  kind: "pi_ai",
+  piVersion: "0.73.1",
+  driverId: "pi/deepseek",
+  catalogProviderId: "deepseek",
+  api: "openai-responses",
+  providerCompatibilityContract: "deepseek-responses-v1",
+  modelId: "deepseek-v4-flash",
+  contextWindow: 128_000,
+  maxOutputTokens: 8_192,
+  compatibility: { supportsUsageInStreaming: true },
+};
+
 describe("persisted Pi runtime registry", () => {
-  it("uses the exact stored contract for verification and Agent snapshots", async () => {
+  it("preserves the frozen DeepSeek Responses contract for verification and Agent snapshots", async () => {
     await usingFixture("stored-contract", async ({ db, repository }) => {
       const clock = new FakeClock(NOW);
       const ids = new FakeIds({
@@ -81,15 +94,15 @@ describe("persisted Pi runtime registry", () => {
         connectionId: CONNECTION_ID,
         displayName: "Anthropic",
         providerKind: "openai_compatible",
-        providerDriver: "pi/anthropic",
-        baseUrl: "https://api.anthropic.com/v1",
-        credential: { type: "none" },
+        providerDriver: "pi/deepseek",
+        baseUrl: "https://api.deepseek.com/v1",
+        credential: { type: "environment", fromEnvironment: "DEEPSEEK_API_KEY" },
         protocolPreference: "responses",
         traceId: "trace-connection",
       });
       expect(connection).toMatchObject({
-        providerDriver: "pi/anthropic",
-        providerKind: "openai_compatible",
+        providerDriver: "pi/deepseek",
+        providerKind: "deepseek",
       });
       repository.recordDiscovery({
         connectionRevisionId: CONNECTION_REVISION_ID,
@@ -114,10 +127,10 @@ describe("persisted Pi runtime registry", () => {
         profileId: PROFILE_ID,
         displayName: "Claude",
         connectionRevisionId: CONNECTION_REVISION_ID,
-        providerModelId: ANTHROPIC_CONTRACT.modelId,
+        providerModelId: DEEPSEEK_RESPONSES_CONTRACT.modelId,
         invocationProtocol: "responses",
-        piRuntime: ANTHROPIC_CONTRACT,
-        maxInputTokens: ANTHROPIC_CONTRACT.contextWindow,
+        piRuntime: DEEPSEEK_RESPONSES_CONTRACT,
+        maxInputTokens: DEEPSEEK_RESPONSES_CONTRACT.contextWindow,
         contextWindowSource: "preset",
         traceId: "trace-profile",
       });
@@ -162,7 +175,9 @@ describe("persisted Pi runtime registry", () => {
 
       expect(model.requests).toHaveLength(2);
       for (const request of model.requests) {
-        expect(request.model.piRuntime).toEqual(ANTHROPIC_CONTRACT);
+        expect(request.model.piRuntime).toEqual(DEEPSEEK_RESPONSES_CONTRACT);
+        expect(request.model.piRuntime?.providerCompatibilityContract)
+          .toBe("deepseek-responses-v1");
         expect(Object.isFrozen(request.model.piRuntime)).toBe(true);
         expect(Object.isFrozen(request.model.piRuntime?.compatibility)).toBe(true);
       }
@@ -189,9 +204,11 @@ describe("persisted Pi runtime registry", () => {
       const snapshot = new AgentResolver({
         catalog: { resolve: () => ({ id: AGENT_ID, definition: AGENT_DEFINITION }) },
         registry: repository,
-        secrets: { resolve: () => { throw new Error("must_not_resolve_no_auth"); } },
+        secrets: { resolve: () => "test-secret" },
       }).resolve(AGENT_ID);
-      expect(snapshot.model.piRuntime).toEqual(ANTHROPIC_CONTRACT);
+      expect(snapshot.model.piRuntime).toEqual(DEEPSEEK_RESPONSES_CONTRACT);
+      expect(snapshot.model.piRuntime?.providerCompatibilityContract)
+        .toBe("deepseek-responses-v1");
       expect(Object.isFrozen(snapshot.model.piRuntime)).toBe(true);
       expect(Object.isFrozen(snapshot.model.piRuntime?.compatibility)).toBe(true);
     });
