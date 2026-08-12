@@ -3,6 +3,32 @@ import { describe, expect, it } from "vitest";
 import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
 
 describe("TuiClient", () => {
+  it("forwards Run creation cancellation to fetch", async () => {
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | null | undefined;
+    const client = new TuiClient({
+      runToken: "run",
+      adminToken: "admin",
+      fetcher: async (_input, init) => {
+        receivedSignal = init?.signal;
+        return Response.json({
+          runId: "run_1",
+          status: "queued",
+          eventsUrl: "/v1/runs/run_1/events",
+        }, { status: 202 });
+      },
+    });
+
+    await client.createRun({
+      agentId: "primary",
+      sessionKey: "terminal",
+      text: "hello",
+      signal: controller.signal,
+    });
+
+    expect(receivedSignal).toBe(controller.signal);
+  });
+
   it("rejects a shared Run and Admin token before making requests", () => {
     expect(() => new TuiClient({ runToken: "shared", adminToken: "shared" }))
       .toThrow(expect.objectContaining({ code: "tui_tokens_must_differ" }));

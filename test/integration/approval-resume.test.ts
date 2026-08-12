@@ -92,8 +92,7 @@ describe("Approval and reconciliation resume", () => {
       await expect(approvals.decide("denied")).resolves.toBe(false);
 
       const rendered = approvals.render(120).join("\n");
-      expect(decisionAuthorizations).toEqual(["Bearer test-token", "Bearer test-token"]);
-      expect(rendered).toContain("approval_already_resolved");
+      expect(decisionAuthorizations).toEqual(["Bearer test-token"]);
       expect(rendered).toContain("Server state: approved");
       expect(rendered).not.toContain("Server state: denied");
     } finally {

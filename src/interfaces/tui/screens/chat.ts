@@ -25,7 +25,7 @@ export class ChatScreen implements Component, Focusable {
   private lines: readonly string[] = ["No active Run is selected."];
   private cursor: RunEventCursor | undefined;
   private controller: AbortController | undefined;
-  private consuming: Promise<void> | undefined;
+  private operation: Promise<void> | undefined;
   private terminal = false;
 
   constructor(private readonly options: {
@@ -39,31 +39,38 @@ export class ChatScreen implements Component, Focusable {
     this.lines = safe.length === 0 ? noSelection(destination) : safe;
   }
 
-  async submit(input: ChatSubmission): Promise<void> {
+  get busy(): boolean { return this.operation !== undefined; }
+
+  submit(input: ChatSubmission): Promise<void> {
     const client = this.requireClient();
     const agentId = required(input.agentId, "Agent ID");
     const sessionKey = required(input.sessionKey, "Session Key");
     const text = required(input.text, "Message");
-    if (this.consuming !== undefined) throw new Error("run_stream_active");
+    if (this.operation !== undefined) return Promise.reject(new Error("run_operation_active"));
 
-    const created = await client.createRun({
-      agentId,
-      sessionKey,
-      text,
-      idempotencyKey: randomUUID(),
-    });
-    this.destination = "runs";
-    this.cursor = { runId: created.runId };
-    this.terminal = false;
-    this.lines = [`Run ${created.runId}`, "Connecting to committed events..."];
-    this.changed();
-    await this.consume();
+    const controller = new AbortController();
+    this.controller = controller;
+    const operation = this.createAndConsume(client, { agentId, sessionKey, text }, controller)
+      .finally(() => {
+        if (this.controller === controller) this.controller = undefined;
+        if (this.operation === operation) this.operation = undefined;
+        this.changed();
+      });
+    this.operation = operation;
+    return operation;
   }
 
-  async reconnect(): Promise<boolean> {
-    if (this.cursor === undefined || this.terminal || this.consuming !== undefined) return false;
-    await this.consume();
-    return true;
+  reconnect(): Promise<boolean> {
+    if (this.cursor === undefined || this.terminal || this.operation !== undefined) return Promise.resolve(false);
+    const controller = new AbortController();
+    this.controller = controller;
+    const operation = this.consume(controller).finally(() => {
+      if (this.controller === controller) this.controller = undefined;
+      if (this.operation === operation) this.operation = undefined;
+      this.changed();
+    });
+    this.operation = operation;
+    return operation.then(() => true);
   }
 
   cancel(): void {
@@ -71,7 +78,7 @@ export class ChatScreen implements Component, Focusable {
   }
 
   async settled(): Promise<void> {
-    await this.consuming;
+    await this.operation;
   }
 
   render(width: number): string[] {
@@ -84,13 +91,29 @@ export class ChatScreen implements Component, Focusable {
 
   invalidate(): void {}
 
-  private async consume(): Promise<void> {
+  private async createAndConsume(
+    client: ChatClient,
+    input: ChatSubmission,
+    controller: AbortController,
+  ): Promise<void> {
+    const created = await client.createRun({
+      ...input,
+      idempotencyKey: randomUUID(),
+      signal: controller.signal,
+    });
+    this.destination = "runs";
+    this.cursor = { runId: created.runId };
+    this.terminal = false;
+    this.lines = [`Run ${created.runId}`, "Connecting to committed events..."];
+    this.changed();
+    await this.consume(controller);
+  }
+
+  private async consume(controller: AbortController): Promise<void> {
     const client = this.requireClient();
     const cursor = this.cursor;
     if (cursor === undefined) return;
-    const controller = new AbortController();
-    this.controller = controller;
-    const consuming = consumeRunEvents({
+    await consumeRunEvents({
       client,
       cursor,
       signal: controller.signal,
@@ -102,14 +125,9 @@ export class ChatScreen implements Component, Focusable {
         this.lines = [...this.lines, "Reconnect available. Press r."];
       }
     }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
       this.lines = [...this.lines, safeProblem(error)];
-    }).finally(() => {
-      if (this.controller === controller) this.controller = undefined;
-      if (this.consuming === consuming) this.consuming = undefined;
-      this.changed();
     });
-    this.consuming = consuming;
-    await consuming;
   }
 
   private acceptEvent(event: SafeRunEvent): void {

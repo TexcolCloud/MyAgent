@@ -77,6 +77,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
         return { consume: true };
       }
       if (matchesKey(data, "r") && !tui.hasOverlay()) {
+        if (chat.busy) return { consume: true };
         const action = chat.reconnect().then(() => undefined).catch((error: unknown) => {
           inspector.showProblem(safeProblem(error, "run_stream_failed", "The committed Run stream is unavailable."));
         }).finally(() => tui.requestRender());

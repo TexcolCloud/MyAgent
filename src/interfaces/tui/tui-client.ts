@@ -14,6 +14,7 @@ export interface CreateRunInput {
   readonly sessionKey: string;
   readonly text: string;
   readonly idempotencyKey?: string;
+  readonly signal?: AbortSignal;
 }
 
 export interface CreateRunResult {
@@ -136,6 +137,7 @@ export class TuiClient {
         sessionKey: input.sessionKey,
         input: { type: "text", text: input.text },
       },
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
   }
 
