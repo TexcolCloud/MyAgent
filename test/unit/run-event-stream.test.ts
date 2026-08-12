@@ -6,8 +6,54 @@ import {
   RunEventStreamError,
   type SafeRunEvent,
 } from "../../src/interfaces/tui/run-event-stream.js";
+import { ChatScreen } from "../../src/interfaces/tui/screens/chat.js";
+import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
 
 describe("consumeRunEvents", () => {
+  it("creates one Run and resumes its committed stream after interruption", async () => {
+    const createRunBodies: unknown[] = [];
+    const idempotencyKeys: (string | null)[] = [];
+    const lastEventIds: (string | null)[] = [];
+    let streamAttempt = 0;
+    const client = new TuiClient({
+      runToken: "run-token",
+      adminToken: "admin-token",
+      fetcher: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/v1/runs") {
+          createRunBodies.push(JSON.parse(String(init?.body)) as unknown);
+          idempotencyKeys.push(new Headers(init?.headers).get("idempotency-key"));
+          return Response.json({
+            runId: "run_1",
+            status: "queued",
+            eventsUrl: "/v1/runs/run_1/events",
+          }, { status: 202 });
+        }
+        lastEventIds.push(new Headers(init?.headers).get("last-event-id"));
+        streamAttempt += 1;
+        return streamAttempt === 1
+          ? interruptedSseResponse(eventFrame(4, "message.delta", { text: "safe status" }))
+          : sseResponse([eventFrame(5, "run.completed", { result: { type: "text", text: "done" } })]);
+      },
+    });
+    const chat = new ChatScreen({ client });
+
+    await chat.submit({ agentId: "primary", sessionKey: "tui:main", text: "read status" });
+    expect(createRunBodies).toEqual([{
+      agentId: "primary",
+      sessionKey: "tui:main",
+      input: { type: "text", text: "read status" },
+    }]);
+    expect(idempotencyKeys[0]).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(chat.render(100).join("\n")).toContain("Reconnect available");
+
+    await chat.reconnect();
+
+    expect(createRunBodies).toHaveLength(1);
+    expect(lastEventIds).toEqual([null, "4"]);
+    expect(chat.render(100).join("\n")).toContain("run.completed");
+  });
+
   it("parses comments and frames split across chunks, then reconnects from the greatest committed ID", async () => {
     const lastEventIds: (string | null)[] = [];
     const responses = [

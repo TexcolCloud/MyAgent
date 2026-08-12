@@ -4,10 +4,239 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { CliPrompt } from "../../src/interfaces/cli/commands/model-setup.js";
 import { runWorkbench } from "../../src/interfaces/tui/workbench.js";
+import { ApprovalScreen } from "../../src/interfaces/tui/screens/approvals.js";
 import { InspectorScreen } from "../../src/interfaces/tui/screens/inspector.js";
 import { runModelSetupScreen } from "../../src/interfaces/tui/screens/model-setup.js";
+import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
 
 describe("TUI workbench", () => {
+  it("creates one explicitly-bound Run and reconnects its committed event cursor", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const createRun = vi.fn(async () => ({
+      runId: "run_1",
+      status: "queued" as const,
+      eventsUrl: "/v1/runs/run_1/events",
+    }));
+    const cursors: (string | undefined)[] = [];
+    let attempt = 0;
+    const client = safeClient({
+      createRun,
+      stream: async (_path, lastEventId) => {
+        cursors.push(lastEventId);
+        attempt += 1;
+        return attempt === 1
+          ? interruptedSseResponse(eventFrame(4, "message.delta", { text: "safe status" }))
+          : sseResponse([eventFrame(5, "run.completed", { result: { type: "text", text: "done" } })]);
+      },
+    });
+    const workbench = runWorkbench({ client, terminal });
+
+    await terminal.ready();
+    terminal.input("c");
+    await terminal.waitForFrame("Agent ID");
+    terminal.input("primary");
+    terminal.input("\r");
+    await terminal.waitForFrame("Session Key");
+    terminal.input("tui:main");
+    terminal.input("\r");
+    await terminal.waitForFrame("Message");
+    terminal.input("read status");
+    terminal.input("\r");
+    await terminal.waitForFrame("Reconnect available");
+    terminal.input("r");
+    await terminal.waitForFrame("run.completed");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    expect(createRun).toHaveBeenCalledOnce();
+    expect(createRun).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: "primary",
+      sessionKey: "tui:main",
+      text: "read status",
+    }));
+    expect(cursors).toEqual([undefined, "4"]);
+  });
+
+  it("opens pending Approvals and dispatches one selected decision", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const decideApproval = vi.fn(async () => ({
+      approvalId: "apr_1",
+      runId: "run_1",
+      state: "approved" as const,
+      resolvedAt: "2026-08-12T00:00:00.000Z",
+    }));
+    const workbench = runWorkbench({
+      terminal,
+      client: safeClient({
+        approvals: [pendingApproval()],
+        decideApproval,
+      }),
+    });
+
+    await terminal.ready();
+    terminal.input("a");
+    await terminal.waitForFrame("write_file");
+    terminal.input("y");
+    await terminal.waitForFrame("Server state: approved");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    expect(decideApproval).toHaveBeenCalledExactlyOnceWith("apr_1", "approve");
+  });
+
+  it("approves one exact pending Tool Call with Run authority and renders the server state", async () => {
+    const decisionBodies: unknown[] = [];
+    const decisionAuthorizations: (string | null)[] = [];
+    let lists = 0;
+    const client = new TuiClient({
+      runToken: "run-token",
+      adminToken: "admin-token",
+      fetcher: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/v1/approvals") {
+          lists += 1;
+          return Response.json({ approvals: lists === 1 ? [{
+            approvalId: "apr_1",
+            runId: "run_1",
+            toolCallId: "tool_1",
+            state: "pending",
+            toolName: "run_command",
+            arguments: { args: ["status"], program: "git" },
+            expiresAt: "2026-08-13T00:00:00.000Z",
+            riskNotice: "This command runs on the host and is not isolated by an OS sandbox.",
+          }] : [] });
+        }
+        decisionBodies.push(JSON.parse(String(init?.body)) as unknown);
+        decisionAuthorizations.push(new Headers(init?.headers).get("authorization"));
+        return Response.json({
+          approvalId: "apr_1",
+          runId: "run_1",
+          state: "denied",
+          resolvedAt: "2026-08-12T00:00:00.000Z",
+        });
+      },
+    });
+    const approvals = new ApprovalScreen({ client });
+
+    await approvals.load();
+    await approvals.select("apr_1");
+    expect(approvals.render(120).join("\n")).toContain("This command runs on the host");
+    await approvals.decide("approved");
+
+    expect(decisionBodies).toEqual([{ decision: "approve" }]);
+    expect(decisionAuthorizations).toEqual(["Bearer run-token"]);
+    expect(approvals.render(120).join("\n")).toContain("denied");
+    expect(approvals.render(120).join("\n")).not.toContain("approved");
+  });
+
+  it("disables Approval controls while one exact decision is in flight", async () => {
+    let resolveDecision: ((value: {
+      approvalId: string;
+      runId: string;
+      state: "approved";
+      resolvedAt: string;
+    }) => void) | undefined;
+    const decision = new Promise<{
+      approvalId: string;
+      runId: string;
+      state: "approved";
+      resolvedAt: string;
+    }>((resolve) => { resolveDecision = resolve; });
+    const decideApproval = vi.fn(() => decision);
+    const approvals = new ApprovalScreen({
+      client: {
+        listPendingApprovals: async () => ({ approvals: [pendingApproval()] }),
+        decideApproval,
+      },
+    });
+    await approvals.load();
+    await approvals.select("apr_1");
+
+    const first = approvals.decide("approved");
+    const second = approvals.decide("denied");
+    expect(approvals.controlsEnabled).toBe(false);
+    await expect(second).resolves.toBe(false);
+    expect(decideApproval).toHaveBeenCalledTimes(1);
+    resolveDecision?.({
+      approvalId: "apr_1",
+      runId: "run_1",
+      state: "approved",
+      resolvedAt: "2026-08-12T00:00:00.000Z",
+    });
+    await expect(first).resolves.toBe(true);
+  });
+
+  it("renders an already-resolved failure from the server without guessing a decision", async () => {
+    let decisionCalls = 0;
+    const approvals = new ApprovalScreen({
+      client: {
+        listPendingApprovals: async () => ({ approvals: [pendingApproval()] }),
+        decideApproval: async () => {
+          decisionCalls += 1;
+          if (decisionCalls === 1) return {
+            approvalId: "apr_1",
+            runId: "run_1",
+            state: "approved",
+            resolvedAt: "2026-08-12T00:00:00.000Z",
+          };
+          throw Object.assign(new Error("approval_already_resolved"), {
+            code: "approval_already_resolved",
+            detail: "This Approval was already resolved.",
+            traceId: "trace_1",
+          });
+        },
+      },
+    });
+    await approvals.load();
+    await approvals.select("apr_1");
+
+    await expect(approvals.decide("approved")).resolves.toBe(true);
+    await expect(approvals.decide("denied")).resolves.toBe(false);
+
+    const rendered = approvals.render(120).join("\n");
+    expect(rendered).toContain("approval_already_resolved");
+    expect(rendered).toContain("Server state: approved");
+    expect(rendered).not.toContain("denied");
+  });
+
+  it("keeps an in-flight Approval open until its server response settles", async () => {
+    let exits = 0;
+    let resolveDecision: ((value: {
+      approvalId: string;
+      runId: string;
+      state: "approved";
+      resolvedAt: string;
+    }) => void) | undefined;
+    const decision = new Promise<{
+      approvalId: string;
+      runId: string;
+      state: "approved";
+      resolvedAt: string;
+    }>((resolve) => { resolveDecision = resolve; });
+    const approvals = new ApprovalScreen({
+      client: {
+        listPendingApprovals: async () => ({ approvals: [pendingApproval()] }),
+        decideApproval: async () => decision,
+      },
+      onExit: () => { exits += 1; },
+    });
+    await approvals.load();
+    await approvals.select("apr_1");
+
+    const deciding = approvals.decide("approved");
+    approvals.handleInput("\u001b");
+    expect(exits).toBe(0);
+    resolveDecision?.({
+      approvalId: "apr_1",
+      runId: "run_1",
+      state: "approved",
+      resolvedAt: "2026-08-12T00:00:00.000Z",
+    });
+    await deciding;
+    approvals.handleInput("\u001b");
+    expect(exits).toBe(1);
+  });
+
   it("renders three bounded regions and restores the terminal on exit", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36, inputs: ["\u0003"] });
 
@@ -338,6 +567,10 @@ function safeClient(overrides: Partial<{
   connections: readonly { readonly connectionId: string; readonly displayName: string; readonly activeRevisionId: string | null; readonly retiredAt: string | null }[];
   profiles: readonly { readonly profileId: string; readonly displayName: string; readonly activeRevisionId: string | null; readonly retiredAt: string | null }[];
   adminRequest: <T>(path: string, init?: { readonly method?: string }) => Promise<T>;
+  createRun: (input: { readonly agentId: string; readonly sessionKey: string; readonly text: string; readonly idempotencyKey?: string }) => Promise<{ readonly runId: string; readonly status: "queued"; readonly eventsUrl: string }>;
+  stream: (path: string, lastEventId?: string, signal?: AbortSignal) => Promise<Response>;
+  approvals: readonly ReturnType<typeof pendingApproval>[];
+  decideApproval: (approvalId: string, decision: "approve" | "deny") => Promise<{ readonly approvalId: string; readonly runId: string; readonly state: "approved" | "denied"; readonly resolvedAt: string | null }>;
 }> = {}) {
   return {
     listAgents: async () => ({ agents: overrides.agents ?? [{ id: "research", displayName: "Research Agent", revisionId: "rev_1" }], unavailable: [] }),
@@ -347,7 +580,59 @@ function safeClient(overrides: Partial<{
     adminRequest: overrides.adminRequest ?? (async <T>(path: string) => (path === "/v1/admin/provider-drivers"
       ? { piVersion: "0.73.1", drivers: [] } as T
       : {} as T)),
+    createRun: overrides.createRun ?? (async () => ({ runId: "run_1", status: "queued", eventsUrl: "/v1/runs/run_1/events" })),
+    stream: overrides.stream ?? (async () => sseResponse([eventFrame(1, "run.completed", { result: null })])),
+    listPendingApprovals: async () => ({ approvals: overrides.approvals ?? [] }),
+    decideApproval: overrides.decideApproval ?? (async (approvalId, decision) => ({
+      approvalId,
+      runId: "run_1",
+      state: decision === "approve" ? "approved" : "denied",
+      resolvedAt: "2026-08-12T00:00:00.000Z",
+    })),
   };
+}
+
+function pendingApproval() {
+  return {
+    approvalId: "apr_1",
+    runId: "run_1",
+    toolCallId: "tool_1",
+    state: "pending" as const,
+    toolName: "write_file",
+    arguments: { path: "status.txt" },
+    expiresAt: "2026-08-13T00:00:00.000Z",
+  };
+}
+
+function sseResponse(chunks: readonly string[]): Response {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  }), { headers: { "content-type": "text/event-stream" } });
+}
+
+function interruptedSseResponse(frame: string): Response {
+  const encoder = new TextEncoder();
+  let reads = 0;
+  return new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (reads++ === 0) controller.enqueue(encoder.encode(frame));
+      else controller.error(new TypeError("network socket closed"));
+    },
+  }), { headers: { "content-type": "text/event-stream" } });
+}
+
+function eventFrame(sequence: number, type: string, payload: unknown): string {
+  return `id: ${String(sequence)}\nevent: ${type}\ndata: ${JSON.stringify({
+    runId: "run_1",
+    sequence,
+    type,
+    occurredAt: "2026-08-12T00:00:00.000Z",
+    payload,
+  })}\n\n`;
 }
 
 

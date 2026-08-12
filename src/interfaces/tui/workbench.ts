@@ -9,6 +9,7 @@ import {
 } from "@mariozechner/pi-tui";
 
 import { PiTuiPrompt } from "./pi-tui-prompt.js";
+import { ApprovalScreen } from "./screens/approvals.js";
 import { ChatScreen } from "./screens/chat.js";
 import { InspectorScreen } from "./screens/inspector.js";
 import { NavigationScreen, type WorkbenchDestination } from "./screens/navigation.js";
@@ -16,7 +17,8 @@ import { runModelSetupScreen } from "./screens/model-setup.js";
 import type { TuiClient } from "./tui-client.js";
 
 type WorkbenchClient = Pick<TuiClient,
-  "listAgents" | "listProviderConnections" | "listModelProfiles" | "adminRequest"
+  "listAgents" | "listProviderConnections" | "listModelProfiles" | "adminRequest" |
+  "createRun" | "stream" | "listPendingApprovals" | "decideApproval"
 >;
 
 export interface RunWorkbenchOptions {
@@ -28,17 +30,22 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   const terminal = options.terminal ?? new ProcessTerminal();
   const tui = new TUI(terminal);
   const inspector = new InspectorScreen();
-  const chat = new ChatScreen();
+  const chat = new ChatScreen({ client: options.client, onChange: () => tui.requestRender() });
   let closed = false;
   let modelSetupPending = false;
   let modelSetup: { readonly controller: AbortController; readonly prompt: PiTuiPrompt; readonly done: Promise<void> } | undefined;
   let latestModelSetup: Promise<void> | undefined;
+  let chatPrompt: PiTuiPrompt | undefined;
+  let latestChatAction: Promise<void> | undefined;
+  let approvals: ApprovalScreen | undefined;
   let resolveExit: (() => void) | undefined;
   const stopped = () => {
     if (closed) return;
     closed = true;
     modelSetup?.controller.abort();
     modelSetup?.prompt.cancel();
+    chat.cancel();
+    chatPrompt?.cancel();
     if (tui.hasOverlay()) tui.hideOverlay();
     resolveExit?.();
   };
@@ -54,6 +61,44 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     tui.addInputListener((data) => {
       if (matchesKey(data, "ctrl+c")) {
         stopped();
+        return { consume: true };
+      }
+      if (matchesKey(data, "c") && chatPrompt === undefined && !modelSetupPending && !tui.hasOverlay()) {
+        const prompt = new PiTuiPrompt(tui);
+        chatPrompt = prompt;
+        const action = submitChat(prompt, chat).catch((error: unknown) => {
+          if (!closed) inspector.showProblem(safeProblem(error, "run_create_failed", "The Run could not be created."));
+        }).finally(() => {
+          if (chatPrompt === prompt) chatPrompt = undefined;
+          tui.setFocus(navigation);
+          tui.requestRender();
+        });
+        latestChatAction = action;
+        return { consume: true };
+      }
+      if (matchesKey(data, "r") && !tui.hasOverlay()) {
+        const action = chat.reconnect().then(() => undefined).catch((error: unknown) => {
+          inspector.showProblem(safeProblem(error, "run_stream_failed", "The committed Run stream is unavailable."));
+        }).finally(() => tui.requestRender());
+        latestChatAction = action;
+        return { consume: true };
+      }
+      if (matchesKey(data, "a") && !modelSetupPending && !tui.hasOverlay()) {
+        const screen = new ApprovalScreen({
+          client: options.client,
+          onChange: () => tui.requestRender(),
+          onExit: () => {
+            if (approvals !== screen) return;
+            approvals = undefined;
+            if (tui.hasOverlay()) tui.hideOverlay();
+            tui.setFocus(navigation);
+            tui.requestRender();
+          },
+        });
+        approvals = screen;
+        tui.showOverlay(screen, { width: "75%", maxHeight: "80%" });
+        tui.setFocus(screen);
+        void screen.load();
         return { consume: true };
       }
       if (!matchesKey(data, "m") || modelSetupPending) return undefined;
@@ -90,12 +135,37 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     tui.requestRender(true);
     await finished;
     await latestModelSetup;
+    await latestChatAction;
+    await approvals?.settled();
     return 0;
   } finally {
     if (!closed && tui.hasOverlay()) tui.hideOverlay();
     closed = true;
     tui.stop();
   }
+}
+
+async function submitChat(prompt: PiTuiPrompt, chat: ChatScreen): Promise<void> {
+  const agentId = await prompt.input("Agent ID");
+  const sessionKey = await prompt.input("Session Key");
+  const text = await prompt.input("Message");
+  await chat.submit({ agentId, sessionKey, text });
+}
+
+function safeProblem(
+  error: unknown,
+  fallbackCode: string,
+  fallbackDetail: string,
+): { readonly code: string; readonly detail: string; readonly traceId: string } {
+  if (typeof error !== "object" || error === null) {
+    return { code: fallbackCode, detail: fallbackDetail, traceId: "tui" };
+  }
+  const candidate = error as { code?: unknown; detail?: unknown; traceId?: unknown };
+  return {
+    code: typeof candidate.code === "string" ? candidate.code : fallbackCode,
+    detail: typeof candidate.detail === "string" ? candidate.detail : fallbackDetail,
+    traceId: typeof candidate.traceId === "string" ? candidate.traceId : "tui",
+  };
 }
 
 async function loadDestination(

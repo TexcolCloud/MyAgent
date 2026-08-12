@@ -21,6 +21,7 @@ describe("SSE", () => {
       expect(stream.payload).toContain("id: 2");
       expect(stream.payload).toContain("id: 3");
       expect(stream.payload).not.toContain("id: 1\n");
+      expect(stream.payload).not.toContain("\"text\":\"hello\"");
     } finally { await harness.close(); }
   });
 
