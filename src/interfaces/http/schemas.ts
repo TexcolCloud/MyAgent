@@ -54,6 +54,12 @@ const runBudgetSchema = z.strictObject({
 });
 export const healthResponseSchema = z.strictObject({ ok: z.literal(true) });
 export const readinessResponseSchema = z.strictObject({ ready: z.boolean() });
+const diagnosticCheckSchema = z.strictObject({
+  id: z.enum(["config", "permissions", "sqlite", "secrets", "workers", "gateway", "tty", "binding"]),
+  status: z.enum(["ok", "failed"]),
+  detail: z.string(),
+});
+export const diagnosticsResponseSchema = z.strictObject({ checks: z.array(diagnosticCheckSchema) });
 const unavailableAgentResponseSchema = z.strictObject({
   label: z.string(),
   code: z.literal("invalid_agent_config"),

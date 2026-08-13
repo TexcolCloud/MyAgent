@@ -22,6 +22,7 @@ import { AgentScreen } from "./screens/agents.js";
 import { ChatScreen } from "./screens/chat.js";
 import { RunsScreen } from "./screens/runs.js";
 import { SessionsScreen } from "./screens/sessions.js";
+import { DiagnosticsScreen } from "./screens/diagnostics.js";
 import { InspectorScreen } from "./screens/inspector.js";
 import { NavigationScreen, type WorkbenchDestination } from "./screens/navigation.js";
 import { runModelSetupScreen } from "./screens/model-setup.js";
@@ -41,6 +42,7 @@ type WorkbenchClient = Pick<TuiClient,
   | "getModelVerificationAt" | "cancelModelVerification" | "getModelAssignment" | "assignModel"
   | "getDefaultModelProfile" | "setDefaultModelProfile"
   | "createManagedAgent" | "listRunHistory" | "listSessions" | "getRun" | "cancelRun"
+  | "getDiagnostics"
 >>;
 
 export interface RunWorkbenchOptions {
@@ -129,6 +131,10 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     }
     if (destination === "sessions" && isSessionHistoryClient(options.client)) {
       const screen = new SessionsScreen({ client: options.client, onRuns: (session) => { if (!isRunHistoryClient(options.client)) return; const runs = new RunsScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = screen; tui.setFocus(screen); tui.requestRender(); } }); center = runs; tui.setFocus(runs); void runs.loadFor(session.agentId, session.sessionKey).finally(() => tui.requestRender()); }, onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
+    }
+    if (destination === "diagnostics" && isDiagnosticsClient(options.client)) {
+      const screen = new DiagnosticsScreen({ client: options.client, onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
       center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
     }
     if (destination === "providers" && isProviderClient(options.client)) {
@@ -315,6 +321,10 @@ function isRunHistoryClient(client: WorkbenchClient): client is WorkbenchClient 
 
 function isSessionHistoryClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof SessionsScreen>[0]["client"] {
   return typeof client.listSessions === "function";
+}
+
+function isDiagnosticsClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof DiagnosticsScreen>[0]["client"] {
+  return typeof client.getDiagnostics === "function";
 }
 
 function isAgentClient(client: WorkbenchClient): client is WorkbenchClient & Required<Pick<TuiClient, "createManagedAgent">> {

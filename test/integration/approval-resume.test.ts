@@ -87,7 +87,12 @@ describe("Approval and reconciliation resume", () => {
 
       await approvals.load();
       await approvals.select("approval-tui-1");
-      expect(approvals.render(120).join("\n")).toContain("This command runs on the host");
+      const detail = approvals.render(120).join("\n");
+      expect(detail).toContain("Run: " + runId);
+      expect(detail).toContain("Tool Call: tool-tui-1");
+      expect(detail).toContain("program: string");
+      expect(detail).not.toContain('"git"');
+      expect(detail).toContain("This command runs on the host");
       await expect(approvals.decide("approved")).resolves.toBe(true);
       await expect(approvals.decide("denied")).resolves.toBe(false);
 

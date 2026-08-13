@@ -6,6 +6,7 @@ import type { CancelRunService } from "../../application/cancel-run.js";
 import type { AssignModelService } from "../../application/assign-model.js";
 import type { CreateBackupService } from "../../application/create-backup.js";
 import type { CreateManagedAgentService } from "../../application/create-managed-agent.js";
+import type { DiagnosticReport } from "../../application/collect-diagnostics.js";
 import type { CreateRunService } from "../../application/create-run.js";
 import type { DecideApprovalService } from "../../application/decide-approval.js";
 import type { DeleteSessionService } from "../../application/delete-session.js";
@@ -25,7 +26,7 @@ import type { SessionLookupStore } from "../../ports/session-store.js";
 import type { ReconciliationStore } from "../../ports/tool-store.js";
 import { isAuthorized, isLoopbackPeer, tokensEqual } from "./auth.js";
 import { sendError, sendProblem } from "./problem.js";
-import { registerHealthRoutes, type ReadinessProbe } from "./routes/health.js";
+import { registerDiagnosticRoutes, registerHealthRoutes, type ReadinessProbe } from "./routes/health.js";
 import { registerAgentRoutes } from "./routes/agents.js";
 import { registerBackupRoutes } from "./routes/backups.js";
 import { registerApprovalRoutes } from "./routes/approvals.js";
@@ -74,6 +75,7 @@ export interface HttpAppOptions {
   createManagedAgents?: CreateManagedAgentService;
   logger?: FastifyBaseLogger;
   readiness?: ReadinessProbe;
+  diagnostics?: () => Promise<DiagnosticReport>;
 }
 
 export function createHttpApp(options: HttpAppOptions): FastifyInstance {
@@ -175,6 +177,12 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
   if (options.createManagedAgents !== undefined) {
     app.register((api, _routeOptions, done) => {
       registerManagedAgentRoutes(api, options.createManagedAgents!);
+      done();
+    }, { prefix: "/v1/admin" });
+  }
+  if (options.diagnostics !== undefined) {
+    app.register((api, _routeOptions, done) => {
+      registerDiagnosticRoutes(api, options.diagnostics!);
       done();
     }, { prefix: "/v1/admin" });
   }

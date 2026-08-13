@@ -4,6 +4,7 @@ import { listAgents, setAgentModel } from "./commands/agents.js";
 import { listApprovals, decideApproval } from "./commands/approvals.js";
 import { createBackup } from "./commands/backup.js";
 import { reloadConfig, validateConfig } from "./commands/config.js";
+import { doctor } from "./commands/doctor.js";
 import { createConsolePrompt, setupModel, type CliPrompt } from "./commands/model-setup.js";
 import { createModel, listModels, promoteModel, retireModel, setDefaultModel, verifyModel } from "./commands/models.js";
 import { addProvider, discoverProviderModels, listProviders, promoteProvider, retireProvider, updateProvider, type ProviderAuthInput } from "./commands/providers.js";
@@ -140,6 +141,11 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     });
     if (ADMIN_COMMANDS.has(command) && (adminToken === undefined || adminToken.length === 0)) {
       throw new CliCredentialError("admin");
+    }
+
+    if (command === "doctor") {
+      await doctor(client, write, json);
+      return 0;
     }
 
     if (command === "model setup") return await setupModel(
@@ -445,6 +451,7 @@ const PROVIDER_FAILURE_CODES = new Set([
 ]);
 
 const ADMIN_COMMANDS = new Set([
+  "doctor",
   "model setup",
   "providers add", "providers update", "providers list", "providers discover",
   "providers promote", "providers retire",
@@ -461,6 +468,7 @@ const COMMAND_GRAMMAR: Readonly<Record<string, {
   readonly flags: readonly string[];
 }>> = {
   serve: { positional: 1, flags: ["config"] },
+  doctor: { positional: 1, flags: ADMIN_FLAGS },
   local: { positional: 0, flags: ["config"] },
   tui: { positional: 1, flags: TUI_FLAGS },
   "config validate": { positional: 2, flags: ["config", "json"] },

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir, stat } from "node:fs/promises";
 import { isIP } from "node:net";
 import path from "node:path";
 
@@ -44,6 +44,7 @@ import { AdvanceRunService } from "./application/advance-run.js";
 import { AgentResolver } from "./application/agent-resolver.js";
 import { AssignModelService } from "./application/assign-model.js";
 import { CancelRunService } from "./application/cancel-run.js";
+import { collectDiagnostics } from "./application/collect-diagnostics.js";
 import { CreateBackupService } from "./application/create-backup.js";
 import { CreateManagedAgentService } from "./application/create-managed-agent.js";
 import { CreateRunService } from "./application/create-run.js";
@@ -343,6 +344,10 @@ export async function bootstrap(
         );
       },
     });
+    const listen = {
+      host: options.listen?.host ?? catalog.current().global.server.host,
+      port: options.listen?.port ?? catalog.current().global.server.port,
+    };
     app = createHttpApp({
       bearerToken,
       adminToken,
@@ -387,15 +392,21 @@ export async function bootstrap(
           verificationWorker?.isHealthy() === true &&
           expirer?.isHealthy() === true,
       ),
+      diagnostics: () => collectDiagnostics({
+        config: async () => { await loadBootConfig(absoluteConfigPath); },
+        permissions: async () => { await stat(absoluteConfigPath); await readdir(path.dirname(absoluteConfigPath)); },
+        sqlite: () => arraysEqual(readMigrationVersions(connection.db), expectedMigrationVersions),
+        secrets: () => environmentReferences(bootConfig).every((reference) => Object.hasOwn(process.env, reference)),
+        workers: () => runWorker?.isHealthy() === true && verificationWorker?.isHealthy() === true && expirer?.isHealthy() === true,
+        gateway: () => providerGateway?.isAvailable === true,
+        tty: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+        binding: () => isLoopbackHost(listen.host),
+      }),
       sse: { faults },
     });
     runWorker.start();
     expirer.start();
     verificationWorker.start();
-    const listen = {
-      host: options.listen?.host ?? catalog.current().global.server.host,
-      port: options.listen?.port ?? catalog.current().global.server.port,
-    };
     const address = await app.listen(listen);
     if (!isLoopbackHost(listen.host)) {
       logger.warn(
@@ -493,6 +504,19 @@ function readMigrationVersions(database: DatabaseSync): number[] {
 
 function arraysEqual(left: readonly number[], right: readonly number[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function environmentReferences(value: unknown): readonly string[] {
+  const references = new Set<string>();
+  const visit = (candidate: unknown): void => {
+    if (typeof candidate !== "object" || candidate === null) return;
+    if (Array.isArray(candidate)) { candidate.forEach(visit); return; }
+    const record = candidate as Record<string, unknown>;
+    if (typeof record.fromEnvironment === "string") references.add(record.fromEnvironment);
+    Object.values(record).forEach(visit);
+  };
+  visit(value);
+  return [...references];
 }
 
 function assertValidHttpAuth(auth: { bearerToken: string; adminToken: string }): void {

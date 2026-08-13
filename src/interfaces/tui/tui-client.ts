@@ -55,10 +55,12 @@ import {
   approvalDecisionResponseSchema,
   approvalsResponseSchema,
   createRunResponseSchema,
+  diagnosticsResponseSchema,
   runResponseSchema,
   runHistoryResponseSchema,
   sessionHistoryResponseSchema,
 } from "../http/schemas.js";
+import type { DiagnosticReport } from "../../application/collect-diagnostics.js";
 import { TuiTokensMustDifferError, type TuiCredentials } from "./credentials.js";
 
 export interface TuiClientOptions extends TuiCredentials {
@@ -264,6 +266,10 @@ export class TuiClient {
 
   listPendingApprovals(): Promise<{ readonly approvals: readonly PendingApproval[] }> {
     return this.requestAndParse(this.runClient, approvalsResponseSchema, "/v1/approvals?status=pending");
+  }
+
+  getDiagnostics(): Promise<DiagnosticReport> {
+    return this.requestAdmin(diagnosticsResponseSchema, "/v1/admin/diagnostics");
   }
 
   listAgents(): Promise<AgentListView> {

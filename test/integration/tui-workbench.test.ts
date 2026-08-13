@@ -559,6 +559,21 @@ describe("TUI workbench", () => {
     expect(client.listRunHistory).toHaveBeenCalledWith(expect.objectContaining({ agentId: "researcher", sessionKey: "session:review" }));
   });
 
+  it("opens typed Admin diagnostics from navigation", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const workbench = runWorkbench({
+      client: { ...safeClient(), getDiagnostics: async () => ({ checks: [{ id: "config" as const, status: "ok" as const, detail: "config_readable" }] }) },
+      terminal,
+    });
+    await terminal.ready();
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    terminal.input("\r");
+    await terminal.waitForFrame("Diagnostics");
+    await terminal.waitForFrame("config: ok (config_readable)");
+    terminal.input("\u0003");
+    await expect(workbench).resolves.toBe(0);
+  });
+
   it("loads safe Provider Connection and Model Profile summaries through navigation", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const workbench = runWorkbench({ client: safeClient(), terminal });
