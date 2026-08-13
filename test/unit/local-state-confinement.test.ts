@@ -15,6 +15,23 @@ describe("local state physical confinement", () => {
         if (value === root) return root;
         throw Object.assign(new Error("dangling link"), { code: "ENOENT" });
       },
+      stat: async () => ({}),
+    })).rejects.toMatchObject({ code: "local_config_outside_project_state" });
+  });
+
+  it("rejects a dangling link when realpath does not expose the missing target", async () => {
+    const root = path.resolve("workspace", ".myagent");
+    const candidate = path.join(root, "state.sqlite");
+
+    await expect(assertPhysicallyConfinedPath(root, candidate, {
+      lstat: async (value) => ({ isSymbolicLink: () => value === candidate }),
+      realpath: async (value) => value,
+      stat: async (value) => {
+        if (value === candidate) {
+          throw Object.assign(new Error("missing link target"), { code: "ENOENT" });
+        }
+        return {};
+      },
     })).rejects.toMatchObject({ code: "local_config_outside_project_state" });
   });
 });

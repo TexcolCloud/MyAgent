@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import path from "node:path";
 
 import {
   activeSecretReferencesResolvable,
@@ -38,14 +39,16 @@ describe("collectDiagnostics", () => {
   });
 
   it("checks an explicit project state root plus an external SQLite parent and file", async () => {
+    const stateRoot = path.resolve("workspace", ".myagent");
+    const databasePath = path.resolve("external-database", "state.sqlite");
     const access = vi.fn(async (target: string) => {
       if (target.endsWith("state.sqlite")) throw new Error("denied");
     });
 
-    await expect(projectStatePermissionsAvailable("D:\\repo\\.myagent", "E:\\database\\state.sqlite", access)).resolves.toBe(false);
-    expect(access).toHaveBeenCalledWith("D:\\repo\\.myagent", expect.any(Number));
-    expect(access).toHaveBeenCalledWith("E:\\database", expect.any(Number));
-    expect(access).toHaveBeenCalledWith("E:\\database\\state.sqlite", expect.any(Number));
+    await expect(projectStatePermissionsAvailable(stateRoot, databasePath, access)).resolves.toBe(false);
+    expect(access).toHaveBeenCalledWith(stateRoot, expect.any(Number));
+    expect(access).toHaveBeenCalledWith(path.dirname(databasePath), expect.any(Number));
+    expect(access).toHaveBeenCalledWith(databasePath, expect.any(Number));
   });
 
   it("checks post-boot active durable environment and managed Secret references", () => {

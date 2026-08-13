@@ -326,12 +326,13 @@ async function assertPhysicallyConfinedLocalState(
 interface LocalStateFilesystem {
   readonly lstat: (candidate: string) => Promise<unknown>;
   readonly realpath: (candidate: string) => Promise<string>;
+  readonly stat: (candidate: string) => Promise<unknown>;
 }
 
 export async function assertPhysicallyConfinedPath(
   root: string,
   candidate: string,
-  filesystem: LocalStateFilesystem = { lstat, realpath },
+  filesystem: LocalStateFilesystem = { lstat, realpath, stat },
 ): Promise<void> {
   const canonicalRoot = await canonicalizeExistingPath(root, filesystem.realpath);
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
@@ -342,6 +343,11 @@ export async function assertPhysicallyConfinedPath(
       await filesystem.lstat(next);
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) return;
+      throw localConfigOutsideProjectState();
+    }
+    try {
+      await filesystem.stat(next);
+    } catch {
       throw localConfigOutsideProjectState();
     }
     try {
