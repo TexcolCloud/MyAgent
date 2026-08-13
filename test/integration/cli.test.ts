@@ -11,6 +11,116 @@ import { startTestApp } from "../helpers/start-test-app.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
 describe("CLI HTTP boundary", () => {
+  it("keeps public help focused on the TUI-first entry points", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const output: string[] = [];
+
+    await expect(executeCli(["--help"], {
+      write: (line) => output.push(line),
+    })).resolves.toBe(0);
+
+    expect(output).toEqual([
+      "myagent",
+      "tui",
+      "serve",
+      "config validate",
+      "doctor",
+      "backup",
+    ]);
+  });
+
+  it("keeps deprecated resource commands executable with one stderr notice and clean JSON stdout", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    await expect(executeCli(["agents", "list", "--json"], {
+      environment: {
+        MYAGENT_API_URL: "http://127.0.0.1:8787",
+        MYAGENT_BEARER_TOKEN: "run-token",
+      },
+      fetcher: async () => Response.json({ catalogRevision: "catalog", agents: [], unavailable: [] }),
+      write: (line) => stdout.push(line),
+      writeError: (line) => stderr.push(line),
+    })).resolves.toBe(0);
+
+    expect(JSON.parse(stdout[0]!)).toEqual({ catalogRevision: "catalog", agents: [], unavailable: [] });
+    expect(stderr).toEqual(["deprecated_command: This command is deprecated; use the TUI or /v1 HTTP Automation Surface."]);
+  });
+
+  it("adapts deprecated Run cancellation to the confirmed revisioned HTTP contract", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const requests: Array<{ method: string; path: string; body: unknown }> = [];
+
+    await expect(executeCli(["run", "cancel", "run_1", "--json"], {
+      environment: {
+        MYAGENT_API_URL: "http://127.0.0.1:8787",
+        MYAGENT_BEARER_TOKEN: "run-token",
+      },
+      fetcher: async (input, init) => {
+        const url = new URL(String(input));
+        requests.push({
+          method: init?.method ?? "GET",
+          path: url.pathname,
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+        });
+        return Response.json(
+          init?.method === "POST"
+            ? { runId: "run_1", status: "cancelled" }
+            : { runId: "run_1", updatedAt: "2026-08-13T00:00:00.000Z" },
+        );
+      },
+      write: (line) => stdout.push(line),
+      writeError: (line) => stderr.push(line),
+    })).resolves.toBe(0);
+
+    expect(requests).toEqual([
+      { method: "GET", path: "/v1/runs/run_1", body: undefined },
+      {
+        method: "POST",
+        path: "/v1/runs/run_1/cancel",
+        body: { confirm: true, expectedRevision: "2026-08-13T00:00:00.000Z" },
+      },
+    ]);
+    expect(JSON.parse(stdout[0]!)).toEqual({ runId: "run_1", status: "cancelled" });
+    expect(stderr).toEqual(["deprecated_command: This command is deprecated; use the TUI or /v1 HTTP Automation Surface."]);
+  });
+
+  it("requires the explicit internal spelling for recovery commands", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const output: string[] = [];
+    const requests: Array<{ path: string; authorization: string | null }> = [];
+    const options = {
+      environment: {
+        MYAGENT_API_URL: "http://127.0.0.1:8787",
+        MYAGENT_BEARER_TOKEN: "run-token",
+        MYAGENT_ADMIN_TOKEN: "admin-token",
+      },
+      fetcher: async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({
+          path: url.pathname,
+          authorization: new Headers(init?.headers).get("authorization"),
+        });
+        return Response.json({ ok: true });
+      },
+      write: (line: string) => output.push(line),
+    };
+
+    await expect(executeCli(["config", "reload"], options)).resolves.toBe(2);
+    await expect(executeCli(["internal", "config", "reload"], options)).resolves.toBe(0);
+    await expect(executeCli(["internal", "tools", "reconcile", "tool_1", "--as", "retry"], options)).resolves.toBe(0);
+    await expect(executeCli(["internal", "secrets", "rotate-master-key", "--expected-revision", "4"], options)).resolves.toBe(0);
+
+    expect(requests).toEqual([
+      { path: "/v1/config/reload", authorization: "Bearer run-token" },
+      { path: "/v1/tool-calls/tool_1/reconciliation", authorization: "Bearer run-token" },
+      { path: "/v1/admin/managed-secrets/master-key-rotation", authorization: "Bearer admin-token" },
+    ]);
+  });
+
   it.each([[[]], [["tui"]], [["tui", "--local"]]])(
     "routes %j to a workspace-scoped Local Integrated Host",
     async (argumentsList) => {
@@ -328,36 +438,49 @@ describe("CLI HTTP boundary", () => {
       fetcher,
       write: (line: string) => { output.push(line); },
     };
+    const call = async (
+      argumentsList: string[],
+      deprecated = false,
+    ): Promise<void> => {
+      const stderr: string[] = [];
+      await expect(executeCli(argumentsList, {
+        ...options,
+        writeError: (line) => stderr.push(line),
+      })).resolves.toBe(0);
+      expect(stderr).toEqual(deprecated
+        ? ["deprecated_command: This command is deprecated; use the TUI or /v1 HTTP Automation Surface."]
+        : []);
+    };
 
     try {
-      await executeCli(["agents", "list"], options);
-      await executeCli(["config", "reload"], options);
-      await executeCli(["run", "create", "--agent", "primary", "--session", "cli:test", "--text", "hello"], options);
+      await call(["agents", "list"], true);
+      await call(["internal", "config", "reload"]);
+      await call(["run", "create", "--agent", "primary", "--session", "cli:test", "--text", "hello"], true);
       const created = JSON.parse(output.at(-1)!) as { runId: string };
       const sessionId = harness.runs.getRun(created.runId as never).sessionId;
 
-      await executeCli(["run", "cancel", created.runId], options);
-      await executeCli(["run", "watch", created.runId], options);
-      await executeCli(["sessions", "list", "--agent", "primary", "--session", "cli:test"], options);
+      await call(["run", "cancel", created.runId], true);
+      await call(["run", "watch", created.runId], true);
+      await call(["sessions", "list", "--agent", "primary", "--session", "cli:test"], true);
 
       const approvalRunA = await createRun(harness.app, "cli:approval:a", "cli-approval-request-a");
       const approvalRunB = await createRun(harness.app, "cli:approval:b", "cli-approval-request-b");
       seedPendingApproval(harness.connection.db, approvalRunA, "a");
       seedPendingApproval(harness.connection.db, approvalRunB, "b");
-      await executeCli(["approvals", "list"], options);
+      await call(["approvals", "list"], true);
       const approvalList = JSON.parse(output.at(-1)!) as { approvals: unknown[] };
-      await executeCli(["approvals", "approve", "approval-cli-a"], options);
-      await executeCli(["approvals", "deny", "approval-cli-b"], options);
+      await call(["approvals", "approve", "approval-cli-a"], true);
+      await call(["approvals", "deny", "approval-cli-b"], true);
 
       for (const outcome of ["succeeded", "failed", "retry"] as const) {
         const runId = await createRun(harness.app, `cli:reconcile:${outcome}`, `cli-reconcile-${outcome}`);
         seedUnknownToolCall(harness.connection.db, runId, outcome);
-        await executeCli(["tools", "reconcile", `tool-cli-${outcome}`, "--as", outcome], options);
+        await call(["internal", "tools", "reconcile", `tool-cli-${outcome}`, "--as", outcome]);
       }
 
-      await executeCli(["sessions", "delete", sessionId], options);
+      await call(["sessions", "delete", sessionId], true);
       const backupDestination = tempPath(`cli-backup-${randomUUID()}`);
-      await executeCli(["backup", backupDestination], options);
+      await call(["backup", backupDestination]);
 
       expect(watchRequests).toBe(1);
       expect(approvalList.approvals).toEqual(expect.arrayContaining([
@@ -372,7 +495,7 @@ describe("CLI HTTP boundary", () => {
     } finally {
       await harness.close();
     }
-  });
+  }, 15_000);
 
   it("stops watching after a terminal Run event", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
@@ -523,8 +646,9 @@ describe("CLI HTTP boundary", () => {
         write: (line) => output.push(line),
         writeError: (line) => output.push(line),
       })).resolves.toBe(3);
-      expect(output).toHaveLength(1);
-      expect(output[0]).toMatch(/^unauthorized: Authentication is required\. \(traceId: .+\)$/u);
+      expect(output).toHaveLength(2);
+      expect(output[0]).toBe("deprecated_command: This command is deprecated; use the TUI or /v1 HTTP Automation Surface.");
+      expect(output[1]).toMatch(/^unauthorized: Authentication is required\. \(traceId: .+\)$/u);
     } finally {
       await harness.close();
     }

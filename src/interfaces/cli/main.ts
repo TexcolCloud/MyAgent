@@ -61,12 +61,23 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
   try {
     const { positional, flags } = parseArguments(argumentsList);
     json = booleanFlag(flags, "json");
-    const command = positional.length === 0
-      ? "local"
-      : positional[0] === "backup"
-        ? "backup"
-        : positional.slice(0, 2).join(" ");
-    assertCommandGrammar(command, positional.length, flags);
+    if (booleanFlag(flags, "help")) {
+      if (positional.length !== 0 || Object.keys(flags).length !== 1) {
+        throw new CliUsageError("invalid_cli_command", "The CLI command is invalid.");
+      }
+      for (const command of publicHelpCommands()) write(command);
+      return 0;
+    }
+    const internal = positional[0] === "internal";
+    const commandPositional = internal ? positional.slice(1) : positional;
+    const command = commandName(commandPositional);
+    const definition = assertCommandGrammar(command, commandPositional.length, flags);
+    if (definition.lifecycle === "internal" ? !internal : internal) {
+      throw new CliUsageError("invalid_cli_command", "The CLI command is invalid.");
+    }
+    if (definition.lifecycle === "deprecated") {
+      writeError("deprecated_command: This command is deprecated; use the TUI or /v1 HTTP Automation Surface.");
+    }
     if (command === "tui") {
       if (booleanFlag(flags, "local") && stringFlag(flags, "api-url") !== undefined) {
         throw new CliUsageError("tui_mode_conflict", "Choose Local or Attached TUI Mode.");
@@ -139,7 +150,7 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
       ...(adminToken === undefined ? {} : { adminToken }),
       ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
     });
-    if (ADMIN_COMMANDS.has(command) && (adminToken === undefined || adminToken.length === 0)) {
+    if (definition.authority === "admin" && (adminToken === undefined || adminToken.length === 0)) {
       throw new CliCredentialError("admin");
     }
 
@@ -213,15 +224,15 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     if (command === "config reload") { await reloadConfig(client, write); return 0; }
     if (command === "agents list") { await listAgents(client, write); return 0; }
     if (command === "run create") { await createRun(client, { agentId: requiredFlag(flags, "agent"), sessionKey: requiredFlag(flags, "session"), text: requiredFlag(flags, "text") }, write); return 0; }
-    if (command === "run cancel" && positional[2] !== undefined) { await cancelRun(client, positional[2], write); return 0; }
-    if (command === "run watch" && positional[2] !== undefined) { await watchRun(client, positional[2], write); return 0; }
+    if (command === "run cancel" && commandPositional[2] !== undefined) { await cancelRun(client, commandPositional[2], write); return 0; }
+    if (command === "run watch" && commandPositional[2] !== undefined) { await watchRun(client, commandPositional[2], write); return 0; }
     if (command === "approvals list") { await listApprovals(client, write); return 0; }
-    if (command === "approvals approve" && positional[2] !== undefined) { await decideApproval(client, positional[2], "approve", write); return 0; }
-    if (command === "approvals deny" && positional[2] !== undefined) { await decideApproval(client, positional[2], "deny", write); return 0; }
-    if (command === "tools reconcile" && positional[2] !== undefined) { await reconcileTool(client, positional[2], asOutcome(requiredFlag(flags, "as")), write); return 0; }
+    if (command === "approvals approve" && commandPositional[2] !== undefined) { await decideApproval(client, commandPositional[2], "approve", write); return 0; }
+    if (command === "approvals deny" && commandPositional[2] !== undefined) { await decideApproval(client, commandPositional[2], "deny", write); return 0; }
+    if (command === "tools reconcile" && commandPositional[2] !== undefined) { await reconcileTool(client, commandPositional[2], asOutcome(requiredFlag(flags, "as")), write); return 0; }
     if (command === "sessions list") { await listSessions(client, requiredFlag(flags, "agent"), requiredFlag(flags, "session"), write); return 0; }
-    if (command === "sessions delete" && positional[2] !== undefined) { await deleteSession(client, positional[2], write); return 0; }
-    if (command === "backup" && positional[1] !== undefined) { await createBackup(client, positional[1], write); return 0; }
+    if (command === "sessions delete" && commandPositional[2] !== undefined) { await deleteSession(client, commandPositional[2], write); return 0; }
+    if (command === "backup" && commandPositional[1] !== undefined) { await createBackup(client, commandPositional[1], write); return 0; }
     throw new CliUsageError("invalid_cli_command", "The CLI command is invalid.");
   } catch (error) {
     const failure = cliFailure(error);
@@ -316,7 +327,7 @@ function parseArguments(argumentsList: readonly string[]): { positional: string[
   const positional: string[] = [];
   const flags: Record<string, string | true> = {};
   const switches = new Set([
-    "json", "api-key-stdin", "allow-insecure-http", "manual-entry", "local", "allow-remote",
+    "json", "api-key-stdin", "allow-insecure-http", "manual-entry", "local", "allow-remote", "help",
   ]);
   for (let index = 0; index < argumentsList.length; index += 1) {
     const argument = argumentsList[index]!;
@@ -450,60 +461,68 @@ const PROVIDER_FAILURE_CODES = new Set([
   "tool_call_unsupported", "model_protocol_error", "secret_locked",
 ]);
 
-const ADMIN_COMMANDS = new Set([
-  "doctor",
-  "model setup",
-  "providers add", "providers update", "providers list", "providers discover",
-  "providers promote", "providers retire",
-  "models create", "models verify", "models promote", "models list",
-  "models retire", "models set-default",
-  "agents set-model", "verifications get", "secrets rotate-master-key",
-]);
-
 const RUN_FLAGS = ["api-url", "token", "json"] as const;
 const ADMIN_FLAGS = ["api-url", "admin-token", "json"] as const;
 const TUI_FLAGS = ["api-url", "local", "config", "allow-remote"] as const;
-const COMMAND_GRAMMAR: Readonly<Record<string, {
+type CommandLifecycle = "public" | "deprecated" | "internal";
+
+interface CommandDefinition {
   readonly positional: number;
   readonly flags: readonly string[];
-}>> = {
-  serve: { positional: 1, flags: ["config"] },
-  doctor: { positional: 1, flags: ADMIN_FLAGS },
-  local: { positional: 0, flags: ["config"] },
-  tui: { positional: 1, flags: TUI_FLAGS },
-  "config validate": { positional: 2, flags: ["config", "json"] },
-  "config reload": { positional: 2, flags: RUN_FLAGS },
-  "agents list": { positional: 2, flags: RUN_FLAGS },
-  "run create": { positional: 2, flags: [...RUN_FLAGS, "agent", "session", "text"] },
-  "run cancel": { positional: 3, flags: RUN_FLAGS },
-  "run watch": { positional: 3, flags: RUN_FLAGS },
-  "approvals list": { positional: 2, flags: RUN_FLAGS },
-  "approvals approve": { positional: 3, flags: RUN_FLAGS },
-  "approvals deny": { positional: 3, flags: RUN_FLAGS },
-  "tools reconcile": { positional: 3, flags: [...RUN_FLAGS, "as"] },
-  "sessions list": { positional: 2, flags: [...RUN_FLAGS, "agent", "session"] },
-  "sessions delete": { positional: 3, flags: RUN_FLAGS },
-  backup: { positional: 2, flags: RUN_FLAGS },
-  "model setup": { positional: 2, flags: ADMIN_FLAGS },
-  "providers add": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "kind", "driver", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
-  "providers update": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision", "driver", "display-name", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"] },
-  "providers list": { positional: 2, flags: ADMIN_FLAGS },
-  "providers discover": { positional: 2, flags: [...ADMIN_FLAGS, "connection-revision", "expected-revision"] },
-  "providers promote": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "connection-revision", "expected-revision"] },
-  "providers retire": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision"] },
-  "models create": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "connection-revision", "catalog-candidate", "model-id", "protocol", "max-input-tokens", "context-source", "manual-entry"] },
-  "models verify": { positional: 2, flags: [...ADMIN_FLAGS, "profile-revision", "expected-revision"] },
-  "models promote": { positional: 2, flags: [...ADMIN_FLAGS, "model", "profile-revision", "expected-revision"] },
-  "models list": { positional: 2, flags: ADMIN_FLAGS },
-  "models retire": { positional: 2, flags: [...ADMIN_FLAGS, "model", "expected-revision"] },
-  "models set-default": { positional: 2, flags: [...ADMIN_FLAGS, "model", "expected-revision"] },
-  "agents set-model": { positional: 2, flags: [...ADMIN_FLAGS, "agent", "profile-revision", "expected-revision"] },
-  "verifications get": { positional: 2, flags: [...ADMIN_FLAGS, "verification"] },
-  "secrets rotate-master-key": { positional: 2, flags: [...ADMIN_FLAGS, "expected-revision"] },
+  readonly lifecycle: CommandLifecycle;
+  readonly authority?: "admin";
+}
+
+const COMMANDS: Readonly<Record<string, CommandDefinition>> = {
+  serve: { positional: 1, flags: ["config"], lifecycle: "public" },
+  doctor: { positional: 1, flags: ADMIN_FLAGS, lifecycle: "public", authority: "admin" },
+  local: { positional: 0, flags: ["config"], lifecycle: "public" },
+  tui: { positional: 1, flags: TUI_FLAGS, lifecycle: "public" },
+  "config validate": { positional: 2, flags: ["config", "json"], lifecycle: "public" },
+  backup: { positional: 2, flags: RUN_FLAGS, lifecycle: "public" },
+  "config reload": { positional: 2, flags: RUN_FLAGS, lifecycle: "internal" },
+  "agents list": { positional: 2, flags: RUN_FLAGS, lifecycle: "deprecated" },
+  "run create": { positional: 2, flags: [...RUN_FLAGS, "agent", "session", "text"], lifecycle: "deprecated" },
+  "run cancel": { positional: 3, flags: RUN_FLAGS, lifecycle: "deprecated" },
+  "run watch": { positional: 3, flags: RUN_FLAGS, lifecycle: "deprecated" },
+  "approvals list": { positional: 2, flags: RUN_FLAGS, lifecycle: "deprecated" },
+  "approvals approve": { positional: 3, flags: RUN_FLAGS, lifecycle: "deprecated" },
+  "approvals deny": { positional: 3, flags: RUN_FLAGS, lifecycle: "deprecated" },
+  "tools reconcile": { positional: 3, flags: [...RUN_FLAGS, "as"], lifecycle: "internal" },
+  "sessions list": { positional: 2, flags: [...RUN_FLAGS, "agent", "session"], lifecycle: "deprecated" },
+  "sessions delete": { positional: 3, flags: RUN_FLAGS, lifecycle: "deprecated" },
+  "model setup": { positional: 2, flags: ADMIN_FLAGS, lifecycle: "deprecated", authority: "admin" },
+  "providers add": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "kind", "driver", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"], lifecycle: "deprecated", authority: "admin" },
+  "providers update": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision", "driver", "display-name", "base-url", "auth", "api-key-env", "api-key-stdin", "allow-insecure-http", "protocol"], lifecycle: "deprecated", authority: "admin" },
+  "providers list": { positional: 2, flags: ADMIN_FLAGS, lifecycle: "deprecated", authority: "admin" },
+  "providers discover": { positional: 2, flags: [...ADMIN_FLAGS, "connection-revision", "expected-revision"], lifecycle: "deprecated", authority: "admin" },
+  "providers promote": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "connection-revision", "expected-revision"], lifecycle: "deprecated", authority: "admin" },
+  "providers retire": { positional: 2, flags: [...ADMIN_FLAGS, "provider", "expected-revision"], lifecycle: "deprecated", authority: "admin" },
+  "models create": { positional: 2, flags: [...ADMIN_FLAGS, "slug", "display-name", "connection-revision", "catalog-candidate", "model-id", "protocol", "max-input-tokens", "context-source", "manual-entry"], lifecycle: "deprecated", authority: "admin" },
+  "models verify": { positional: 2, flags: [...ADMIN_FLAGS, "profile-revision", "expected-revision"], lifecycle: "deprecated", authority: "admin" },
+  "models promote": { positional: 2, flags: [...ADMIN_FLAGS, "model", "profile-revision", "expected-revision"], lifecycle: "deprecated", authority: "admin" },
+  "models list": { positional: 2, flags: ADMIN_FLAGS, lifecycle: "deprecated", authority: "admin" },
+  "models retire": { positional: 2, flags: [...ADMIN_FLAGS, "model", "expected-revision"], lifecycle: "deprecated", authority: "admin" },
+  "models set-default": { positional: 2, flags: [...ADMIN_FLAGS, "model", "expected-revision"], lifecycle: "deprecated", authority: "admin" },
+  "agents set-model": { positional: 2, flags: [...ADMIN_FLAGS, "agent", "profile-revision", "expected-revision"], lifecycle: "deprecated", authority: "admin" },
+  "verifications get": { positional: 2, flags: [...ADMIN_FLAGS, "verification"], lifecycle: "deprecated", authority: "admin" },
+  "secrets rotate-master-key": { positional: 2, flags: [...ADMIN_FLAGS, "expected-revision"], lifecycle: "internal", authority: "admin" },
 };
 
-function assertCommandGrammar(command: string, positional: number, flags: CliFlags): void {
-  const grammar = COMMAND_GRAMMAR[command];
+function commandName(positional: readonly string[]): string {
+  return positional.length === 0
+    ? "local"
+    : positional[0] === "backup"
+      ? "backup"
+      : positional.slice(0, 2).join(" ");
+}
+
+function publicHelpCommands(): readonly string[] {
+  return ["myagent", "tui", "serve", "config validate", "doctor", "backup"];
+}
+
+function assertCommandGrammar(command: string, positional: number, flags: CliFlags): CommandDefinition {
+  const grammar = COMMANDS[command];
   if (grammar === undefined || positional !== grammar.positional) {
     throw new CliUsageError("invalid_cli_command", "The CLI command is invalid.");
   }
@@ -514,6 +533,7 @@ function assertCommandGrammar(command: string, positional: number, flags: CliFla
   if (Object.keys(flags).some((flag) => !allowed.has(flag))) {
     throw new CliUsageError("invalid_cli_command", "The CLI command is invalid.");
   }
+  return grammar;
 }
 
 function asOutcome(value: string): "succeeded" | "failed" | "retry" {

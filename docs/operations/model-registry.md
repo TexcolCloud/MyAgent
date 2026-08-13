@@ -12,7 +12,11 @@ Start Local Integrated Mode with `myagent`, `myagent tui`, or
 `myagent tui --local`. These entries own a random-port loopback service and use
 fresh in-memory Run/Admin capabilities; they do not read the attached-TUI token
 environment variables. See [Local Integrated Mode](local-integrated-mode.md)
-for the complete command, consent, lifetime, and recovery boundaries.
+for the complete command, consent, lifetime, and recovery boundaries. Normal
+interactive Model Registry management is TUI-first; use the documented HTTP
+Automation Surface for CI and integrations. Legacy resource CLI commands remain
+temporarily compatible with a stderr deprecation notice and are not a new
+automation contract.
 
 Use `myagent tui --api-url <origin>` only to attach to an existing service.
 Attached mode reads its Run credential from `MYAGENT_RUN_TOKEN` and its Admin
