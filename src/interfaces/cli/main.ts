@@ -279,6 +279,9 @@ async function executeLocalTui(flags: CliFlags, options: ExecuteCliOptions): Pro
     }
     await (options.initializeProjectState ?? initializeProjectState)(paths);
   }
+  if (explicitConfigPath === undefined) {
+    await assertWorkspaceOwnedLocalConfig(paths);
+  }
   if (options.runLocalHost !== undefined) {
     return await options.runLocalHost({ configPath: paths.configPath, projectStateRoot: paths.root });
   }
