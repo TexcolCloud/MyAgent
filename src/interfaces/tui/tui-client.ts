@@ -246,7 +246,8 @@ export class TuiClient {
   }
 
   listSessions(input: SessionHistoryInput = {}): Promise<SessionHistoryView> {
-    return this.requestAndParse(this.runClient, sessionHistoryResponseSchema, `/v1/sessions?${historyQuery({ agentId: input.agentId, sessionKey: input.sessionKey, limit: input.limit, cursor: input.cursor })}`);
+    const combinedFilter = input.agentId !== undefined && input.sessionKey !== undefined;
+    return this.requestAndParse(this.runClient, sessionHistoryResponseSchema, `/v1/sessions?${historyQuery({ agentId: input.agentId, sessionKey: input.sessionKey, limit: input.limit ?? (combinedFilter ? 50 : undefined), cursor: input.cursor })}`);
   }
 
   decideApproval(approvalId: string, decision: "approve" | "deny"): Promise<ApprovalDecision> {

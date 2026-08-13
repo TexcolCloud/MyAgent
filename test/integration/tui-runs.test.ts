@@ -28,6 +28,22 @@ describe("TUI Run history transport", () => {
     ]);
   });
 
+  it("makes combined Session filters unambiguously request paginated history by default", async () => {
+    const paths: string[] = [];
+    const client = new TuiClient({
+      runToken: "run",
+      adminToken: "admin",
+      fetcher: async (input) => {
+        paths.push(`${new URL(String(input)).pathname}${new URL(String(input)).search}`);
+        return Response.json({ items: [] });
+      },
+    });
+
+    await client.listSessions({ agentId: "primary", sessionKey: "session:history" });
+
+    expect(paths).toEqual(["/v1/sessions?agentId=primary&sessionKey=session%3Ahistory&limit=50"]);
+  });
+
   it("keeps Session history review-only so durable Runs are never deleted from the TUI", async () => {
     let deleteRequests = 0;
     const client = new TuiClient({
@@ -68,6 +84,47 @@ describe("TUI Run history transport", () => {
     expect(getRun).toHaveBeenCalledTimes(3);
     expect(cancelRun).toHaveBeenCalledExactlyOnceWith("run_1", "2026-08-13T00:00:00.000Z");
     expect(screen.render(120).join("\n")).toContain("cancelled");
+  });
+
+  it("renders a selected terminal Run result without exposing secret-bearing fields", async () => {
+    const completed = {
+      ...run("run_1", "cancelled", "2026-08-13T00:00:00.000Z"),
+      status: "completed" as const,
+      result: { type: "text", text: "durable result\nAuthorization: Bearer secret-value" },
+    };
+    const screen = new RunsScreen({
+      client: { listRunHistory: vi.fn(async () => ({ items: [completed] })), getRun: vi.fn(async () => completed), cancelRun: vi.fn() },
+      inspector: new InspectorScreen(),
+      promptFactory: () => ({ input: async () => "", confirm: async () => true } as never),
+    });
+
+    await screen.loadFor("researcher", "session:review");
+    screen.handleInput("\r");
+    await screen.settled();
+
+    const frame = screen.render(120).join("\n");
+    expect(frame).toContain("durable result");
+    expect(frame).not.toContain("secret-value");
+  });
+
+  it("renders typed failure and nonterminal Run details safely", async () => {
+    const failed = { ...run("run_failed", "cancelled", "2026-08-13T00:00:00.000Z"), status: "failed" as const, failure: { code: "provider_unavailable" } };
+    const active = { ...run("run_active", "running", "2026-08-13T00:00:01.000Z") };
+    const getRun = vi.fn().mockResolvedValueOnce(failed).mockResolvedValueOnce(active);
+    const screen = new RunsScreen({
+      client: { listRunHistory: vi.fn(async () => ({ items: [failed, active] })), getRun, cancelRun: vi.fn() },
+      inspector: new InspectorScreen(),
+      promptFactory: () => ({ input: async () => "", confirm: async () => true } as never),
+    });
+
+    await screen.loadFor("researcher", "session:review");
+    screen.handleInput("\r");
+    await screen.settled();
+    expect(screen.render(120).join("\n")).toContain("Failure: provider_unavailable");
+    screen.handleInput("\u001b[B");
+    screen.handleInput("\r");
+    await screen.settled();
+    expect(screen.render(120).join("\n")).toContain("Run is not terminal.");
   });
 
   it("locks Run controls after a revision conflict and does not retry cancellation", async () => {

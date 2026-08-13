@@ -12,6 +12,7 @@ export class RunsScreen implements Component, Focusable {
   private items: readonly RunView[] = [];
   private nextCursor: string | undefined;
   private selected = 0;
+  private selectedDetail: RunView | undefined;
   private loading = false;
   private reloadRequired = false;
   private filter: { agentId: string; sessionKey: string } | undefined;
@@ -56,7 +57,7 @@ export class RunsScreen implements Component, Focusable {
   render(width: number): string[] {
     const filter = this.filter === undefined ? "No filter selected." : `${this.filter.agentId} / ${this.filter.sessionKey}`;
     const rows = this.items.length === 0 ? [this.loading ? "Loading..." : "No Runs found."] : this.items.map((item, index) => `${index === this.selected ? ">" : " "} ${item.runId} ${item.status} ${item.updatedAt}`);
-    return ["Runs", filter, ...rows, ...(this.reloadRequired ? ["Reload required. Press r."] : ["[f] filter  [Enter] detail  [x] cancel  [n] next page  [r] reload  [Esc] navigation"])]
+    return ["Runs", filter, ...rows, ...this.detailLines(), ...(this.reloadRequired ? ["Reload required. Press r."] : ["[f] filter  [Enter] detail  [x] cancel  [n] next page  [r] reload  [Esc] navigation"])]
       .flatMap(safeDisplayLines).map((line) => truncateToWidth(line, width));
   }
   invalidate(): void {}
@@ -68,12 +69,13 @@ export class RunsScreen implements Component, Focusable {
     const sessionKey = (await prompt.input("Session Key", this.filter?.sessionKey)).trim();
     if (agentId.length === 0 || sessionKey.length === 0) return;
     this.filter = { agentId, sessionKey }; this.nextCursor = undefined; this.items = []; this.selected = 0;
+    this.selectedDetail = undefined;
     await this.load();
   }
 
   private async detail(): Promise<void> {
     const item = this.items[this.selected]; if (item === undefined) return;
-    await this.track(async () => { const detail = await this.options.client.getRun(item.runId); this.replace(detail); });
+    await this.track(async () => { const detail = await this.options.client.getRun(item.runId); this.selectedDetail = detail; this.replace(detail); });
   }
 
   private async cancelSelected(): Promise<void> {
@@ -94,7 +96,20 @@ export class RunsScreen implements Component, Focusable {
     }).finally(() => { if (this.operation === operation) this.operation = undefined; this.changed(); });
     this.operation = operation; await operation;
   }
-  private replace(detail: RunView): void { this.items = this.items.map((item) => item.runId === detail.runId ? detail : item); this.changed(); }
+  private replace(detail: RunView): void { this.items = this.items.map((item) => item.runId === detail.runId ? detail : item); if (this.selectedDetail?.runId === detail.runId) this.selectedDetail = detail; this.changed(); }
+  private detailLines(): readonly string[] {
+    const detail = this.selectedDetail;
+    if (detail === undefined) return [];
+    const lines = [`Detail: ${detail.runId}`, `State: ${detail.status}`, `Updated: ${detail.updatedAt}`];
+    if (detail.status === "completed") return [...lines, ...displayResult(detail.result)];
+    if (detail.status === "failed") return [...lines, `Failure: ${detail.failure?.code ?? "run_failed"}`];
+    return [...lines, "Run is not terminal."];
+  }
   private problem(code: string, detail: string): void { this.options.inspector.showProblem({ code, detail, traceId: "tui" }); }
   private changed(): void { this.options.onChange?.(); }
+}
+
+function displayResult(result: RunView["result"]): readonly string[] {
+  if (typeof result === "object" && result !== null && !Array.isArray(result) && result.type === "text" && typeof result.text === "string") return safeDisplayLines(result.text);
+  return ["Result: recorded."];
 }

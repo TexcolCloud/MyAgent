@@ -139,10 +139,13 @@ describe("HTTP Runs", () => {
   it("rejects noncanonical history cursors before SQLite enumeration", async () => {
     const harness = await startTestApp();
     try {
-      for (const cursor of ["not-base64", Buffer.from('{"updatedAt":"2026-08-13T00:00:00Z","runId":"run_x"}').toString("base64url"), Buffer.from('{"runId":"run_x","updatedAt":"2026-08-13T00:00:00.000Z","extra":true}').toString("base64url")]) {
+      for (const cursor of ["not-base64", Buffer.from('{"updatedAt":"2026-08-13T00:00:00Z","runId":"run_x"}').toString("base64url"), Buffer.from('{"runId":"run_x","updatedAt":"2026-08-13T00:00:00.000Z","extra":true}').toString("base64url"), Buffer.from('{"updatedAt":"2026-08-13T00:00:00.000Z","runId":"ses_wrong_kind"}').toString("base64url"), Buffer.from('{"updatedAt":"2026-08-13T00:00:00.000Z","runId":"run_arbitrary"}').toString("base64url")]) {
         const response = await harness.app.inject({ method: "GET", url: `/v1/runs?agentId=primary&sessionKey=session%3Ahistory&cursor=${encodeURIComponent(cursor)}`, headers: auth });
         expect(response.statusCode).toBe(400);
       }
+      const sessionCursor = Buffer.from('{"updatedAt":"2026-08-13T00:00:00.000Z","sessionId":"run_wrong_kind"}').toString("base64url");
+      const sessionResponse = await harness.app.inject({ method: "GET", url: `/v1/sessions?cursor=${encodeURIComponent(sessionCursor)}`, headers: auth });
+      expect(sessionResponse.statusCode).toBe(400);
     } finally { await harness.close(); }
   });
 

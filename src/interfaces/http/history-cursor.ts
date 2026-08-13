@@ -1,7 +1,9 @@
 import type { RunId, SessionId } from "../../domain/ids.js";
-import { identifierSchema } from "./schemas.js";
+import { z } from "zod";
 
 const MAX_CURSOR_LENGTH = 512;
+const runIdSchema = z.string().regex(/^run_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
+const sessionIdSchema = z.string().regex(/^ses_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
 
 export function encodeRunHistoryCursor(cursor: { readonly updatedAt: Date; readonly runId: RunId }): string {
   return encode({ updatedAt: cursor.updatedAt.toISOString(), runId: cursor.runId });
@@ -9,7 +11,7 @@ export function encodeRunHistoryCursor(cursor: { readonly updatedAt: Date; reado
 
 export function decodeRunHistoryCursor(cursor: string): { readonly updatedAt: Date; readonly runId: RunId } {
   const value = decode(cursor, ["updatedAt", "runId"]);
-  return { updatedAt: timestamp(value.updatedAt), runId: identifier(value.runId) as RunId };
+  return { updatedAt: timestamp(value.updatedAt), runId: identifier(value.runId, runIdSchema) as RunId };
 }
 
 export function encodeSessionHistoryCursor(cursor: { readonly updatedAt: Date; readonly sessionId: SessionId }): string {
@@ -18,7 +20,7 @@ export function encodeSessionHistoryCursor(cursor: { readonly updatedAt: Date; r
 
 export function decodeSessionHistoryCursor(cursor: string): { readonly updatedAt: Date; readonly sessionId: SessionId } {
   const value = decode(cursor, ["updatedAt", "sessionId"]);
-  return { updatedAt: timestamp(value.updatedAt), sessionId: identifier(value.sessionId) as SessionId };
+  return { updatedAt: timestamp(value.updatedAt), sessionId: identifier(value.sessionId, sessionIdSchema) as SessionId };
 }
 
 function encode(value: Record<string, string>): string {
@@ -45,8 +47,8 @@ function timestamp(value: unknown): Date {
   return parsed;
 }
 
-function identifier(value: unknown): string {
-  const parsed = identifierSchema.safeParse(value);
+function identifier(value: unknown, schema: z.ZodType<string>): string {
+  const parsed = schema.safeParse(value);
   if (!parsed.success) invalid();
   return parsed.data;
 }
