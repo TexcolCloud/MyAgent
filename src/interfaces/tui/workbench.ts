@@ -40,7 +40,7 @@ type WorkbenchClient = Pick<TuiClient,
   | "createModelProfile" | "promoteModelProfile" | "retireModelProfile" | "verifyModel"
   | "getModelVerificationAt" | "cancelModelVerification" | "getModelAssignment" | "assignModel"
   | "getDefaultModelProfile" | "setDefaultModelProfile"
-  | "createManagedAgent" | "listRunHistory" | "listSessions" | "getRun"
+  | "createManagedAgent" | "listRunHistory" | "listSessions" | "getRun" | "cancelRun"
 >>;
 
 export interface RunWorkbenchOptions {
@@ -124,11 +124,11 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   };
   const refresh = (destination: WorkbenchDestination) => {
     if (destination === "runs" && isRunHistoryClient(options.client)) {
-      const screen = new RunsScreen({ client: options.client, agentId: "primary", sessionKey: "default", onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      const screen = new RunsScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
       center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
     }
     if (destination === "sessions" && isSessionHistoryClient(options.client)) {
-      const screen = new SessionsScreen({ client: options.client, onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      const screen = new SessionsScreen({ client: options.client, onRuns: (session) => { if (!isRunHistoryClient(options.client)) return; const runs = new RunsScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = screen; tui.setFocus(screen); tui.requestRender(); } }); center = runs; tui.setFocus(runs); void runs.loadFor(session.agentId, session.sessionKey).finally(() => tui.requestRender()); }, onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
       center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
     }
     if (destination === "providers" && isProviderClient(options.client)) {
@@ -307,8 +307,10 @@ function isAssignmentClient(client: WorkbenchClient): client is WorkbenchClient 
   return typeof client.getModelProfile === "function" && typeof client.getModelAssignment === "function" && typeof client.assignModel === "function" && typeof client.getDefaultModelProfile === "function" && typeof client.setDefaultModelProfile === "function";
 }
 
-function isRunHistoryClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof RunsScreen>[0]["client"] {
-  return typeof client.listRunHistory === "function";
+function isRunHistoryClient(client: WorkbenchClient): client is WorkbenchClient & Required<Pick<TuiClient, "listRunHistory" | "getRun" | "cancelRun">> {
+  return typeof client.listRunHistory === "function" &&
+    typeof client.getRun === "function" &&
+    typeof client.cancelRun === "function";
 }
 
 function isSessionHistoryClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof SessionsScreen>[0]["client"] {

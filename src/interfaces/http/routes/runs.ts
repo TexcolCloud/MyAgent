@@ -6,6 +6,7 @@ import type { RunStore } from "../../../ports/run-store.js";
 import type { AgentId, RunId, SessionKey } from "../../../domain/ids.js";
 import { activeRunsQuerySchema, cancelRunSchema, createRunResponseSchema, createRunSchema, idempotencyKeySchema, identifierSchema, parseSchema, runHistoryQuerySchema, runResponseSchema } from "../schemas.js";
 import { parseLastEventId, streamRunEvents, type SseStreamOptions } from "../sse.js";
+import { decodeRunHistoryCursor, encodeRunHistoryCursor } from "../history-cursor.js";
 
 export function registerRunRoutes(app: FastifyInstance, services: {
   createRuns: CreateRunService;
@@ -31,11 +32,11 @@ export function registerRunRoutes(app: FastifyInstance, services: {
       agentId: history.agentId as AgentId,
       sessionKey: history.sessionKey as SessionKey,
       limit: history.limit ?? 50,
-      ...(history.cursor === undefined ? {} : { cursor: decodeCursor(history.cursor) }),
+      ...(history.cursor === undefined ? {} : { cursor: decodeRunHistoryCursor(history.cursor) }),
     });
     return {
       items: page.items.map(runView),
-      ...(page.nextCursor === undefined ? {} : { nextCursor: encodeCursor(page.nextCursor) }),
+      ...(page.nextCursor === undefined ? {} : { nextCursor: encodeRunHistoryCursor(page.nextCursor) }),
     };
   });
   app.get("/runs/:runId", { schema: { response: { 200: runResponseSchema } } }, async (request) => runView(services.runs.getRun(parseSchema(identifierSchema, (request.params as { runId: unknown }).runId) as RunId)));
@@ -51,25 +52,6 @@ export function registerRunRoutes(app: FastifyInstance, services: {
     reply.raw.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
     await streamRunEvents(request, reply.raw, runId, services.runs, services.sse);
   });
-}
-
-function encodeCursor(cursor: { readonly updatedAt: Date; readonly runId: RunId }): string {
-  return Buffer.from(JSON.stringify({ updatedAt: cursor.updatedAt.toISOString(), runId: cursor.runId }))
-    .toString("base64url");
-}
-
-function decodeCursor(cursor: string): { readonly updatedAt: Date; readonly runId: RunId } {
-  try {
-    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as {
-      updatedAt?: unknown; runId?: unknown;
-    };
-    if (typeof value.updatedAt !== "string" || typeof value.runId !== "string") throw new Error("invalid_cursor");
-    const updatedAt = new Date(value.updatedAt);
-    if (!Number.isFinite(updatedAt.getTime())) throw new Error("invalid_cursor");
-    return { updatedAt, runId: value.runId as RunId };
-  } catch {
-    throw new Error("invalid_request");
-  }
 }
 
 function runView(run: ReturnType<RunStore["getRun"]>) {

@@ -538,6 +538,27 @@ describe("TUI workbench", () => {
     expect(terminal.frames.at(-1)).toContain("Research Agent");
   });
 
+  it("exposes Sessions in navigation and opens selected Session Run history", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const client = {
+      ...safeClient(),
+      listSessions: async () => ({ items: [{ sessionId: "ses_1", agentId: "researcher", sessionKey: "session:review", createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z" }] }),
+      listRunHistory: vi.fn(async (input: { agentId: string; sessionKey: string }) => ({ items: [{ runId: "run_1", sessionId: "ses_1", agentId: input.agentId, status: "completed" as const, fifoSequence: 0, parentRunId: null, rootRunId: "run_1", delegationDepth: 0, budget: { modelTurns: 0, toolCalls: 0, childRuns: 0, delegationDepth: 0, activeExecutionSeconds: 0, toolOutputBytes: 0 }, createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z" }] })),
+      getRun: async () => ({ runId: "run_1", sessionId: "ses_1", agentId: "researcher", status: "completed" as const, fifoSequence: 0, parentRunId: null, rootRunId: "run_1", delegationDepth: 0, budget: { modelTurns: 0, toolCalls: 0, childRuns: 0, delegationDepth: 0, activeExecutionSeconds: 0, toolOutputBytes: 0 }, createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z" }),
+      cancelRun: async () => { throw new Error("unused"); },
+    };
+    const workbench = runWorkbench({ client, terminal });
+    await terminal.ready();
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    terminal.input("\r");
+    await terminal.waitForFrame("Sessions");
+    terminal.input("\r");
+    await terminal.waitForFrame("run_1");
+    terminal.input("\u0003");
+    await expect(workbench).resolves.toBe(0);
+    expect(client.listRunHistory).toHaveBeenCalledWith(expect.objectContaining({ agentId: "researcher", sessionKey: "session:review" }));
+  });
+
   it("loads safe Provider Connection and Model Profile summaries through navigation", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const workbench = runWorkbench({ client: safeClient(), terminal });
@@ -585,7 +606,7 @@ describe("TUI workbench", () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const workbench = runWorkbench({ client, terminal });
     await terminal.ready();
-    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
     terminal.input("\r");
     await terminal.waitForFrame("Verifications");
     terminal.input("q");
@@ -615,7 +636,7 @@ describe("TUI workbench", () => {
     const workbench = runWorkbench({ client, terminal });
 
     await terminal.ready();
-    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
     terminal.input("\r");
     await terminal.waitForFrame("Verifications");
     terminal.input("q");

@@ -8,6 +8,7 @@ const destinations: readonly { readonly id: WorkbenchDestination; readonly label
   { id: "providers", label: "Providers" },
   { id: "profiles", label: "Profiles" },
   { id: "verifications", label: "Verifications" },
+  { id: "sessions", label: "Sessions" },
 ];
 
 export class NavigationScreen implements Component, Focusable {
