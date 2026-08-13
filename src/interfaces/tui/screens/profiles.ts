@@ -1,14 +1,19 @@
 import { matchesKey, truncateToWidth, type Component, type Focusable } from "@mariozechner/pi-tui";
 
 import type { CliPrompt } from "../../cli/commands/model-setup.js";
-import type { CreateModelProfileInput, ModelProfileResponse } from "../../http/model-control-schemas.js";
+import type {
+  CreateModelProfileInput,
+  ProviderConnectionResponse,
+  ModelProfileResponse,
+} from "../../http/model-control-schemas.js";
 import { safeDisplayLines } from "../safe-display-text.js";
 import { isRevisionConflict, type TuiClient } from "../tui-client.js";
 import type { InspectorScreen } from "./inspector.js";
 
 type ProfileClient = Pick<TuiClient,
   "listModelProfiles" | "getModelProfile" | "createModelProfile" |
-  "promoteModelProfile" | "retireModelProfile"
+  "promoteModelProfile" | "retireModelProfile" | "listProviderConnections" |
+  "getProviderConnection" | "listProviderDrivers"
 >;
 
 interface ProfileRow {
@@ -90,11 +95,53 @@ export class ProfileScreen implements Component, Focusable {
     const prompt = this.prompt();
     const slug = required(await prompt.input("Profile ID"));
     const displayName = required(await prompt.input("Profile display name"));
-    const connectionRevisionId = required(await prompt.input("Provider revision ID"));
-    const modelId = required(await prompt.input("Provider model ID"));
-    const input: CreateModelProfileInput = { slug, displayName, connectionRevisionId, modelId, protocol: "auto", manualEntryAcknowledged: true };
+    const target = await this.selectProviderRevision(prompt);
+    const input = await this.profileInput(prompt, slug, displayName, target);
     if (!await this.confirm("Profile creation", slug, "none", "new draft", [])) return;
     this.accept(await this.options.client.createModelProfile(input), "Created draft Profile.");
+  }
+
+  private async selectProviderRevision(prompt: CliPrompt): Promise<ProviderRevisionTarget> {
+    const connections = await this.options.client.listProviderConnections();
+    const details = await Promise.all(connections.connections.map(({ connectionId }) =>
+      this.options.client.getProviderConnection(connectionId),
+    ));
+    const targets = details.flatMap(providerRevisionTargets);
+    const revisionId = await prompt.select("Provider revision", targets.map(({ revisionId }) => revisionId));
+    const target = targets.find((candidate) => candidate.revisionId === revisionId);
+    if (target === undefined) throw new Error("provider_revision_not_selected");
+    return target;
+  }
+
+  private async profileInput(
+    prompt: CliPrompt,
+    slug: string,
+    displayName: string,
+    target: ProviderRevisionTarget,
+  ): Promise<CreateModelProfileInput> {
+    if (target.driverId !== undefined) {
+      const catalog = await this.options.client.listProviderDrivers();
+      const driver = catalog.drivers.find(({ driverId }) => driverId === target.driverId);
+      if (driver === undefined) throw new Error("provider_driver_not_found");
+      const catalogCandidateId = await prompt.select(
+        "Catalog Candidate",
+        driver.candidates.filter(({ credentialSupport }) => credentialSupport !== "unsupported")
+          .map(({ candidateId }) => candidateId),
+      );
+      return { slug, displayName, connectionRevisionId: target.revisionId, catalogCandidateId };
+    }
+    if (target.providerKind !== "openai_compatible") throw new Error("manual_profile_not_permitted");
+    const modelId = required(await prompt.input("Provider model ID"));
+    const protocol = await prompt.select("Protocol", ["auto", "chat_completions", "responses"] as const);
+    if (!await prompt.confirm("Acknowledge manual custom-provider model entry?")) throw new Error("manual_profile_not_acknowledged");
+    return {
+      slug,
+      displayName,
+      connectionRevisionId: target.revisionId,
+      modelId,
+      protocol,
+      manualEntryAcknowledged: true,
+    };
   }
 
   private async promote(): Promise<void> {
@@ -163,3 +210,17 @@ export class ProfileScreen implements Component, Focusable {
 function summary(profile: ModelProfileResponse): ProfileRow { return { profileId: profile.profileId, displayName: profile.displayName, activeRevisionId: profile.activeRevisionId, retiredAt: profile.retiredAt }; }
 function profileDetail(profile: ModelProfileResponse, outcome?: string) { const latest = profile.revisions.at(-1); return { profileId: profile.profileId, displayName: profile.displayName, recordRevision: profile.recordRevision, activeRevisionId: profile.activeRevisionId, latestRevisionId: latest?.revisionId ?? null, latestRevisionState: latest?.state ?? "missing", capabilities: latest?.verifiedCapabilities ?? [], retiredAt: profile.retiredAt, ...(outcome === undefined ? {} : { outcome }) }; }
 function required(value: string): string { const normalized = value.trim(); if (normalized.length === 0) throw new Error("profile_value_required"); return normalized; }
+
+interface ProviderRevisionTarget {
+  readonly revisionId: string;
+  readonly providerKind: ProviderConnectionResponse["providerKind"];
+  readonly driverId: string | undefined;
+}
+
+function providerRevisionTargets(connection: ProviderConnectionResponse): readonly ProviderRevisionTarget[] {
+  return connection.revisions.map(({ revisionId }) => ({
+    revisionId,
+    providerKind: connection.providerKind,
+    driverId: connection.providerDriver,
+  }));
+}

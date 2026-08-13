@@ -45,16 +45,33 @@ describe("TUI model control workflows", () => {
     expect(inspector.render(100).join("\n")).toContain("Verification required");
   });
 
-  it("cancels the selected Verification with its own revision after explicit confirmation", async () => {
+  it("polls only the returned opaque Verification operation URL and allows explicit cancellation while polling", async () => {
+    let releaseSleep: (() => void) | undefined;
+    const sleeping = new Promise<void>((resolve) => { releaseSleep = resolve; });
+    const getModelVerificationAt = vi.fn(async (operationUrl: string) => {
+      expect(operationUrl).toBe("/v1/admin/operations/opaque-verification-status");
+      return verification("running", 3);
+    });
     const cancelModelVerification = vi.fn(async () => verification("cancelled", 4));
     const screen = new VerificationScreen({
-      client: { verifyModel: vi.fn(), getModelVerification: vi.fn(), cancelModelVerification } as never,
+      client: {
+        verifyModel: vi.fn(async () => ({
+          verificationId: "ver_one", profileRevisionId: "mpr_verified",
+          capabilityBaseline: "text_and_single_tool_call_v1", status: "queued",
+          recordRevision: 1, operationUrl: "/v1/admin/operations/opaque-verification-status",
+        })),
+        getModelVerificationAt,
+        cancelModelVerification,
+      } as never,
       inspector: new InspectorScreen(),
-      promptFactory: () => prompt({ confirms: [true] }),
+      promptFactory: () => prompt({ inputs: ["mpr_verified", "2"], confirms: [true] }),
+      sleep: async () => await sleeping,
     });
-    (screen as unknown as { verification: unknown }).verification = verification("running", 3);
 
+    screen.handleInput("q");
+    await vi.waitFor(() => expect(getModelVerificationAt).toHaveBeenCalledOnce());
     screen.handleInput("x");
+    releaseSleep?.();
     await screen.settled();
 
     expect(cancelModelVerification).toHaveBeenCalledWith("ver_one", { expectedRevision: 3 });
@@ -83,20 +100,68 @@ describe("TUI model control workflows", () => {
     expect(inspector.render(100).join("\n")).toContain("Existing Assignments are not rewritten.");
   });
 
+  it("does not offer or accept legacy-trusted revisions for a new Agent Assignment", async () => {
+    const selections: Array<{ readonly message: string; readonly choices: readonly unknown[] }> = [];
+    const assignModel = vi.fn();
+    const inspector = new InspectorScreen();
+    const screen = new AssignmentScreen({
+      client: assignmentClient({ assignModel }),
+      inspector,
+      promptFactory: () => prompt({ selects: ["agent-one", "mpr_legacy"], confirmations: [true], selections }),
+    });
+    await screen.load();
+
+    screen.handleInput("a");
+    await screen.settled();
+
+    expect(selections.find(({ message }) => message === "Verified Profile revision")?.choices)
+      .not.toContain("mpr_legacy");
+    expect(assignModel).not.toHaveBeenCalled();
+    expect(inspector.render(100).join("\n")).toContain("Verification required");
+  });
+
   it("reviews retirement as preserving historical Runs before the mutation", async () => {
-    let release: ((value: boolean) => void) | undefined;
-    const confirmation = new Promise<boolean>((resolve) => { release = resolve; });
+    let confirmationRequested = false;
+    let release: (() => void) | undefined;
+    const confirmation = new Promise<void>((resolve) => { release = resolve; });
     const retireModelProfile = vi.fn(async () => ({ ...modelProfile(), retiredAt: "2026-08-13T00:00:00.000Z" }));
     const inspector = new InspectorScreen();
-    const screen = new ProfileScreen({ client: profileClient({ retireModelProfile }), inspector, promptFactory: () => prompt({ confirms: [confirmation] }) });
+    const screen = new ProfileScreen({ client: profileClient({ retireModelProfile }), inspector, promptFactory: () => ({
+      ...prompt({}),
+      confirm: async () => { confirmationRequested = true; await confirmation; return true; },
+    }) });
     await screen.load();
     screen.handleInput("x");
-    await vi.waitFor(() => expect(inspector.render(100).join("\n")).toContain("Profile retirement"));
+    await vi.waitFor(() => expect(confirmationRequested).toBe(true));
     expect(retireModelProfile).not.toHaveBeenCalled();
-    release?.(true);
+    release?.();
     await screen.settled();
     expect(retireModelProfile).toHaveBeenCalledWith("profile-one", { expectedRevision: 2 });
     expect(inspector.render(100).join("\n")).toContain("historical Runs remain unchanged");
+  });
+
+  it("creates native-driver Profiles from a safe Catalog Candidate without manual acknowledgement", async () => {
+    const createModelProfile = vi.fn(async () => modelProfile());
+    const screen = new ProfileScreen({
+      client: profileClient({
+        createModelProfile,
+        listProviderConnections: async () => ({ connections: [{ connectionId: "provider-one", displayName: "Provider One", activeRevisionId: "pcr_native", retiredAt: null }] }),
+        getProviderConnection: async () => ({ providerDriver: "pi/openai", providerKind: "openai", revisions: [{ revisionId: "pcr_native" }] }),
+        listProviderDrivers: async () => ({ piVersion: "0.73.1", drivers: [{ driverId: "pi/openai", candidates: [{ candidateId: "pi/openai:gpt-4.1-mini", displayName: "GPT-4.1 mini", modelId: "gpt-4.1-mini", credentialSupport: "bearer" }] }] }),
+      }),
+      inspector: new InspectorScreen(),
+      promptFactory: () => prompt({ inputs: ["catalog-profile", "Catalog Profile"], selects: ["pcr_native", "pi/openai:gpt-4.1-mini"], confirms: [true] }),
+    });
+    await screen.load();
+    screen.handleInput("n");
+    await screen.settled();
+
+    expect(createModelProfile).toHaveBeenCalledWith({
+      slug: "catalog-profile",
+      displayName: "Catalog Profile",
+      connectionRevisionId: "pcr_native",
+      catalogCandidateId: "pi/openai:gpt-4.1-mini",
+    });
   });
 });
 
@@ -107,6 +172,9 @@ function profileClient(overrides: Record<string, unknown> = {}) {
     createModelProfile: async () => modelProfile(),
     promoteModelProfile: async () => modelProfile(),
     retireModelProfile: async () => modelProfile(),
+    listProviderConnections: async () => ({ connections: [] }),
+    getProviderConnection: async () => ({ providerDriver: undefined, providerKind: "openai_compatible", revisions: [] }),
+    listProviderDrivers: async () => ({ piVersion: "0.73.1", drivers: [] }),
     ...overrides,
   } as never;
 }
@@ -130,6 +198,7 @@ function modelProfile(): ModelProfileResponse {
     revisions: [
       revision("mpr_active", "active", ["streaming_text", "single_tool_call"]),
       revision("mpr_verified", "verified", ["streaming_text", "single_tool_call"]),
+      revision("mpr_legacy", "legacy_trusted", ["streaming_text", "single_tool_call"]),
       revision("mpr_draft", "draft", []),
     ],
   };
@@ -139,8 +208,14 @@ function revision(revisionId: string, state: ModelProfileResponse["revisions"][n
   return { revisionId, profileId: "profile-one", connectionRevisionId: "pcr_one", providerModelId: "model-one", invocationProtocol: "responses", maxInputTokens: 128_000, contextWindowSource: "preset", capabilityBaseline: "text_and_single_tool_call_v1", verifiedCapabilities, state, createdAt: "2026-08-13T00:00:00.000Z" };
 }
 
-function prompt(values: { readonly selects?: string[]; readonly confirms?: boolean[] }): CliPrompt {
-  return { select: async <T extends string>() => values.selects?.shift() as T, selectChoice: async <T extends string>() => values.selects?.shift() as T, input: async () => "", secret: async () => "", confirm: async () => values.confirms?.shift() ?? false };
+function prompt(values: { readonly selects?: string[]; readonly inputs?: string[]; readonly confirms?: boolean[]; readonly confirmations?: boolean[]; readonly selections?: Array<{ readonly message: string; readonly choices: readonly unknown[] }> }): CliPrompt {
+  return {
+    select: async <T extends string>(message: string, choices: readonly unknown[]) => { values.selections?.push({ message, choices }); return values.selects?.shift() as T; },
+    selectChoice: async <T extends string>(message: string, choices: readonly unknown[]) => { values.selections?.push({ message, choices }); return values.selects?.shift() as T; },
+    input: async () => values.inputs?.shift() ?? "",
+    secret: async () => "",
+    confirm: async () => values.confirms?.shift() ?? values.confirmations?.shift() ?? false,
+  };
 }
 
 function verification(status: "queued" | "running" | "passed" | "failed" | "cancelled", recordRevision: number) {

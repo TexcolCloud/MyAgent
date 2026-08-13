@@ -15,6 +15,7 @@ import { ApprovalScreen } from "../../src/interfaces/tui/screens/approvals.js";
 import { InspectorScreen } from "../../src/interfaces/tui/screens/inspector.js";
 import { runModelSetupScreen } from "../../src/interfaces/tui/screens/model-setup.js";
 import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
+import type { ModelProfileResponse } from "../../src/interfaces/http/model-control-schemas.js";
 
 describe("TUI workbench", () => {
   it("exits immediately without a prompt when no durable work is active", async () => {
@@ -547,6 +548,53 @@ describe("TUI workbench", () => {
     expect(terminal.frames.at(-1)).toContain("Model One");
   });
 
+  it("routes Profiles, Assignments, and Verification q/x controls through the workbench", async () => {
+    const cancelModelVerification = vi.fn(async () => verificationView("cancelled", 4));
+    const client = {
+      ...safeClient(),
+      getModelProfile: async () => modelProfileView(),
+      createModelProfile: async () => modelProfileView(),
+      promoteModelProfile: async () => modelProfileView(),
+      retireModelProfile: async () => modelProfileView(),
+      getProviderConnection: async () => providerConnectionView(),
+      verifyModel: async () => ({
+        verificationId: "ver_one", profileRevisionId: "mpr_verified",
+        capabilityBaseline: "text_and_single_tool_call_v1" as const,
+        status: "queued" as const, recordRevision: 1,
+        operationUrl: "/v1/admin/operations/opaque-verification-status",
+      }),
+      getModelVerification: async () => verificationView("running", 3),
+      getModelVerificationAt: async () => verificationView("running", 3),
+      cancelModelVerification,
+      getModelAssignment: async () => ({ agentId: "research", state: "unassigned" as const, modelProfileRevisionId: null, source: null, recordRevision: null, updatedAt: null }),
+      assignModel: async () => ({ agentId: "research", state: "assigned" as const, modelProfileRevisionId: "mpr_verified", source: "explicit" as const, recordRevision: 1, updatedAt: "2026-08-13T00:00:00.000Z" }),
+      getDefaultModelProfile: async () => ({ state: "unset" as const, profileId: null, recordRevision: null }),
+      setDefaultModelProfile: async () => ({ state: "configured" as const, profileId: "model-one", recordRevision: 1 }),
+    };
+    await navigateWorkbench(client, ["\u001b[B", "\u001b[B"], "Profiles");
+    await navigateWorkbench(client, ["\u001b[A"], "Assignments");
+
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const workbench = runWorkbench({ client, terminal });
+    await terminal.ready();
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    terminal.input("\r");
+    await terminal.waitForFrame("Verifications");
+    terminal.input("q");
+    await terminal.waitForFrame("Profile revision ID");
+    terminal.input("mpr_verified"); terminal.input("\r");
+    await terminal.waitForFrame("Profile record revision");
+    terminal.input("2"); terminal.input("\r");
+    await terminal.waitForFrame("ver_one (running)");
+    terminal.input("x");
+    await terminal.waitForFrame("Cancel this Verification?"); terminal.input("\r");
+    await vi.waitFor(() => expect(cancelModelVerification).toHaveBeenCalledWith("ver_one", { expectedRevision: 3 }));
+    await terminal.waitForFrame("ver_one (cancelled)");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+  });
+
   it("does not render control sequences or credential lines from typed list summaries", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const client = safeClient({
@@ -1032,6 +1080,87 @@ function safeClient(overrides: Partial<{
       state: decision === "approve" ? "approved" : "denied",
       resolvedAt: "2026-08-12T00:00:00.000Z",
     })),
+  };
+}
+
+async function navigateWorkbench(
+  client: Parameters<typeof runWorkbench>[0]["client"],
+  keys: readonly string[],
+  expected: string,
+): Promise<void> {
+  const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+  const workbench = runWorkbench({ client, terminal });
+  await terminal.ready();
+  for (const key of keys) terminal.input(key);
+  terminal.input("\r");
+  await terminal.waitForFrame(expected);
+  terminal.input("\u0003");
+  await expect(workbench).resolves.toBe(0);
+}
+
+function modelProfileView(): ModelProfileResponse {
+  return {
+    profileId: "model-one",
+    displayName: "Model One",
+    activeRevisionId: "mpr_verified",
+    retiredAt: null,
+    recordRevision: 2,
+    revisions: [{
+      revisionId: "mpr_verified",
+      profileId: "model-one",
+      connectionRevisionId: "pcr_one",
+      providerModelId: "model-one",
+      invocationProtocol: "responses" as const,
+      maxInputTokens: 128_000,
+      contextWindowSource: "preset" as const,
+      capabilityBaseline: "text_and_single_tool_call_v1" as const,
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      state: "verified" as const,
+      createdAt: "2026-08-13T00:00:00.000Z",
+    }],
+  };
+}
+
+function providerConnectionView() {
+  return {
+    connectionId: "provider-one",
+    displayName: "Provider One",
+    providerKind: "openai" as const,
+    providerDriver: "pi/openai",
+    activeRevisionId: "pcr_one",
+    retiredAt: null,
+    recordRevision: 1,
+    credentialConfigured: true,
+    revisions: [{
+      revisionId: "pcr_one",
+      connectionId: "provider-one",
+      state: "active" as const,
+      baseUrl: "https://api.openai.com/v1",
+      allowInsecureHttp: false,
+      protocolPreference: "responses" as const,
+      presetVersion: "2026-08-01",
+      credentialConfigured: true,
+      createdAt: "2026-08-13T00:00:00.000Z",
+    }],
+  };
+}
+
+function verificationView(status: "running" | "cancelled", recordRevision: number) {
+  return {
+    verificationId: "ver_one",
+    profileRevisionId: "mpr_verified",
+    capabilityBaseline: "text_and_single_tool_call_v1" as const,
+    status,
+    resultCode: null,
+    safeStatus: null,
+    capabilities: [],
+    traceId: "trace_one",
+    recordRevision,
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+    cancellationRequestedAt: null,
+    fallbackProfileRevisionId: null,
+    fallbackVerificationId: null,
   };
 }
 

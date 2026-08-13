@@ -388,6 +388,11 @@ export class TuiClient {
     );
   }
 
+  getModelVerificationAt(operationUrl: string): Promise<ModelVerificationResponse> {
+    if (!operationUrl.startsWith("/v1/admin/")) return Promise.reject(new TuiResponseValidationError());
+    return this.requestAdmin(modelVerificationResponseSchema, operationUrl);
+  }
+
   cancelModelVerification(
     verificationId: string,
     input: ExpectedRevisionInput,
