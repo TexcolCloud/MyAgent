@@ -549,7 +549,7 @@ describe("TUI workbench", () => {
     };
     const workbench = runWorkbench({ client, terminal });
     await terminal.ready();
-    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
     terminal.input("\r");
     await terminal.waitForFrame("Sessions");
     terminal.input("\r");

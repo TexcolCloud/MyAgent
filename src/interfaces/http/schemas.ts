@@ -54,12 +54,21 @@ const runBudgetSchema = z.strictObject({
 });
 export const healthResponseSchema = z.strictObject({ ok: z.literal(true) });
 export const readinessResponseSchema = z.strictObject({ ready: z.boolean() });
-const diagnosticCheckSchema = z.strictObject({
-  id: z.enum(["config", "permissions", "sqlite", "secrets", "workers", "gateway", "tty", "binding"]),
-  status: z.enum(["ok", "failed"]),
-  detail: z.string(),
-});
-export const diagnosticsResponseSchema = z.strictObject({ checks: z.array(diagnosticCheckSchema) });
+const diagnosticCheck = <Id extends string, Ok extends string, Failed extends string>(id: Id, ok: Ok, failed: Failed) =>
+  z.union([
+    z.strictObject({ id: z.literal(id), status: z.literal("ok"), detail: z.literal(ok) }),
+    z.strictObject({ id: z.literal(id), status: z.literal("failed"), detail: z.literal(failed) }),
+  ]);
+export const diagnosticsResponseSchema = z.strictObject({ checks: z.tuple([
+  diagnosticCheck("config", "config_readable", "config_unreadable"),
+  diagnosticCheck("permissions", "project_permissions_ok", "project_permissions_unavailable"),
+  diagnosticCheck("sqlite", "sqlite_migrations_current", "sqlite_migrations_unavailable"),
+  diagnosticCheck("secrets", "secret_references_resolved", "secret_references_unavailable"),
+  diagnosticCheck("workers", "worker_ready", "worker_not_ready"),
+  diagnosticCheck("gateway", "provider_gateway_available", "provider_gateway_unavailable"),
+  diagnosticCheck("tty", "interactive_tty_available", "interactive_tty_unavailable"),
+  diagnosticCheck("binding", "loopback_binding", "binding_unavailable"),
+]) });
 const unavailableAgentResponseSchema = z.strictObject({
   label: z.string(),
   code: z.literal("invalid_agent_config"),

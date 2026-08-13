@@ -1,3 +1,7 @@
+import { constants as fsConstants } from "node:fs";
+
+import type { ManagedSecretVersionId } from "../domain/ids.js";
+
 export type DiagnosticStatus = "ok" | "failed";
 
 export interface DiagnosticCheck {
@@ -41,4 +45,55 @@ export async function collectDiagnostics(probes: DiagnosticProbes): Promise<Diag
 
 async function passes(probe: () => boolean | Promise<boolean | void>): Promise<boolean> {
   try { return (await probe()) !== false; } catch { return false; }
+}
+
+export async function projectStatePermissionsAvailable(
+  root: string,
+  databasePath: string,
+  access: (path: string, mode: number) => Promise<void>,
+): Promise<boolean> {
+  try {
+    await access(root, fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK);
+    await access(databasePath, fsConstants.R_OK | fsConstants.W_OK);
+    return true;
+  } catch { return false; }
+}
+
+type DiagnosticRegistry = {
+  readonly listConnections: () => readonly {
+    readonly activeRevisionId: string | null;
+    readonly revisions: readonly {
+      readonly revisionId: string;
+      readonly auth: { readonly type: "none" } | { readonly type: "bearer"; readonly secret: { readonly fromEnvironment: string } | { readonly managedSecretVersionId: string } };
+    }[];
+  }[];
+  readonly listProfiles: () => readonly {
+    readonly activeRevisionId: string | null;
+    readonly revisions: readonly { readonly revisionId: string; readonly connectionRevisionId: string }[];
+  }[];
+};
+
+export function activeSecretReferencesResolvable(
+  registry: DiagnosticRegistry,
+  environment: Readonly<Record<string, string | undefined>>,
+  assertManaged: (versionId: ManagedSecretVersionId) => void,
+): boolean {
+  try {
+    const activeProfileConnections = new Set(registry.listProfiles().flatMap((profile) =>
+      profile.revisions
+        .filter((revision) => revision.revisionId === profile.activeRevisionId)
+        .map((revision) => revision.connectionRevisionId)));
+    const revisions = registry.listConnections().flatMap((connection) => connection.revisions.filter((revision) =>
+      revision.revisionId === connection.activeRevisionId || activeProfileConnections.has(revision.revisionId)));
+    for (const revision of revisions) {
+      if (revision.auth.type === "none") continue;
+      const reference = revision.auth.secret;
+      if ("fromEnvironment" in reference) {
+        if (!Object.hasOwn(environment, reference.fromEnvironment)) return false;
+      } else {
+        assertManaged(reference.managedSecretVersionId as ManagedSecretVersionId);
+      }
+    }
+    return true;
+  } catch { return false; }
 }

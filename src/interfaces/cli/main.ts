@@ -144,8 +144,7 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
     }
 
     if (command === "doctor") {
-      await doctor(client, write, json);
-      return 0;
+      return await doctor(client, write, json) ? 0 : 1;
     }
 
     if (command === "model setup") return await setupModel(

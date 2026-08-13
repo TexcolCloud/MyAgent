@@ -11,7 +11,16 @@ describe("TUI diagnostics", () => {
       adminToken: "admin-token",
       fetcher: async (input, init) => {
         paths.push(`${new URL(String(input)).pathname}:${new Headers(init?.headers).get("authorization")}`);
-        return Response.json({ checks: [{ id: "config", status: "ok", detail: "config_readable" }] });
+        return Response.json({ checks: [
+          { id: "config", status: "ok", detail: "config_readable" },
+          { id: "permissions", status: "ok", detail: "project_permissions_ok" },
+          { id: "sqlite", status: "ok", detail: "sqlite_migrations_current" },
+          { id: "secrets", status: "ok", detail: "secret_references_resolved" },
+          { id: "workers", status: "ok", detail: "worker_ready" },
+          { id: "gateway", status: "ok", detail: "provider_gateway_available" },
+          { id: "tty", status: "ok", detail: "interactive_tty_available" },
+          { id: "binding", status: "ok", detail: "loopback_binding" },
+        ] });
       },
     });
     const screen = new DiagnosticsScreen({ client });

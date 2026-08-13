@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { collectDiagnostics } from "../../src/application/collect-diagnostics.js";
+import {
+  activeSecretReferencesResolvable,
+  collectDiagnostics,
+  projectStatePermissionsAvailable,
+} from "../../src/application/collect-diagnostics.js";
 
 describe("collectDiagnostics", () => {
   it("runs every read-only check independently and redacts thrown details", async () => {
@@ -31,5 +35,37 @@ describe("collectDiagnostics", () => {
     });
     expect(JSON.stringify(report)).not.toContain("secret-value");
     for (const probe of Object.values(probes)) expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it("checks the actual project state root and SQLite file permissions", async () => {
+    const access = vi.fn(async (target: string) => {
+      if (target.endsWith("state.sqlite")) throw new Error("denied");
+    });
+
+    await expect(projectStatePermissionsAvailable("D:\\repo\\.myagent", "D:\\repo\\.myagent\\state.sqlite", access)).resolves.toBe(false);
+    expect(access).toHaveBeenCalledWith("D:\\repo\\.myagent", expect.any(Number));
+    expect(access).toHaveBeenCalledWith("D:\\repo\\.myagent\\state.sqlite", expect.any(Number));
+  });
+
+  it("checks post-boot active durable environment and managed Secret references", () => {
+    const assertManaged = vi.fn((versionId: string) => {
+      if (versionId === "msv_missing") throw new Error("missing");
+    });
+    const registry = {
+      listConnections: () => [{
+        activeRevisionId: "pcr_active",
+        revisions: [{ revisionId: "pcr_active", auth: { type: "bearer" as const, secret: { managedSecretVersionId: "msv_missing" } } }],
+      }, {
+        activeRevisionId: "pcr_env",
+        revisions: [{ revisionId: "pcr_env", auth: { type: "bearer" as const, secret: { fromEnvironment: "POST_BOOT_KEY" } } }],
+      }],
+      listProfiles: () => [{
+        activeRevisionId: "mpr_active",
+        revisions: [{ revisionId: "mpr_active", connectionRevisionId: "pcr_active" }],
+      }],
+    };
+
+    expect(activeSecretReferencesResolvable(registry, { POST_BOOT_KEY: "present" }, assertManaged)).toBe(false);
+    expect(assertManaged).toHaveBeenCalledExactlyOnceWith("msv_missing");
   });
 });
