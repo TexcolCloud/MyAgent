@@ -54,6 +54,10 @@ describe("local project state", () => {
         "myagent.yaml",
         "skills",
       ]);
+      expect((await readdir(paths.root)).find((entry) => entry.includes(".tmp-")))
+        .toBeUndefined();
+      expect((await readdir(paths.root)).find((entry) => entry.endsWith(".owner")))
+        .toBeUndefined();
       expect(await readFile(paths.configPath, "utf8"))
         .toBe(await readFile(localMinimalFixture, "utf8"));
       expect(await readFile(paths.configPath, "utf8"))
@@ -147,6 +151,27 @@ describe("local project state", () => {
         "myagent.yaml",
         "skills",
       ]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a detectable replacement temporary file before cleanup", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+    const paths = resolveLocalProjectPaths(workspace);
+    const temporaryPath = path.join(paths.root, "owned-temporary.yaml");
+    const replacement = "competitor replacement\n";
+    try {
+      await initializeProjectState(paths, {
+        temporaryPath: () => temporaryPath,
+        beforeCleanup: async () => {
+          await rm(temporaryPath);
+          await writeFile(temporaryPath, replacement);
+        },
+      });
+
+      expect((await loadBootConfig(paths.configPath)).version).toBe(2);
+      expect(await readFile(temporaryPath, "utf8")).toBe(replacement);
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }

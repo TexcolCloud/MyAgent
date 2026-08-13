@@ -18,6 +18,7 @@ export interface LocalProjectPaths {
 interface InitializeProjectStateDependencies {
   readonly temporaryPath?: (paths: LocalProjectPaths) => string;
   readonly beforeCommit?: () => Promise<void>;
+  readonly beforeCleanup?: () => Promise<void>;
 }
 
 export function resolveLocalProjectPaths(
@@ -82,26 +83,58 @@ export async function initializeProjectState(
     paths.root,
     `.${path.basename(paths.configPath)}.tmp-${randomUUID()}`,
   );
+  const ownershipMarkerPath = `${temporaryPath}.owner`;
   let temporary: Awaited<ReturnType<typeof open>> | undefined;
+  let ownedIdentity: Awaited<ReturnType<typeof stat>> | undefined;
   let ownsTemporaryFile = false;
+  let ownsMarker = false;
   try {
     temporary = await open(temporaryPath, "wx");
     ownsTemporaryFile = true;
+    await link(temporaryPath, ownershipMarkerPath);
+    ownsMarker = true;
+    ownedIdentity = await temporary.stat();
     await temporary.writeFile(stringifyYaml(config), "utf8");
     await temporary.sync();
     await temporary.close();
     temporary = undefined;
     await dependencies.beforeCommit?.();
     await installCreateOnly(temporaryPath, paths.configPath);
-    await rm(temporaryPath);
+    await dependencies.beforeCleanup?.();
+    await removeOwnedPath(temporaryPath, ownedIdentity);
+    await removeOwnedPath(ownershipMarkerPath, ownedIdentity);
     ownsTemporaryFile = false;
+    ownsMarker = false;
   } catch (error) {
     try {
-      await temporary?.close();
+      if (ownedIdentity !== undefined) {
+        if (ownsTemporaryFile) {
+          await removeOwnedPath(temporaryPath, ownedIdentity);
+        }
+        if (ownsMarker) await removeOwnedPath(ownershipMarkerPath, ownedIdentity);
+      }
     } finally {
-      if (ownsTemporaryFile) await rm(temporaryPath, { force: true });
+      await temporary?.close();
     }
     throw error;
+  }
+}
+
+/**
+ * Under benign concurrency, verify identity before best-effort cleanup. A mismatch
+ * leaves residue rather than deleting a detectable replacement; hostile namespace
+ * tampering within the stat-to-unlink window is outside this portable Node boundary.
+ */
+async function removeOwnedPath(
+  candidate: string,
+  ownedIdentity: Awaited<ReturnType<typeof stat>>,
+): Promise<void> {
+  try {
+    const candidateIdentity = await stat(candidate);
+    if (!sameFile(candidateIdentity, ownedIdentity)) return;
+    await rm(candidate);
+  } catch (error) {
+    if (!hasErrorCode(error, "ENOENT")) throw error;
   }
 }
 
@@ -142,4 +175,11 @@ function hasErrorCode(error: unknown, code: string): boolean {
     && "code" in error
     && error.code === code
   );
+}
+
+function sameFile(
+  left: Awaited<ReturnType<typeof stat>>,
+  right: Awaited<ReturnType<typeof stat>>,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
