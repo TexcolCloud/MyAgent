@@ -1,3 +1,4 @@
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +30,23 @@ describe("CreateManagedAgentService", () => {
       expect(await readFile(path.join(project.agentsRoot, "writer", "AGENT.md"), "utf8")).toBe("Write clearly.\n");
       expect(catalog.current().byId.get("writer" as never)?.definition.policy).toEqual([]);
       expect((await readdir(project.agentsRoot)).filter((name) => name.includes("tmp"))).toEqual([]);
+    } finally { await project.close(); }
+  });
+
+  it("keeps staging outside the loader-scanned Agent root", async () => {
+    const project = await localProject();
+    try {
+      const catalog = new CatalogService(await loadCatalog(project.configPath));
+      const validate = catalog.validate.bind(catalog);
+      const scannedDirectories: string[][] = [];
+      vi.spyOn(catalog, "validate").mockImplementation(async () => {
+        scannedDirectories.push(await readdir(project.agentsRoot));
+        return validate();
+      });
+
+      await new CreateManagedAgentService(catalog).execute(input(catalog.revision()));
+
+      expect(scannedDirectories).toEqual([["writer"]]);
     } finally { await project.close(); }
   });
 
@@ -79,6 +97,19 @@ describe("CreateManagedAgentService", () => {
     } finally { await project.close(); }
   });
 
+  it("rejects structurally valid allow rules and grants no Tool authority", async () => {
+    const project = await localProject();
+    try {
+      const catalog = new CatalogService(await loadCatalog(project.configPath));
+      await expect(new CreateManagedAgentService(catalog).execute({
+        ...input(catalog.revision()),
+        policy: { rules: [{ tool: "read_file", effect: "allow" }] },
+      })).rejects.toMatchObject({ code: "invalid_managed_agent" });
+      expect(await readdir(project.agentsRoot)).toEqual([]);
+      expect(catalog.current().available).toEqual([]);
+    } finally { await project.close(); }
+  });
+
   it("removes only its known staging directory after a write failure", async () => {
     const project = await localProject();
     try {
@@ -113,17 +144,131 @@ describe("CreateManagedAgentService", () => {
     } finally { await project.close(); }
   });
 
-  it("rejects workspace symlink escape", async () => {
+  it("removes its published Agent when reload preparation fails", async () => {
     const project = await localProject();
     try {
-      const outside = await mkdtemp(path.join(os.tmpdir(), "myagent-agent-outside-"));
-      await symlink(outside, path.join(project.agentsRoot, "escaped-workspace"), "junction");
       const catalog = new CatalogService(await loadCatalog(project.configPath));
-      await expect(new CreateManagedAgentService(catalog).execute({
-        ...input(catalog.revision()), workspace: "../escaped-workspace",
-      })).rejects.toMatchObject({ code: "invalid_managed_agent" });
-      await rm(outside, { recursive: true, force: true });
+      const service = new CreateManagedAgentService(catalog, {
+        afterReload: () => { throw new Error("forced_reload_failure"); },
+      });
+      await expect(service.execute(input(catalog.revision()))).rejects.toThrow("forced_reload_failure");
+      expect(await readdir(project.agentsRoot)).toEqual([]);
+      expect(catalog.current().available).toEqual([]);
     } finally { await project.close(); }
+  });
+
+  it("serializes concurrent distinct creates and leaves catalog and files consistent", async () => {
+    const project = await localProject();
+    try {
+      const catalog = new CatalogService(await loadCatalog(project.configPath));
+      const service = new CreateManagedAgentService(catalog);
+      const revision = catalog.revision();
+      const results = await Promise.allSettled([
+        service.execute({ ...input(revision), id: "alpha", displayName: "Alpha" }),
+        service.execute({ ...input(revision), id: "beta", displayName: "Beta" }),
+      ]);
+      expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+      expect(results.filter(({ status }) => status === "rejected").map((result) =>
+        result.status === "rejected" ? (result.reason as { code?: string }).code : undefined,
+      )).toEqual(["revision_conflict"]);
+      const directories = await readdir(project.agentsRoot);
+      expect(directories).toHaveLength(1);
+      expect(catalog.current().available.map(({ id }) => id)).toEqual(directories);
+    } finally { await project.close(); }
+  });
+
+  it("serializes concurrent creates across service instances sharing a catalog", async () => {
+    const project = await localProject();
+    try {
+      const catalog = new CatalogService(await loadCatalog(project.configPath));
+      const revision = catalog.revision();
+      const results = await Promise.allSettled([
+        new CreateManagedAgentService(catalog).execute({
+          ...input(revision), id: "alpha", displayName: "Alpha",
+        }),
+        new CreateManagedAgentService(catalog).execute({
+          ...input(revision), id: "beta", displayName: "Beta",
+        }),
+      ]);
+
+      expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+      expect(results.filter(({ status }) => status === "rejected").map((result) =>
+        result.status === "rejected" ? (result.reason as { code?: string }).code : undefined,
+      )).toEqual(["revision_conflict"]);
+      const directories = await readdir(project.agentsRoot);
+      expect(directories).toHaveLength(1);
+      expect(catalog.current().available.map(({ id }) => id)).toEqual(directories);
+    } finally { await project.close(); }
+  });
+
+  it("does not remove a target replaced by another actor during rollback", async () => {
+    const project = await localProject();
+    try {
+      const target = path.join(project.agentsRoot, "writer");
+      const catalog = new CatalogService(await loadCatalog(project.configPath));
+      const service = new CreateManagedAgentService(catalog, {
+        afterReload: () => {
+          rmSync(target, { recursive: true });
+          mkdirSync(target);
+          writeFileSync(path.join(target, "owner.txt"), "external\n");
+          throw new Error("forced_reload_failure");
+        },
+      });
+
+      await expect(service.execute(input(catalog.revision()))).rejects.toThrow("forced_reload_failure");
+
+      expect(await readFile(path.join(target, "owner.txt"), "utf8")).toBe("external\n");
+      expect(catalog.current().available).toEqual([]);
+    } finally { await project.close(); }
+  });
+
+  it("restores the catalog when response construction fails after reload commit", async () => {
+    const project = await localProject();
+    try {
+      const catalog = new CatalogService(await loadCatalog(project.configPath));
+      const revision = catalog.revision();
+      const actualRevision = catalog.revision.bind(catalog);
+      vi.spyOn(catalog, "revision").mockImplementation(() => {
+        if (catalog.current().byId.has("writer" as never)) throw new Error("forced_response_failure");
+        return actualRevision();
+      });
+
+      await expect(new CreateManagedAgentService(catalog).execute(input(revision)))
+        .rejects.toThrow("forced_response_failure");
+
+      expect(await readdir(project.agentsRoot)).toEqual([]);
+      expect(catalog.current().available).toEqual([]);
+    } finally { await project.close(); }
+  });
+
+  it("rejects a managed-root junction that resolves outside the project", async () => {
+    const project = await localProject();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "myagent-agent-outside-"));
+    try {
+      await rm(project.agentsRoot, { recursive: true });
+      await symlink(outside, project.agentsRoot, "junction");
+      const catalog = new CatalogService(await loadCatalog(project.configPath));
+      await expect(new CreateManagedAgentService(catalog).execute(input(catalog.revision())))
+        .rejects.toMatchObject({ code: "unmanaged_agent_root" });
+      expect(await readdir(outside)).toEqual([]);
+    } finally { await project.close(); await rm(outside, { recursive: true, force: true }); }
+  });
+
+  it("rejects a workspace junction escape without touching its external target", async () => {
+    const project = await localProject();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "myagent-workspace-outside-"));
+    try {
+      await writeFile(path.join(outside, "keep.txt"), "keep\n");
+      await symlink(outside, path.join(project.agentsRoot, "linked-workspace"), "junction");
+      const catalog = new CatalogService(await loadCatalog(project.configPath));
+
+      await expect(new CreateManagedAgentService(catalog).execute({
+        ...input(catalog.revision()), workspace: "../linked-workspace",
+      })).rejects.toMatchObject({ code: "invalid_managed_agent" });
+
+      expect(await readFile(path.join(outside, "keep.txt"), "utf8")).toBe("keep\n");
+      expect(await readdir(outside)).toEqual(["keep.txt"]);
+    } finally { await project.close(); await rm(outside, { recursive: true, force: true }); }
   });
 });
 

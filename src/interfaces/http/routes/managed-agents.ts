@@ -12,7 +12,12 @@ export const createManagedAgentSchema = z.strictObject({
   displayName: z.string().min(1),
   prompt: z.string(),
   workspace: z.string().min(1),
-  policy: z.strictObject({ rules: z.array(policyRuleSchema) }),
+  policy: z.strictObject({
+    rules: z.array(policyRuleSchema).refine(
+      (rules) => rules.every((rule) => rule.effect !== "allow"),
+      "managed Agent creation cannot grant Tool authority",
+    ),
+  }),
   expectedCatalogRevision: z.string().min(1),
 });
 

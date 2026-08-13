@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { stringify as stringifyYaml } from "yaml";
 
-import type { CatalogSnapshot } from "../config/catalog-loader.js";
+import {
+  type CatalogSnapshot,
+  validateAgentDirectory,
+} from "../config/catalog-loader.js";
 import { CatalogService } from "../config/catalog-service.js";
 import { policyConfigSchema } from "../config/schemas.js";
 import { ApplicationError } from "../domain/errors.js";
@@ -42,6 +45,10 @@ export class CreateManagedAgentService {
   ) {}
 
   async execute(input: CreateManagedAgentInput): Promise<CreatedManagedAgent> {
+    return runCatalogExclusive(this.catalog, () => this.create(input));
+  }
+
+  private async create(input: CreateManagedAgentInput): Promise<CreatedManagedAgent> {
     this.catalog.assertRevision(input.expectedCatalogRevision);
     const id = parseManagedAgentId(input.id);
     const managedRoot = await resolveManagedRoot(this.catalog.current());
@@ -51,7 +58,14 @@ export class CreateManagedAgentService {
 
     const target = path.join(managedRoot, id);
     if (await pathExists(target)) throw new ApplicationError("managed_agent_exists", 409);
-    const temporary = path.join(managedRoot, `.managed-agent-${id}-tmp-${randomUUID()}`);
+    const ownershipToken = randomUUID();
+    const temporary = path.join(
+      path.dirname(managedRoot),
+      `.managed-agent-${id}-tmp-${ownershipToken}`,
+    );
+    const ownershipFile = ".managed-agent-owner";
+    const initialSnapshot = this.catalog.current();
+    let committedSnapshot: CatalogSnapshot | undefined;
     let renamed = false;
     try {
       await mkdir(temporary);
@@ -68,10 +82,10 @@ export class CreateManagedAgentService {
       }));
       await write(path.join(temporary, "AGENT.md"), input.prompt);
       await write(path.join(temporary, "policy.yaml"), stringifyYaml({ version: 1, rules: policy.rules }));
+      await exclusiveWrite(path.join(temporary, ownershipFile), ownershipToken);
 
-      const staged = await this.catalog.validate();
-      const stagedAgent = staged.byId.get(id);
-      if (stagedAgent === undefined || staged.unavailable.some(({ sourceLabel }) => sourceLabel === id)) {
+      const stagedAgent = await validateAgentDirectory(temporary, this.catalog.current().global);
+      if (!("definition" in stagedAgent) || stagedAgent.id !== id) {
         throw new ApplicationError("invalid_managed_agent", 422);
       }
       this.catalog.assertRevision(input.expectedCatalogRevision);
@@ -90,11 +104,74 @@ export class CreateManagedAgentService {
           },
         };
       });
-      return { ...result, catalogRevision: this.catalog.revision() };
+      committedSnapshot = this.catalog.current();
+      const catalogRevision = this.catalog.revision();
+      await unlink(path.join(target, ownershipFile));
+      return { ...result, catalogRevision };
     } catch (error) {
-      if (!renamed) await rm(temporary, { recursive: true, force: true });
+      if (renamed) {
+        await rollbackPublishedAgent(target, temporary, ownershipFile, ownershipToken);
+        if (committedSnapshot !== undefined) {
+          this.catalog.restoreIfCurrent(committedSnapshot, initialSnapshot);
+        }
+      } else {
+        await rm(temporary, { recursive: true, force: true });
+      }
       throw normalizeCreationError(error);
     }
+  }
+}
+
+const catalogTails = new WeakMap<CatalogService, Promise<void>>();
+
+async function runCatalogExclusive<Result>(
+  catalog: CatalogService,
+  operation: () => Promise<Result>,
+): Promise<Result> {
+  const previous = catalogTails.get(catalog) ?? Promise.resolve();
+  let release: (() => void) | undefined;
+  const tail = new Promise<void>((resolve) => { release = resolve; });
+  catalogTails.set(catalog, tail);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release?.();
+    if (catalogTails.get(catalog) === tail) catalogTails.delete(catalog);
+  }
+}
+
+async function rollbackPublishedAgent(
+  target: string,
+  quarantine: string,
+  ownershipFile: string,
+  ownershipToken: string,
+): Promise<void> {
+  try {
+    await rename(target, quarantine);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return;
+    throw error;
+  }
+
+  if (await ownsPublishedDirectory(quarantine, ownershipFile, ownershipToken)) {
+    await rm(quarantine, { recursive: true, force: true });
+    return;
+  }
+
+  if (!await pathExists(target)) await rename(quarantine, target);
+}
+
+async function ownsPublishedDirectory(
+  directory: string,
+  ownershipFile: string,
+  ownershipToken: string,
+): Promise<boolean> {
+  try {
+    return await readFile(path.join(directory, ownershipFile), "utf8") === ownershipToken;
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return false;
+    throw error;
   }
 }
 
@@ -133,7 +210,13 @@ function assertManagedRelativePath(value: string): void {
 }
 
 function parsePolicy(value: CreateManagedAgentInput["policy"]) {
-  try { return policyConfigSchema.parse({ version: 1, rules: value.rules }); }
+  try {
+    const policy = policyConfigSchema.parse({ version: 1, rules: value.rules });
+    if (policy.rules.some((rule) => rule.effect === "allow")) {
+      throw new Error("managed_agent_allow_policy_forbidden");
+    }
+    return policy;
+  }
   catch { throw new ApplicationError("invalid_managed_agent", 422); }
 }
 
@@ -156,8 +239,12 @@ async function pathExists(candidate: string): Promise<boolean> {
 
 function normalizeCreationError(error: unknown): unknown {
   if (error instanceof ApplicationError) return error;
-  if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
+  if (hasErrorCode(error, "EEXIST")) {
     return new ApplicationError("managed_agent_exists", 409);
   }
   return error;
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }

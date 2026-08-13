@@ -121,6 +121,14 @@ export async function loadCatalog(configPath: string): Promise<CatalogSnapshot> 
   });
 }
 
+export async function validateAgentDirectory(
+  directory: string,
+  global: ResolvedGlobalConfig,
+): Promise<AvailableAgent | UnavailableAgent> {
+  const skills = await loadSkillCatalog(global.skillRoots);
+  return loadAgent(directory, global, skills);
+}
+
 async function readGlobalConfig(configPath: string): Promise<string> {
   try {
     return await readFile(configPath, "utf8");

@@ -14,6 +14,12 @@ export class CatalogService {
     return this.#snapshot;
   }
 
+  restoreIfCurrent(expected: CatalogSnapshot, replacement: CatalogSnapshot): boolean {
+    if (this.#snapshot !== expected) return false;
+    this.#snapshot = Object.freeze(replacement);
+    return true;
+  }
+
   revision(): string {
     return catalogRevision(this.#snapshot);
   }

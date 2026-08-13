@@ -47,6 +47,21 @@ describe("managed Agent HTTP API", () => {
       expect(execute).toHaveBeenCalledOnce();
     } finally { execute.mockRestore(); await app.close(); await project.close(); }
   });
+
+  it("rejects authority-granting policy through the Admin HTTP boundary", async () => {
+    const project = await localProject();
+    const catalog = new CatalogService(await loadCatalog(project.configPath));
+    const app = createHttpApp({ bearerToken: "run-token", adminToken: "admin-token", catalog,
+      createManagedAgents: new CreateManagedAgentService(catalog), });
+    try {
+      const response = await app.inject({ method: "POST", url: "/v1/admin/agents",
+        remoteAddress: "127.0.0.1", headers: { authorization: "Bearer admin-token" },
+        payload: { ...input(catalog.revision()), policy: { rules: [{ tool: "read_file", effect: "allow" }] } }, });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({ code: "invalid_request" });
+      expect(catalog.current().available).toEqual([]);
+    } finally { await app.close(); await project.close(); }
+  });
 });
 
 function input(expectedCatalogRevision: string) { return { id: "writer", displayName: "Writer", prompt: "Write clearly.\n", workspace: "./workspace", policy: { rules: [] }, expectedCatalogRevision } as const; }
