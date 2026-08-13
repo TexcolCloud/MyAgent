@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, open, rm, stat } from "node:fs/promises";
+import { link, lstat, mkdir, open, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { stringify as stringifyYaml } from "yaml";
@@ -53,7 +53,12 @@ export async function inspectProjectState(
     isDirectory(paths.skillsRoot),
   ]);
   if (entries.every(Boolean)) return "ready";
-  if (entries.every((entry) => !entry)) return "absent";
+  const databaseArtifacts = await Promise.all([
+    pathExists(paths.databasePath),
+    pathExists(`${paths.databasePath}-wal`),
+    pathExists(`${paths.databasePath}-shm`),
+  ]);
+  if ([...entries, ...databaseArtifacts].every((entry) => !entry)) return "absent";
   return "partial";
 }
 
@@ -170,6 +175,15 @@ async function isDirectory(candidate: string): Promise<boolean> {
 async function isFile(candidate: string): Promise<boolean> {
   try {
     return (await stat(candidate)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function pathExists(candidate: string): Promise<boolean> {
+  try {
+    await lstat(candidate);
+    return true;
   } catch {
     return false;
   }

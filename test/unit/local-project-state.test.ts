@@ -18,6 +18,12 @@ const localMinimalFixture = path.resolve(
   "myagent.yaml",
 );
 
+const databaseArtifacts = [
+  ["database", ""],
+  ["write-ahead log", "-wal"],
+  ["shared-memory file", "-shm"],
+] as const;
+
 describe("local project state", () => {
   it("resolves the default state below .myagent and reports it absent", async () => {
     const paths = resolveLocalProjectPaths("C:\\repo");
@@ -100,6 +106,42 @@ describe("local project state", () => {
       await rm(workspace, { recursive: true, force: true });
     }
   });
+
+  it.each(databaseArtifacts)(
+    "classifies an orphan SQLite %s as partial state",
+    async (_description, suffix) => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+      const paths = resolveLocalProjectPaths(workspace);
+      try {
+        await mkdir(paths.root, { recursive: true });
+        await writeFile(`${paths.databasePath}${suffix}`, "historical database bytes");
+
+        expect(await inspectProjectState(paths)).toBe("partial");
+      } finally {
+        await rm(workspace, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(databaseArtifacts)(
+    "refuses initialization over an orphan SQLite %s and preserves its bytes",
+    async (_description, suffix) => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+      const paths = resolveLocalProjectPaths(workspace);
+      const artifactPath = `${paths.databasePath}${suffix}`;
+      const historicalBytes = `historical ${suffix || "database"} bytes\n`;
+      try {
+        await mkdir(paths.root, { recursive: true });
+        await writeFile(artifactPath, historicalBytes);
+
+        await expect(initializeProjectState(paths)).rejects.toThrow("partial");
+        expect(await readFile(artifactPath, "utf8")).toBe(historicalBytes);
+        expect(await readdir(paths.root)).toEqual([path.basename(artifactPath)]);
+      } finally {
+        await rm(workspace, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("treats a configuration directory as partial state", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
