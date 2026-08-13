@@ -176,4 +176,22 @@ describe("local project state", () => {
       await rm(workspace, { recursive: true, force: true });
     }
   });
+
+  it("removes its temporary file when ownership-marker creation fails", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+    const paths = resolveLocalProjectPaths(workspace);
+    const temporaryPath = path.join(paths.root, "owned-temporary.yaml");
+    try {
+      await expect(initializeProjectState(paths, {
+        temporaryPath: () => temporaryPath,
+        createOwnershipMarker: async () => {
+          throw new Error("marker creation failed");
+        },
+      })).rejects.toThrow("marker creation failed");
+
+      expect(await readdir(paths.root)).toEqual(["agents", "skills"]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
 });

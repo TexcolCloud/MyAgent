@@ -17,6 +17,10 @@ export interface LocalProjectPaths {
 
 interface InitializeProjectStateDependencies {
   readonly temporaryPath?: (paths: LocalProjectPaths) => string;
+  readonly createOwnershipMarker?: (
+    temporaryPath: string,
+    ownershipMarkerPath: string,
+  ) => Promise<void>;
   readonly beforeCommit?: () => Promise<void>;
   readonly beforeCleanup?: () => Promise<void>;
 }
@@ -91,9 +95,12 @@ export async function initializeProjectState(
   try {
     temporary = await open(temporaryPath, "wx");
     ownsTemporaryFile = true;
-    await link(temporaryPath, ownershipMarkerPath);
-    ownsMarker = true;
     ownedIdentity = await temporary.stat();
+    await (dependencies.createOwnershipMarker ?? link)(
+      temporaryPath,
+      ownershipMarkerPath,
+    );
+    ownsMarker = true;
     await temporary.writeFile(stringifyYaml(config), "utf8");
     await temporary.sync();
     await temporary.close();
