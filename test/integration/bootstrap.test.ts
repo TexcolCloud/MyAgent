@@ -4,8 +4,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret-resolver.js";
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
@@ -19,6 +20,72 @@ import { seedVerifiedChatAssignments } from "../helpers/verified-chat-model-regi
 const FIXTURES = fileURLToPath(new URL("../fixtures/config", import.meta.url));
 
 describe("bootstrap", () => {
+  it("uses injected authentication without resolving configured token references", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "myagent-bootstrap-auth-"));
+    const configRoot = path.join(root, "config");
+    await cp(path.join(FIXTURES, "valid"), configRoot, { recursive: true });
+    const environmentResolve = vi.spyOn(EnvironmentSecretResolver.prototype, "resolve");
+    let service: Awaited<ReturnType<typeof bootstrap>> | undefined;
+    try {
+      service = await bootstrap(path.join(configRoot, "myagent.yaml"), {
+        auth: { bearerToken: "local-run", adminToken: "local-admin" },
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        log: { write: () => {} },
+      });
+      const response = await fetch(`${service.url}/v1/agents`, {
+        headers: { authorization: "Bearer local-run" },
+      });
+      expect(response.status).toBe(200);
+      expect(environmentResolve).not.toHaveBeenCalled();
+    } finally {
+      await service?.shutdown();
+      environmentResolve.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects empty injected Admin authentication before creating SQLite", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "myagent-bootstrap-invalid-auth-"));
+    const configRoot = path.join(root, "config");
+    await cp(path.join(FIXTURES, "valid"), configRoot, { recursive: true });
+    let service: Awaited<ReturnType<typeof bootstrap>> | undefined;
+    try {
+      try {
+        service = await bootstrap(path.join(configRoot, "myagent.yaml"), {
+          auth: { bearerToken: "local-run", adminToken: "" },
+          listen: { host: "127.0.0.1", port: 0 },
+          signals: false,
+          log: { write: () => {} },
+        });
+        expect.unreachable("bootstrap accepted an empty Admin token");
+      } catch (error) {
+        expect(error).toHaveProperty("message", "http_admin_token_required");
+      }
+      expect(await exists(path.join(configRoot, "data", "kernel.db"))).toBe(false);
+    } finally {
+      await service?.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects injected authentication that reuses the Run token before creating SQLite", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "myagent-bootstrap-duplicate-auth-"));
+    const configRoot = path.join(root, "config");
+    await cp(path.join(FIXTURES, "valid"), configRoot, { recursive: true });
+    try {
+      await expect(bootstrap(path.join(configRoot, "myagent.yaml"), {
+        auth: { bearerToken: "local-shared", adminToken: "local-shared" },
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        log: { write: () => {} },
+      })).rejects.toThrowError("http_admin_token_must_differ");
+      expect(await exists(path.join(configRoot, "data", "kernel.db"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("fails on a missing Admin Token before creating or migrating SQLite", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "myagent-bootstrap-admin-"));
     const configRoot = path.join(root, "config");

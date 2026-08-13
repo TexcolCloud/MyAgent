@@ -74,6 +74,10 @@ import { ModelVerificationWorker } from "./runtime/model-verification-worker.js"
 import { RunWorker } from "./runtime/run-worker.js";
 
 export interface BootstrapOptions {
+  auth?: {
+    readonly bearerToken: string;
+    readonly adminToken: string;
+  };
   listen?: { host?: string; port?: number };
   signals?: boolean;
   log?: {
@@ -118,12 +122,14 @@ export async function bootstrap(
   const bootConfig = await loadBootConfig(absoluteConfigPath);
   const redactionRegistry = new MutableDynamicRedactionRegistry();
   const environmentSecrets = new EnvironmentSecretResolver();
-  const bearerToken = environmentSecrets.resolve(
-    bootConfig.server.bearerToken,
-  );
-  const adminToken = environmentSecrets.resolve(
-    bootConfig.server.adminToken,
-  );
+  const auth = options.auth ?? {
+    bearerToken: environmentSecrets.resolve(bootConfig.server.bearerToken),
+    adminToken: environmentSecrets.resolve(bootConfig.server.adminToken),
+  };
+  const { bearerToken, adminToken } = auth;
+  if (bearerToken.length === 0) throw new Error("http_bearer_token_required");
+  if (adminToken.length === 0) throw new Error("http_admin_token_required");
+  if (bearerToken === adminToken) throw new Error("http_admin_token_must_differ");
   redactionRegistry.register(bearerToken);
   redactionRegistry.register(adminToken);
   const logger = createStructuredLogger({
