@@ -8,18 +8,24 @@ Use configuration version 2. It contains `server.bearerToken`, `server.adminToke
 
 ## Interactive TUI
 
-Start the workbench with `myagent tui` from a terminal that provides both an
-interactive stdin TTY and stdout TTY. Redirected input/output, CI, and other
-non-interactive invocations fail with `interactive_tty_required` before the
-workbench starts.
+Start Local Integrated Mode with `myagent`, `myagent tui`, or
+`myagent tui --local`. These entries own a random-port loopback service and use
+fresh in-memory Run/Admin capabilities; they do not read the attached-TUI token
+environment variables. See [Local Integrated Mode](local-integrated-mode.md)
+for the complete command, consent, lifetime, and recovery boundaries.
 
-The TUI reads its Run credential only from `MYAGENT_RUN_TOKEN` and its Admin
-credential only from `MYAGENT_ADMIN_TOKEN`. If either variable is absent, the
-TUI asks for that value with hidden input. The two values must differ. Do not
-put either token in command arguments: `--token` and `--admin-token` are
-rejected for `myagent tui`. Run creation, Run reads, committed SSE events, and
-Approval decisions use Run authority. Provider Connection and Model Profile
-reads and mutations use Admin authority.
+Use `myagent tui --api-url <origin>` only to attach to an existing service.
+Attached mode reads its Run credential from `MYAGENT_RUN_TOKEN` and its Admin
+credential from `MYAGENT_ADMIN_TOKEN`, an available credential helper, or
+hidden terminal input. The two values must differ. Do not put either token in
+command arguments: `--token` and `--admin-token` are rejected for all TUI
+entries. Run creation, Run reads, committed SSE events, and Approval decisions
+use Run authority. Provider Connection and Model Profile reads and mutations
+use Admin authority.
+
+All TUI modes require interactive stdin and stdout. Redirected input/output,
+CI, and other noninteractive invocations fail with
+`interactive_tty_required` before initialization or credential acquisition.
 
 The workbench observes one durable Run created for the Operator's exact Agent,
 Session Key, and message. If its SSE connection is interrupted, use reconnect;
