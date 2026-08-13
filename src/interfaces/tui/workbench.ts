@@ -23,6 +23,9 @@ import { InspectorScreen } from "./screens/inspector.js";
 import { NavigationScreen, type WorkbenchDestination } from "./screens/navigation.js";
 import { runModelSetupScreen } from "./screens/model-setup.js";
 import { ProviderScreen } from "./screens/providers.js";
+import { ProfileScreen } from "./screens/profiles.js";
+import { VerificationScreen } from "./screens/verifications.js";
+import { AssignmentScreen } from "./screens/assignments.js";
 import type { TuiClient } from "./tui-client.js";
 
 type WorkbenchClient = Pick<TuiClient,
@@ -31,6 +34,9 @@ type WorkbenchClient = Pick<TuiClient,
 > & Partial<Pick<TuiClient,
   "getProviderConnection" | "createProvider" | "reviseProvider" | "discoverProviderModels" |
   "getProviderModels" | "promoteProvider" | "retireProvider" | "listProviderDrivers" | "getModelProfile"
+  | "createModelProfile" | "promoteModelProfile" | "retireModelProfile" | "verifyModel"
+  | "getModelVerification" | "cancelModelVerification" | "getModelAssignment" | "assignModel"
+  | "getDefaultModelProfile" | "setDefaultModelProfile"
 >>;
 
 export interface RunWorkbenchOptions {
@@ -45,6 +51,9 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   const inspector = new InspectorScreen();
   const chat = new ChatScreen({ client: options.client, onChange: () => tui.requestRender() });
   let providerScreen: ProviderScreen | undefined;
+  let profileScreen: ProfileScreen | undefined;
+  let verificationScreen: VerificationScreen | undefined;
+  let assignmentScreen: AssignmentScreen | undefined;
   let center: Component = chat;
   let closed = false;
   let modelSetupPending = false;
@@ -126,6 +135,18 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
       tui.setFocus(screen);
       void screen.load().finally(() => tui.requestRender());
       return;
+    }
+    if (destination === "profiles" && isProfileClient(options.client)) {
+      const screen = new ProfileScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      profileScreen = screen; center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
+    }
+    if (destination === "verifications" && isVerificationClient(options.client)) {
+      const screen = new VerificationScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      verificationScreen = screen; center = screen; tui.setFocus(screen); tui.requestRender(); return;
+    }
+    if (destination === "agents" && isAssignmentClient(options.client)) {
+      const screen = new AssignmentScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      assignmentScreen = screen; center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
     }
     center = chat;
     tui.setFocus(navigation);
@@ -245,12 +266,27 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     await latestExitAttempt;
     await approvals?.settled();
     await providerScreen?.settled();
+    await profileScreen?.settled();
+    await verificationScreen?.settled();
+    await assignmentScreen?.settled();
     return 0;
   } finally {
     if (!closed && tui.hasOverlay()) tui.hideOverlay();
     closed = true;
     tui.stop();
   }
+}
+
+function isProfileClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof ProfileScreen>[0]["client"] {
+  return typeof client.getModelProfile === "function" && typeof client.createModelProfile === "function" && typeof client.promoteModelProfile === "function" && typeof client.retireModelProfile === "function";
+}
+
+function isVerificationClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof VerificationScreen>[0]["client"] {
+  return typeof client.verifyModel === "function" && typeof client.getModelVerification === "function" && typeof client.cancelModelVerification === "function";
+}
+
+function isAssignmentClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof AssignmentScreen>[0]["client"] {
+  return typeof client.getModelProfile === "function" && typeof client.getModelAssignment === "function" && typeof client.assignModel === "function" && typeof client.getDefaultModelProfile === "function" && typeof client.setDefaultModelProfile === "function";
 }
 
 function isProviderClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof ProviderScreen>[0]["client"] {
