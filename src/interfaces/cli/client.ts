@@ -59,6 +59,7 @@ export class CliClient {
     if (token === undefined || token.length === 0) throw new CliCredentialError(authority);
     const response = await this.fetcher(`${this.baseUrl}${path}`, {
       method: init.method ?? "GET",
+      redirect: "manual",
       headers: {
         authorization: `Bearer ${token}`,
         ...(init.idempotencyKey === undefined ? {} : { "idempotency-key": init.idempotencyKey }),
@@ -67,24 +68,41 @@ export class CliClient {
       ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
       ...(init.signal === undefined ? {} : { signal: init.signal }),
     });
+    if (isRedirectResponse(response)) throw redirectRefused(response.status);
     if (!response.ok) throw await problem(response);
     if (response.status === 204) return undefined as T;
     return await response.json() as T;
   }
 
-  stream(path: string, lastEventId?: string, signal?: AbortSignal): Promise<Response> {
+  async stream(path: string, lastEventId?: string, signal?: AbortSignal): Promise<Response> {
     const token = this.options.bearerToken;
     if (token === undefined || token.length === 0) {
-      return Promise.reject(new CliCredentialError("run"));
+      throw new CliCredentialError("run");
     }
-    return this.fetcher(`${this.baseUrl}${path}`, {
+    const response = await this.fetcher(`${this.baseUrl}${path}`, {
+      redirect: "manual",
       headers: {
         authorization: `Bearer ${token}`,
         ...(lastEventId === undefined ? {} : { "last-event-id": lastEventId }),
       },
       ...(signal === undefined ? {} : { signal }),
     });
+    if (isRedirectResponse(response)) throw redirectRefused(response.status);
+    return response;
   }
+}
+
+function isRedirectResponse(response: Response): boolean {
+  return response.redirected || (response.status >= 300 && response.status < 400);
+}
+
+function redirectRefused(status: number): CliHttpError {
+  return new CliHttpError(
+    status,
+    "redirect_refused",
+    "The service response attempted a redirect.",
+    "cli",
+  );
 }
 
 async function problem(response: Response): Promise<CliHttpError> {
