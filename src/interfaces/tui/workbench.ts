@@ -35,7 +35,7 @@ type WorkbenchClient = Pick<TuiClient,
   "getProviderConnection" | "createProvider" | "reviseProvider" | "discoverProviderModels" |
   "getProviderModels" | "promoteProvider" | "retireProvider" | "listProviderDrivers" | "getModelProfile"
   | "createModelProfile" | "promoteModelProfile" | "retireModelProfile" | "verifyModel"
-  | "getModelVerification" | "cancelModelVerification" | "getModelAssignment" | "assignModel"
+  | "getModelVerificationAt" | "cancelModelVerification" | "getModelAssignment" | "assignModel"
   | "getDefaultModelProfile" | "setDefaultModelProfile"
 >>;
 
@@ -282,7 +282,7 @@ function isProfileClient(client: WorkbenchClient): client is WorkbenchClient & C
 }
 
 function isVerificationClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof VerificationScreen>[0]["client"] {
-  return typeof client.verifyModel === "function" && typeof client.getModelVerification === "function" && typeof client.cancelModelVerification === "function";
+  return typeof client.verifyModel === "function" && typeof client.getModelVerificationAt === "function" && typeof client.cancelModelVerification === "function";
 }
 
 function isAssignmentClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof AssignmentScreen>[0]["client"] {

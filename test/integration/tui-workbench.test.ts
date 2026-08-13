@@ -595,6 +595,30 @@ describe("TUI workbench", () => {
     await expect(workbench).resolves.toBe(0);
   });
 
+  it("does not instantiate Verifications when the client lacks opaque operation polling", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const verifyModel = vi.fn();
+    const client = {
+      ...safeClient(),
+      verifyModel,
+      getModelVerification: vi.fn(),
+      cancelModelVerification: vi.fn(),
+    };
+    const workbench = runWorkbench({ client, terminal });
+
+    await terminal.ready();
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    terminal.input("\r");
+    await terminal.waitForFrame("Verifications");
+    terminal.input("q");
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    expect(verifyModel).not.toHaveBeenCalled();
+    expect(plainLines(terminal.frames.at(-1) ?? "").join("\n")).not.toContain("Profile revision ID");
+    terminal.input("\u0003");
+    await expect(workbench).resolves.toBe(0);
+  });
+
   it("does not render control sequences or credential lines from typed list summaries", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const client = safeClient({

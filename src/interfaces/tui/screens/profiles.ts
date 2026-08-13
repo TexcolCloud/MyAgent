@@ -119,7 +119,8 @@ export class ProfileScreen implements Component, Focusable {
     displayName: string,
     target: ProviderRevisionTarget,
   ): Promise<CreateModelProfileInput> {
-    if (target.driverId !== undefined) {
+    if (target.providerKind !== "openai_compatible") {
+      if (target.driverId === undefined) throw new Error("provider_driver_not_found");
       const catalog = await this.options.client.listProviderDrivers();
       const driver = catalog.drivers.find(({ driverId }) => driverId === target.driverId);
       if (driver === undefined) throw new Error("provider_driver_not_found");
@@ -130,7 +131,6 @@ export class ProfileScreen implements Component, Focusable {
       );
       return { slug, displayName, connectionRevisionId: target.revisionId, catalogCandidateId };
     }
-    if (target.providerKind !== "openai_compatible") throw new Error("manual_profile_not_permitted");
     const modelId = required(await prompt.input("Provider model ID"));
     const protocol = await prompt.select("Protocol", ["auto", "chat_completions", "responses"] as const);
     if (!await prompt.confirm("Acknowledge manual custom-provider model entry?")) throw new Error("manual_profile_not_acknowledged");

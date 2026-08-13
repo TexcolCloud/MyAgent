@@ -78,6 +78,38 @@ describe("TUI model control workflows", () => {
     expect(screen.render(100).join("\n")).toContain("ver_one (cancelled)");
   });
 
+  it("does not let an aborted in-flight poll overwrite successful cancellation", async () => {
+    let releasePoll: ((value: ReturnType<typeof verification>) => void) | undefined;
+    const deferredPoll = new Promise<ReturnType<typeof verification>>((resolve) => { releasePoll = resolve; });
+    let markPollStarted: (() => void) | undefined;
+    const pollStarted = new Promise<void>((resolve) => { markPollStarted = resolve; });
+    const screen = new VerificationScreen({
+      client: {
+        verifyModel: async () => ({
+          verificationId: "ver_one", profileRevisionId: "mpr_verified",
+          capabilityBaseline: "text_and_single_tool_call_v1", status: "queued",
+          recordRevision: 1, operationUrl: "/v1/admin/operations/deferred",
+        }),
+        getModelVerificationAt: async () => { markPollStarted?.(); return await deferredPoll; },
+        cancelModelVerification: async () => verification("cancelled", 4),
+      } as never,
+      inspector: new InspectorScreen(),
+      promptFactory: () => prompt({ inputs: ["mpr_verified", "2"], confirms: [true] }),
+    });
+
+    screen.handleInput("q");
+    await pollStarted;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    (screen as unknown as { verification: unknown }).verification = verification("running", 3);
+    screen.handleInput("x");
+    await vi.waitFor(() => expect(screen.render(100).join("\n")).toContain("ver_one (cancelled)"));
+    releasePoll?.(verification("running", 3));
+    await screen.settled();
+
+    expect(screen.render(100).join("\n")).toContain("ver_one (cancelled)");
+    expect(screen.render(100).join("\n")).not.toContain("ver_one (running)");
+  });
+
   it("does not rewrite an existing Assignment when setting the default Profile", async () => {
     const getModelAssignment = vi.fn(async () => ({
       agentId: "agent-one", state: "assigned" as const, modelProfileRevisionId: "mpr_active",
@@ -161,6 +193,39 @@ describe("TUI model control workflows", () => {
       displayName: "Catalog Profile",
       connectionRevisionId: "pcr_native",
       catalogCandidateId: "pi/openai:gpt-4.1-mini",
+    });
+  });
+
+  it("allows acknowledged manual creation for the custom OpenAI-compatible driver", async () => {
+    const createModelProfile = vi.fn(async () => modelProfile());
+    const listProviderDrivers = vi.fn(async () => ({ piVersion: "0.73.1" as const, drivers: [] }));
+    const screen = new ProfileScreen({
+      client: profileClient({
+        createModelProfile,
+        listProviderConnections: async () => ({ connections: [{ connectionId: "custom", displayName: "Custom", activeRevisionId: "pcr_custom", retiredAt: null }] }),
+        getProviderConnection: async () => ({ providerDriver: "pi/openai-compatible", providerKind: "openai_compatible", revisions: [{ revisionId: "pcr_custom" }] }),
+        listProviderDrivers,
+      }),
+      inspector: new InspectorScreen(),
+      promptFactory: () => prompt({
+        inputs: ["manual-profile", "Manual Profile", "custom-model"],
+        selects: ["pcr_custom", "responses"],
+        confirms: [true, true],
+      }),
+    });
+    await screen.load();
+
+    screen.handleInput("n");
+    await screen.settled();
+
+    expect(listProviderDrivers).not.toHaveBeenCalled();
+    expect(createModelProfile).toHaveBeenCalledWith({
+      slug: "manual-profile",
+      displayName: "Manual Profile",
+      connectionRevisionId: "pcr_custom",
+      modelId: "custom-model",
+      protocol: "responses",
+      manualEntryAcknowledged: true,
     });
   });
 });

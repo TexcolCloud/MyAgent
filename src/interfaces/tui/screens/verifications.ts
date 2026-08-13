@@ -80,6 +80,9 @@ export class VerificationScreen implements Component, Focusable {
   private async poll(operationUrl: string, signal: AbortSignal): Promise<ModelVerificationResponse> {
     while (!signal.aborted) {
       const current = await this.options.client.getModelVerificationAt(operationUrl);
+      if (signal.aborted || this.controller?.signal !== signal) {
+        throw new Error("verification_poll_cancelled");
+      }
       this.verification = current;
       this.options.inspector.showVerification({ verificationId: current.verificationId, profileRevisionId: current.profileRevisionId, status: current.status, capabilities: current.capabilities, confirmation: "confirmed" });
       this.changed();
