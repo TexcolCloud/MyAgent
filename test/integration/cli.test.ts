@@ -168,7 +168,7 @@ describe("CLI HTTP boundary", () => {
       },
     })).resolves.toBe(0);
 
-    expect(events).toEqual(["confirm", "initialize", `host:${configPath}`, `root:${path.join(workspace, ".myagent")}`]);
+    expect(events).toEqual(["confirm", "initialize", `host:${configPath}`, `root:${path.dirname(configPath)}`]);
   });
 
   it("fails noninteractively before creating absent project state", async () => {
