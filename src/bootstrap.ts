@@ -64,6 +64,7 @@ import { loadBootConfig } from "./config/boot-config.js";
 import { loadCatalog } from "./config/catalog-loader.js";
 import { CatalogService } from "./config/catalog-service.js";
 import { createHttpApp } from "./interfaces/http/app.js";
+import { resolveLocalProjectPaths } from "./interfaces/local/project-state.js";
 import { createStructuredLogger } from "./observability/logger.js";
 import { MutableDynamicRedactionRegistry } from "./observability/redactor.js";
 import type { Clock } from "./ports/clock.js";
@@ -110,7 +111,16 @@ export function resolveBootstrapProjectStateRoot(
   configPath: string,
   projectStateRoot?: string,
 ): string {
-  return path.resolve(projectStateRoot ?? path.dirname(path.resolve(configPath)));
+  if (projectStateRoot !== undefined) return path.resolve(projectStateRoot);
+  const resolvedConfigPath = path.resolve(configPath);
+  const configDirectory = path.dirname(resolvedConfigPath);
+  if (
+    path.basename(configDirectory) === ".myagent"
+    && path.basename(resolvedConfigPath) === "myagent.yaml"
+  ) {
+    return configDirectory;
+  }
+  return resolveLocalProjectPaths(process.cwd()).root;
 }
 
 const DEFAULT_MODEL_CONTROL = Object.freeze({

@@ -15,6 +15,7 @@ import {
   modelRegistryEventIdFromUuid,
   parseModelProfileId,
 } from "../../src/domain/ids.js";
+import { resolveLocalProjectPaths } from "../../src/interfaces/local/project-state.js";
 import { seedVerifiedChatAssignments } from "../helpers/verified-chat-model-registry.js";
 
 const FIXTURES = fileURLToPath(new URL("../fixtures/config", import.meta.url));
@@ -39,6 +40,15 @@ describe("bootstrap", () => {
 
     expect(resolveBootstrapProjectStateRoot(configPath, explicitRoot)).toBe(
       path.resolve(explicitRoot),
+    );
+  });
+
+  it.each([
+    path.join(process.cwd(), "settings", "custom.yaml"),
+    path.join(os.tmpdir(), "external-myagent-config", "custom.yaml"),
+  ])("uses the current project state root for noncanonical config %s", (configPath) => {
+    expect(resolveBootstrapProjectStateRoot(configPath)).toBe(
+      resolveLocalProjectPaths(process.cwd()).root,
     );
   });
 
