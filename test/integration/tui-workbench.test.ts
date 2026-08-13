@@ -2,7 +2,13 @@ import type { Terminal } from "@mariozechner/pi-tui";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
-import type { CliPrompt } from "../../src/interfaces/cli/commands/model-setup.js";
+import {
+  CliPromptCancelledError,
+  setupModel,
+  type CliPrompt,
+  type SetupModelProgressCallback,
+} from "../../src/interfaces/cli/commands/model-setup.js";
+import type { AdminClient } from "../../src/interfaces/cli/commands/providers.js";
 import { CliHttpError } from "../../src/interfaces/cli/client.js";
 import { runWorkbench } from "../../src/interfaces/tui/workbench.js";
 import { ApprovalScreen } from "../../src/interfaces/tui/screens/approvals.js";
@@ -642,10 +648,10 @@ describe("TUI workbench", () => {
           retiredAt: null,
         }] };
       },
-      adminRequest: async (path: string) => {
-        setupRequests.push(path);
-        throw new CliHttpError(409, "revision_conflict", "stale", "trace_1");
-      },
+      runModelSetup: modelSetupCapability(async (path: string) => {
+          setupRequests.push(path);
+          throw new CliHttpError(409, "revision_conflict", "stale", "trace_1");
+        }).runModelSetup,
     };
     const workbench = runWorkbench({ client, terminal });
 
@@ -701,9 +707,9 @@ describe("TUI workbench", () => {
     const requests: { path: string; body: unknown }[] = [];
     let pollStarted: (() => void) | undefined;
     const pollStartedPromise = new Promise<void>((resolve) => { pollStarted = resolve; });
-    const setup = setupClient(requests, () => "running");
-    const client = safeClient({
-      adminRequest: async <T>(path: string, init?: { readonly method?: string }) => {
+    const setupRequest = createSetupRequest(requests, () => "running");
+    const setupCapability = modelSetupCapability(
+      async <T>(path: string, init?: { readonly method?: string }) => {
         if (path === "/v1/admin/provider-drivers") return {
           piVersion: "0.73.1",
           drivers: [{
@@ -716,10 +722,12 @@ describe("TUI workbench", () => {
             }],
           }],
         } as T;
+        const response = await setupRequest<T>(path, init);
         if (path === "/v1/admin/model-verifications/ver_1") pollStarted?.();
-        return setup.adminRequest<T>(path, init);
+        return response;
       },
-    });
+    );
+    const client = safeClient({ runModelSetup: setupCapability.runModelSetup });
     const workbench = runWorkbench({ client, terminal });
 
     await terminal.ready();
@@ -748,12 +756,12 @@ describe("TUI workbench", () => {
     await terminal.waitForFrame("Use resolved context limit");
     terminal.input("\r");
     await pollStartedPromise;
-    const requestCountAtCancel = requests.length;
+    const requestsAtCancel = requests.map((request) => request.path);
     terminal.input("\u0003");
 
     await expect(workbench).resolves.toBe(0);
     await new Promise<void>((resolve) => setTimeout(resolve, 300));
-    expect(requests).toHaveLength(requestCountAtCancel);
+    expect(requests.map((request) => request.path)).toEqual(requestsAtCancel);
     expect(requests.some((request) => request.path.includes("/promotions"))).toBe(false);
     expect(requests.some((request) => request.path.includes("model-assignment"))).toBe(false);
   });
@@ -837,16 +845,16 @@ describe("model setup screen", () => {
   it("returns a reload requirement after one conflicting Promotion and clears review output", async () => {
     const requests: { path: string; body: unknown }[] = [];
     const output: string[] = [];
-    const setup = setupClient(requests);
-    const client = {
-      adminRequest: async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
+    const setupRequest = createSetupRequest(requests);
+    const client = modelSetupCapability(
+      async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
         if (path.endsWith("/promotions")) {
           requests.push({ path, body: init?.body });
           throw new CliHttpError(409, "revision_conflict", "provider-secret stale response", "trace-secret");
         }
-        return setup.adminRequest<T>(path, init);
+        return setupRequest<T>(path, init);
       },
-    };
+    );
     const outcome = await runModelSetupScreen({
       client,
       prompt: scriptedPrompt({
@@ -866,15 +874,15 @@ describe("model setup screen", () => {
 
   it("does not convert unrelated HTTP failures into revision conflicts", async () => {
     const requests: { path: string; body: unknown }[] = [];
-    const setup = setupClient(requests);
-    const client = {
-      adminRequest: async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
+    const setupRequest = createSetupRequest(requests);
+    const client = modelSetupCapability(
+      async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
         if (path.endsWith("/promotions")) {
           throw new CliHttpError(503, "provider_unavailable", "safe detail", "trace_1");
         }
-        return setup.adminRequest<T>(path, init);
+        return setupRequest<T>(path, init);
       },
-    };
+    );
 
     await expect(runModelSetupScreen({
       client,
@@ -998,6 +1006,7 @@ function safeClient(overrides: Partial<{
   connections: readonly { readonly connectionId: string; readonly displayName: string; readonly activeRevisionId: string | null; readonly retiredAt: string | null }[];
   profiles: readonly { readonly profileId: string; readonly displayName: string; readonly activeRevisionId: string | null; readonly retiredAt: string | null }[];
   adminRequest: <T>(path: string, init?: { readonly method?: string }) => Promise<T>;
+  runModelSetup: ReturnType<typeof modelSetupCapability>["runModelSetup"];
   createRun: (input: { readonly agentId: string; readonly sessionKey: string; readonly text: string; readonly idempotencyKey?: string; readonly signal?: AbortSignal }) => Promise<{ readonly runId: string; readonly status: "queued"; readonly eventsUrl: string }>;
   stream: (path: string, lastEventId?: string, signal?: AbortSignal) => Promise<Response>;
   approvals: readonly ReturnType<typeof pendingApproval>[];
@@ -1009,9 +1018,11 @@ function safeClient(overrides: Partial<{
     listProviderConnections: async () => ({ connections: overrides.connections ?? [{ connectionId: "provider-one", displayName: "Provider One", activeRevisionId: "pcr_1", retiredAt: null }] }),
     listModelProfiles: async () => ({ profiles: overrides.profiles ?? [{ profileId: "model-one", displayName: "Model One", activeRevisionId: "mpr_1", retiredAt: null }] }),
     listProviderDrivers: async () => ({ piVersion: "0.73.1" as const, drivers: [] }),
-    adminRequest: overrides.adminRequest ?? (async <T>(path: string) => (path === "/v1/admin/provider-drivers"
-      ? { piVersion: "0.73.1", drivers: [] } as T
-      : {} as T)),
+    runModelSetup: overrides.runModelSetup ?? modelSetupCapability(
+      overrides.adminRequest ?? (async <T>(path: string) => (path === "/v1/admin/provider-drivers"
+        ? { piVersion: "0.73.1", drivers: [] } as T
+        : {} as T)),
+    ).runModelSetup,
     createRun: overrides.createRun ?? (async () => ({ runId: "run_1", status: "queued", eventsUrl: "/v1/runs/run_1/events" })),
     stream: overrides.stream ?? (async () => sseResponse([eventFrame(1, "run.completed", { result: null })])),
     listPendingApprovals: overrides.listPendingApprovals ?? (async () => ({ approvals: overrides.approvals ?? [] })),
@@ -1118,8 +1129,14 @@ function setupClient(
   requests: { path: string; body: unknown }[],
   verificationStatus: () => "running" | "passed" = () => "passed",
 ) {
-  return {
-    adminRequest: async <T>(path: string, options: { method?: string; body?: unknown } = {}) => {
+  return modelSetupCapability(createSetupRequest(requests, verificationStatus));
+}
+
+function createSetupRequest(
+  requests: { path: string; body: unknown }[],
+  verificationStatus: () => "running" | "passed" = () => "passed",
+): AdminClient["request"] {
+  return async <T>(path: string, options: { method?: string; body?: unknown } = {}) => {
       requests.push({ path, body: options.body });
       if (path === "/v1/admin/provider-drivers") return {
         piVersion: "0.73.1",
@@ -1138,6 +1155,28 @@ function setupClient(
       if (path === "/v1/admin/model-verifications/ver_1") return { verificationId: "ver_1", profileRevisionId: "mpr_1", status: verificationStatus(), resultCode: null, capabilities: [], traceId: "trace", fallbackProfileRevisionId: null, fallbackVerificationId: null } as T;
       if (path === "/v1/admin/model-profiles/deepseek-chat") return { profileId: "deepseek-chat", recordRevision: 1, revisions: [{ revisionId: "mpr_1", invocationProtocol: "responses", maxInputTokens: 65536, contextWindowSource: "preset" }] } as T;
       return {} as T;
-    },
+    };
+}
+
+function modelSetupCapability(request: AdminClient["request"]) {
+  return {
+    runModelSetup: (input: {
+      readonly prompt: CliPrompt;
+      readonly sleep: (milliseconds: number) => Promise<void>;
+      readonly write: (line: string) => void;
+      readonly onProgress?: SetupModelProgressCallback;
+      readonly signal?: AbortSignal;
+    }) => setupModel(
+      {
+        request: <T>(path: string, init?: Parameters<AdminClient["request"]>[1]) => input.signal?.aborted === true
+          ? Promise.reject(new CliPromptCancelledError())
+          : request<T>(path, init),
+      },
+      input.prompt,
+      input.sleep,
+      input.write,
+      true,
+      input.onProgress,
+    ),
   };
 }

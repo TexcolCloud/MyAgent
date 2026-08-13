@@ -25,7 +25,7 @@ import { runModelSetupScreen } from "./screens/model-setup.js";
 import type { TuiClient } from "./tui-client.js";
 
 type WorkbenchClient = Pick<TuiClient,
-  "listAgents" | "listProviderConnections" | "listModelProfiles" | "adminRequest" |
+  "listAgents" | "listProviderConnections" | "listModelProfiles" | "runModelSetup" |
   "createRun" | "stream" | "listPendingApprovals" | "decideApproval"
 >;
 

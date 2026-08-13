@@ -30,9 +30,7 @@ describe("HTTP model control plane", () => {
           });
         },
       });
-      await client.adminRequest("/v1/admin/provider-connections", {
-        method: "POST",
-        body: {
+      await client.createProvider({
           slug: "tui-conflict-provider",
           displayName: "TUI Conflict Provider",
           kind: "openai_compatible",
@@ -40,7 +38,6 @@ describe("HTTP model control plane", () => {
           auth: { type: "none" },
           allowInsecureHttp: false,
           protocolPreference: "chat_completions",
-        },
       });
       const revision = {
         expectedRevision: 0,
@@ -51,15 +48,10 @@ describe("HTTP model control plane", () => {
         allowInsecureHttp: false,
         protocolPreference: "responses",
       } as const;
-      await client.adminRequest("/v1/admin/provider-connections/tui-conflict-provider/revisions", {
-        method: "POST",
-        body: revision,
-      });
+      await client.reviseProvider("tui-conflict-provider", revision);
 
-      const conflict = await client.adminRequest("/v1/admin/provider-connections/tui-conflict-provider/revisions", {
-        method: "POST",
-        body: revision,
-      }).then(() => undefined, (error: unknown) => error);
+      const conflict = await client.reviseProvider("tui-conflict-provider", revision)
+        .then(() => undefined, (error: unknown) => error);
 
       expect(conflict).toBeInstanceOf(CliHttpError);
       expect(conflict).toMatchObject({ status: 409, code: "revision_conflict" });

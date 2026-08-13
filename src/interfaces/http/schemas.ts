@@ -1,5 +1,16 @@
 import { z } from "zod";
 
+import type { JsonValue } from "../../domain/json.js";
+
+const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
+  z.string(),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+  z.array(jsonValueSchema),
+  z.record(z.string(), jsonValueSchema),
+]));
+
 export const agentIdSchema = z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/);
 export const sessionKeySchema = z.string().regex(/^[A-Za-z0-9._:@/-]{1,200}$/);
 export const idempotencyKeySchema = z.string().regex(/^[\x20-\x7E]{8,128}$/);
@@ -14,7 +25,7 @@ export const decisionSchema = z.strictObject({ decision: z.enum(["approve", "den
 export const reconciliationSchema = z.strictObject({
   outcome: z.enum(["succeeded", "failed", "retry"]),
   note: z.string().optional(),
-  result: z.unknown().optional(),
+  result: jsonValueSchema.optional(),
 });
 export const backupRequestSchema = z.strictObject({ destination: z.string().min(1) });
 
@@ -69,7 +80,7 @@ export const runResponseSchema = z.strictObject({
   rootRunId: z.string(),
   delegationDepth: z.number().int().nonnegative(),
   budget: runBudgetSchema,
-  result: z.unknown().optional(),
+  result: jsonValueSchema.optional(),
   failure: z.strictObject({ code: z.string() }).optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -81,7 +92,7 @@ export const approvalsResponseSchema = z.strictObject({
     toolCallId: z.string(),
     state: z.literal("pending"),
     toolName: z.string(),
-    arguments: z.unknown(),
+    arguments: jsonValueSchema,
     expiresAt: z.string(),
     riskNotice: z.string().optional(),
   })),

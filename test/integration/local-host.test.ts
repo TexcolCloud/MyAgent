@@ -32,13 +32,16 @@ describe("runLocalHost", () => {
         return Response.json({ runs: [{ runId: "run_1", status: "waiting_approval" }] });
       }
       if (url.pathname === "/v1/approvals") {
-        return Response.json({ approvals: [{ approvalId: "apr_1" }, { approvalId: "apr_2" }] });
+        return Response.json({ approvals: [approval("apr_1"), approval("apr_2")] });
+      }
+      if (url.pathname === "/v1/admin/model-profiles") {
+        return Response.json({ profiles: [] });
       }
       return Response.json({ agents: [], unavailable: [] });
     }) as typeof fetch;
     const runTui = vi.fn(async (options: RunWorkbenchOptions) => {
       await options.client.listAgents();
-      await options.client.adminRequest("/v1/admin/model-profiles");
+      await options.client.listModelProfiles();
       await expect(options.beforeExit?.()).resolves.toEqual({
         activeRuns: [{ runId: "run_1", status: "waiting_approval" }],
         pendingApprovalCount: 2,
@@ -106,3 +109,15 @@ describe("runLocalHost", () => {
     expect(runTui).not.toHaveBeenCalled();
   });
 });
+
+function approval(approvalId: string) {
+  return {
+    approvalId,
+    runId: "run_1",
+    toolCallId: `tool_${approvalId}`,
+    state: "pending",
+    toolName: "write_file",
+    arguments: {},
+    expiresAt: "2026-08-13T00:00:00.000Z",
+  };
+}

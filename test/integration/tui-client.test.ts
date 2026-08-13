@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { CliHttpError } from "../../src/interfaces/cli/client.js";
 import {
   TuiClient,
+  TuiResponseValidationError,
   TuiRevisionConflictError,
 } from "../../src/interfaces/tui/tui-client.js";
 
@@ -96,6 +97,12 @@ describe("TuiClient", () => {
       .toThrow(expect.objectContaining({ code: "tui_tokens_must_differ" }));
   });
 
+  it("does not expose a generic Admin request escape hatch", () => {
+    const client = new TuiClient({ runToken: "run", adminToken: "admin" });
+    // @ts-expect-error TUI callers must use named, schema-checked capabilities.
+    void client.adminRequest;
+  });
+
   it("keeps Run and Admin authority on their exact endpoints", async () => {
     const requests: { url: string; authorization: string | null; redirect?: RequestInit["redirect"]; body?: unknown }[] = [];
     const fetcher: typeof fetch = async (input, init) => {
@@ -110,13 +117,35 @@ describe("TuiClient", () => {
         return Response.json({ runId: "run_1", status: "queued", eventsUrl: "/v1/runs/run_1/events" }, { status: 202 });
       }
       if (path === "/v1/runs/run_1") {
-        return Response.json({ runId: "run_1", status: "queued" });
+        return Response.json({
+          runId: "run_1",
+          sessionId: "session_1",
+          agentId: "primary",
+          status: "queued",
+          fifoSequence: 1,
+          parentRunId: null,
+          rootRunId: "run_1",
+          delegationDepth: 0,
+          budget: {
+            modelTurns: 0,
+            toolCalls: 0,
+            childRuns: 0,
+            delegationDepth: 0,
+            activeExecutionSeconds: 0,
+            toolOutputBytes: 0,
+          },
+          createdAt: "2026-08-13T00:00:00.000Z",
+          updatedAt: "2026-08-13T00:00:00.000Z",
+        });
       }
       if (path === "/v1/approvals/approval%2F1/decision") {
         return Response.json({ approvalId: "approval/1", runId: "run_1", state: "approved", resolvedAt: "2026-08-12T00:00:00.000Z" });
       }
       if (path === "/v1/approvals") {
         return Response.json({ approvals: [] });
+      }
+      if (path === "/v1/admin/model-profiles") {
+        return Response.json({ profiles: [] });
       }
       return Response.json({ piVersion: "0.73.1", drivers: [] });
     };
@@ -133,10 +162,7 @@ describe("TuiClient", () => {
     await client.decideApproval("approval/1", "approve");
     await client.listPendingApprovals();
     await client.listProviderDrivers();
-    await client.adminRequest("/v1/admin/model-profiles", {
-      method: "POST",
-      body: { catalogCandidateId: "pi/deepseek:deepseek-chat" },
-    });
+    await client.listModelProfiles();
 
     expect(requests).toEqual([
       {
@@ -154,12 +180,7 @@ describe("TuiClient", () => {
       },
       { url: "http://127.0.0.1:8787/v1/approvals?status=pending", authorization: "Bearer run", redirect: "manual" },
       { url: "http://127.0.0.1:8787/v1/admin/provider-drivers", authorization: "Bearer admin", redirect: "manual" },
-      {
-        url: "http://127.0.0.1:8787/v1/admin/model-profiles",
-        authorization: "Bearer admin",
-        redirect: "manual",
-        body: { catalogCandidateId: "pi/deepseek:deepseek-chat" },
-      },
+      { url: "http://127.0.0.1:8787/v1/admin/model-profiles", authorization: "Bearer admin", redirect: "manual" },
     ]);
   });
 
@@ -352,6 +373,61 @@ describe("TuiClient", () => {
     expect(failure).not.toHaveProperty("apiKey");
     expect(String(failure)).not.toContain("must-not-project");
   });
+
+  it.each([
+    ["apiKey", "secret-api-key"],
+    ["value", "secret-value"],
+    ["fromEnvironment", "SECRET_ENVIRONMENT_NAME"],
+    ["rawProvider", { authorization: "Bearer secret-provider-token" }],
+  ])("rejects successful Provider responses containing unsafe field %s", async (field, value) => {
+    const client = new TuiClient({
+      runToken: "run",
+      adminToken: "admin",
+      fetcher: async () => Response.json({
+        connections: [{
+          connectionId: "deepseek",
+          displayName: "DeepSeek",
+          providerKind: "deepseek",
+          activeRevisionId: null,
+          retiredAt: null,
+          recordRevision: 0,
+          credentialConfigured: false,
+          revisions: [],
+          [field]: value,
+        }],
+      }),
+    });
+
+    const failure = await client.listProviderConnections().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(TuiResponseValidationError);
+    expect(failure).toMatchObject({
+      code: "invalid_tui_response",
+      detail: "The service returned an invalid response.",
+      traceId: "tui",
+    });
+    expect(String(failure)).not.toContain(String(value));
+    expect(failure).not.toHaveProperty("cause");
+  });
+
+  it("rejects a malformed successful detail response with a fixed safe error", async () => {
+    const rawBody = "raw-provider-secret";
+    const client = new TuiClient({
+      runToken: "run",
+      adminToken: "admin",
+      fetcher: async () => Response.json({
+        connectionId: "deepseek",
+        rawProvider: rawBody,
+      }),
+    });
+
+    const failure = await client.getProviderConnection("deepseek")
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(TuiResponseValidationError);
+    expect(String(failure)).toBe("TuiResponseValidationError: invalid_tui_response");
+    expect(JSON.stringify(failure)).not.toContain(rawBody);
+  });
 });
 
 interface CapturedRequest {
@@ -372,9 +448,97 @@ function captureRequests(): { readonly values: CapturedRequest[]; readonly fetch
         authorization: new Headers(init?.headers).get("authorization"),
         ...(typeof init?.body === "string" ? { body: JSON.parse(init.body) as unknown } : {}),
       });
-      return Response.json({});
+      return responseFor(new URL(String(input)).pathname, init?.method ?? "GET");
     },
   };
+}
+
+function responseFor(path: string, method: string): Response {
+  const connection = {
+    connectionId: "deepseek",
+    displayName: "DeepSeek",
+    providerKind: "deepseek",
+    activeRevisionId: null,
+    retiredAt: null,
+    recordRevision: 0,
+    credentialConfigured: false,
+    revisions: [],
+  };
+  const profile = {
+    profileId: "model-one",
+    displayName: "Model One",
+    activeRevisionId: null,
+    retiredAt: null,
+    recordRevision: 0,
+    revisions: [],
+  };
+  if (path === "/v1/admin/provider-connections" && method === "GET") {
+    return Response.json({ connections: [connection] });
+  }
+  if (path.endsWith("/purge")) return new Response(null, { status: 204 });
+  if (path.startsWith("/v1/admin/provider-connections/")) return Response.json(connection);
+  if (path === "/v1/admin/provider-connections") return Response.json(connection);
+  if (path.includes("/provider-connection-revisions/")) {
+    return Response.json({
+      connectionRevisionId: "pcr_2",
+      recordRevision: 1,
+      state: "fresh",
+      models: [],
+      cache: { fetchedAt: null, expiresAt: null },
+      error: null,
+    });
+  }
+  if (path === "/v1/admin/model-profiles" && method === "GET") {
+    return Response.json({ profiles: [profile] });
+  }
+  if (path.startsWith("/v1/admin/model-profiles/")) return Response.json(profile);
+  if (path === "/v1/admin/model-profiles") return Response.json(profile);
+  if (path.includes("/model-profile-revisions/")) {
+    return Response.json({
+      verificationId: "ver_2",
+      profileRevisionId: "mpr_2",
+      capabilityBaseline: "text_and_single_tool_call_v1",
+      status: "queued",
+      recordRevision: 1,
+      operationUrl: "/v1/admin/model-verifications/ver_2",
+    }, { status: 202 });
+  }
+  if (path.includes("/model-verifications/")) {
+    return Response.json({
+      verificationId: "ver_2",
+      profileRevisionId: "mpr_2",
+      capabilityBaseline: "text_and_single_tool_call_v1",
+      status: "cancelled",
+      resultCode: null,
+      safeStatus: null,
+      capabilities: [],
+      traceId: "trace_2",
+      recordRevision: 1,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+      cancellationRequestedAt: "2026-08-13T00:00:00.000Z",
+      fallbackProfileRevisionId: null,
+      fallbackVerificationId: null,
+    });
+  }
+  if (path.includes("/model-assignment")) {
+    return Response.json({
+      agentId: "agent-one",
+      state: "unassigned",
+      modelProfileRevisionId: null,
+      source: null,
+      recordRevision: null,
+      updatedAt: null,
+    });
+  }
+  if (path === "/v1/admin/default-model-profile") {
+    return Response.json({ state: "unset", profileId: null, recordRevision: null });
+  }
+  if (path.endsWith("/destruction")) return new Response(null, { status: 204 });
+  if (path.endsWith("/master-key-rotation")) {
+    return Response.json({ reencrypted: 1, currentKeyId: "key_2", recordRevision: 1 });
+  }
+  return Response.json({});
 }
 
 function request(path: string, method = "GET", body?: unknown): CapturedRequest {
