@@ -78,7 +78,7 @@ describe("run_command Tool", () => {
       stdout: "a && echo injected\n",
       stderr: "",
     });
-  });
+  }, NORMAL_COMMAND_TIMEOUT_MS);
 
   it("rejects an embedded NUL in the approved program during normalization", async () => {
     const tool = createRunCommandTool({
