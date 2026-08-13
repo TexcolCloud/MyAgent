@@ -24,6 +24,18 @@ export interface ActiveRun {
   readonly status: ActiveRunStatus;
 }
 
+export interface RunHistoryQuery {
+  readonly agentId: AgentId;
+  readonly sessionKey: SessionKey;
+  readonly limit: number;
+  readonly cursor?: { readonly updatedAt: Date; readonly runId: RunId };
+}
+
+export interface RunHistoryPage {
+  readonly items: readonly Run[];
+  readonly nextCursor?: { readonly updatedAt: Date; readonly runId: RunId };
+}
+
 export interface CreateStoredRunInput {
   agentId: AgentId;
   sessionKey: SessionKey;
@@ -100,6 +112,7 @@ export interface StartDelegationInput {
 export interface RunStore {
   create(input: CreateStoredRunInput): CreateStoredRunResult;
   getRun(runId: RunId): Run;
+  listHistory(query: RunHistoryQuery): RunHistoryPage;
   listActiveRuns(): readonly ActiveRun[];
   listEventsAfter(runId: RunId, sequence: number): readonly RunEvent[];
   appendEvent(

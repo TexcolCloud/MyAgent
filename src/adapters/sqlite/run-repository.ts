@@ -18,6 +18,8 @@ import type {
   CreateStoredRunResult,
   FailModelAttemptInput,
   RunExecutionContext,
+  RunHistoryPage,
+  RunHistoryQuery,
   RunStore,
   StartDelegationInput,
 } from "../../ports/run-store.js";
@@ -264,6 +266,35 @@ export class SqliteRunRepository implements RunStore {
       throw new Error("run_not_found");
     }
     return mapRun(row);
+  }
+
+  listHistory(query: RunHistoryQuery): RunHistoryPage {
+    const rows = this.db.prepare(
+      `SELECT runs.*, sessions.agent_id
+       FROM runs JOIN sessions ON sessions.session_id = runs.session_id
+       WHERE sessions.agent_id = ? AND sessions.session_key = ?
+         AND sessions.owner_session_id IS NULL
+         AND (? IS NULL OR runs.updated_at < ? OR (runs.updated_at = ? AND runs.run_id < ?))
+       ORDER BY runs.updated_at DESC, runs.run_id DESC
+       LIMIT ?`,
+    ).all(
+      query.agentId,
+      query.sessionKey,
+      query.cursor?.updatedAt.toISOString() ?? null,
+      query.cursor?.updatedAt.toISOString() ?? null,
+      query.cursor?.updatedAt.toISOString() ?? null,
+      query.cursor?.runId ?? null,
+      query.limit + 1,
+    ) as unknown as RunRow[];
+    const hasNext = rows.length > query.limit;
+    const items = rows.slice(0, query.limit).map(mapRun);
+    const last = items.at(-1);
+    return {
+      items,
+      ...(hasNext && last !== undefined
+        ? { nextCursor: { updatedAt: last.updatedAt, runId: last.runId } }
+        : {}),
+    };
   }
 
   listActiveRuns(): readonly ActiveRun[] {
@@ -632,10 +663,13 @@ export class SqliteRunRepository implements RunStore {
     });
   }
 
-  cancel(input: { runId: RunId; occurredAt: Date }): Run {
+  cancel(input: { runId: RunId; occurredAt: Date; expectedRevision?: string }): Run {
     const occurredAt = input.occurredAt.toISOString();
     return this.inImmediateTransaction(() => {
       const run = this.getRun(input.runId);
+      if (input.expectedRevision !== undefined && run.updatedAt.toISOString() !== input.expectedRevision) {
+        throw new ApplicationError("revision_conflict", 409);
+      }
       if (["completed", "failed", "cancelled"].includes(run.state)) return run;
       const blocked = this.db.prepare(
         `SELECT blocked_by_child_run_id FROM runs WHERE run_id = ?`,

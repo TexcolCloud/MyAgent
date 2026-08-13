@@ -5,7 +5,7 @@ import { safeDisplayLines } from "../safe-display-text.js";
 import { isRevisionConflict, type TuiClient } from "../tui-client.js";
 import type { InspectorScreen } from "./inspector.js";
 
-type ManagedAgentClient = Pick<TuiClient, "listAgents" | "createManagedAgent">;
+type ManagedAgentClient = Pick<TuiClient, "listAgents"> & Partial<Pick<TuiClient, "createManagedAgent">>;
 type AgentSummary = { readonly id: string; readonly displayName: string };
 
 interface AgentScreenOptions {
@@ -47,7 +47,7 @@ export class AgentScreen implements Component, Focusable {
       if (data === "r") void this.load();
       return;
     }
-    if (data === "n") void this.runCreate();
+    if (data === "n" && this.options.client.createManagedAgent !== undefined) void this.runCreate();
     if (data === "a") this.options.onAssignments?.();
     this.changed();
   }
@@ -58,7 +58,9 @@ export class AgentScreen implements Component, Focusable {
       : this.agents.map(({ id, displayName }) => `${displayName} (${id})`);
     const actions = this.reloadRequired
       ? ["Reload required. Press r."]
-      : ["[n] new Agent  [a] assignments  [Esc] navigation"];
+      : [this.options.client.createManagedAgent === undefined
+        ? "[a] assignments  [Esc] navigation"
+        : "[n] new Agent  [a] assignments  [Esc] navigation"];
     return ["Agents", ...agents, ...this.review, ...actions]
       .flatMap(safeDisplayLines)
       .map((line) => truncateToWidth(line, width));
@@ -69,9 +71,8 @@ export class AgentScreen implements Component, Focusable {
   private async loadAgents(): Promise<void> {
     try {
       const response = await this.options.client.listAgents();
-      if (response.catalogRevision === undefined) throw new Error("catalog_revision_unavailable");
       this.agents = response.agents;
-      this.catalogRevision = response.catalogRevision;
+      this.catalogRevision = response.catalogRevision ?? "";
       this.reloadRequired = false;
       this.review = [];
     } catch {
@@ -98,7 +99,9 @@ export class AgentScreen implements Component, Focusable {
     this.changed();
     if (!await prompt.confirm("Confirm Agent creation?")) return;
 
-    const created = await this.options.client.createManagedAgent({
+    const createManagedAgent = this.options.client.createManagedAgent;
+    if (createManagedAgent === undefined || this.catalogRevision.length === 0) throw new Error("agent_create_unavailable");
+    const created = await createManagedAgent({
       id,
       displayName,
       prompt: instructions.endsWith("\n") ? instructions : `${instructions}\n`,

@@ -12,7 +12,7 @@ import { safeDisplayLines } from "../safe-display-text.js";
 import type { TuiClient } from "../tui-client.js";
 import type { WorkbenchDestination } from "./navigation.js";
 
-type ChatClient = Pick<TuiClient, "createRun" | "stream">;
+type ChatClient = Pick<TuiClient, "createRun" | "stream"> & Partial<Pick<TuiClient, "getRun">>;
 
 export interface ChatSubmission {
   readonly agentId: string;
@@ -83,7 +83,7 @@ export class ChatScreen implements Component, Focusable {
       this.changed();
     });
     this.operation = operation;
-    return operation.then(() => true);
+    return operation.then(async () => { await this.refreshDetail(); return true; });
   }
 
   cancel(): void {
@@ -163,6 +163,16 @@ export class ChatScreen implements Component, Focusable {
       ...safePayload,
     ];
     this.terminal = ["run.completed", "run.failed", "run.cancelled"].includes(event.type);
+    this.changed();
+  }
+
+  private async refreshDetail(): Promise<void> {
+    const runId = this.cursor?.runId;
+    if (runId === undefined) return;
+    const getRun = this.requireClient().getRun;
+    if (getRun === undefined) return;
+    const run = await getRun.call(this.requireClient(), runId);
+    this.lines = [...this.lines.filter((line) => !line.startsWith("Run status:")), `Run status: ${run.status}`];
     this.changed();
   }
 

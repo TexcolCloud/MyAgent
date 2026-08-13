@@ -1,6 +1,6 @@
 import { matchesKey, truncateToWidth, type Component, type Focusable } from "@mariozechner/pi-tui";
 
-export type WorkbenchDestination = "agents" | "runs" | "providers" | "profiles" | "verifications";
+export type WorkbenchDestination = "agents" | "runs" | "sessions" | "providers" | "profiles" | "verifications";
 
 const destinations: readonly { readonly id: WorkbenchDestination; readonly label: string }[] = [
   { id: "agents", label: "Agents" },

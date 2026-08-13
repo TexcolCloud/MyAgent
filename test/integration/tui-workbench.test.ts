@@ -243,9 +243,16 @@ describe("TUI workbench", () => {
       eventsUrl: "/v1/runs/run_1/events",
     }));
     const cursors: (string | undefined)[] = [];
+    const getRun = vi.fn(async () => ({
+      runId: "run_1", sessionId: "ses_1", agentId: "primary", status: "completed" as const,
+      fifoSequence: 0, parentRunId: null, rootRunId: "run_1", delegationDepth: 0,
+      budget: { modelTurns: 0, toolCalls: 0, childRuns: 0, delegationDepth: 0, activeExecutionSeconds: 0, toolOutputBytes: 0 },
+      createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z",
+    }));
     let attempt = 0;
     const client = safeClient({
       createRun,
+      getRun,
       stream: async (_path, lastEventId) => {
         cursors.push(lastEventId);
         attempt += 1;
@@ -280,6 +287,7 @@ describe("TUI workbench", () => {
       text: "read status",
     }));
     expect(cursors).toEqual([undefined, "4"]);
+    expect(getRun).toHaveBeenCalledExactlyOnceWith("run_1");
   });
 
   it("opens pending Approvals and dispatches one selected decision", async () => {
@@ -1080,6 +1088,7 @@ function safeClient(overrides: Partial<{
   adminRequest: <T>(path: string, init?: { readonly method?: string }) => Promise<T>;
   runModelSetup: ReturnType<typeof modelSetupCapability>["runModelSetup"];
   createRun: (input: { readonly agentId: string; readonly sessionKey: string; readonly text: string; readonly idempotencyKey?: string; readonly signal?: AbortSignal }) => Promise<{ readonly runId: string; readonly status: "queued"; readonly eventsUrl: string }>;
+  getRun: (runId: string) => Promise<{ readonly runId: string; readonly sessionId: string; readonly agentId: string; readonly status: "queued" | "running" | "waiting_approval" | "cancelling" | "waiting_reconciliation" | "completed" | "failed" | "cancelled"; readonly fifoSequence: number; readonly parentRunId: string | null; readonly rootRunId: string; readonly delegationDepth: number; readonly budget: { readonly modelTurns: number; readonly toolCalls: number; readonly childRuns: number; readonly delegationDepth: number; readonly activeExecutionSeconds: number; readonly toolOutputBytes: number }; readonly createdAt: string; readonly updatedAt: string }>;
   stream: (path: string, lastEventId?: string, signal?: AbortSignal) => Promise<Response>;
   approvals: readonly ReturnType<typeof pendingApproval>[];
   listPendingApprovals: () => Promise<{ readonly approvals: readonly ReturnType<typeof pendingApproval>[] }>;
@@ -1096,6 +1105,7 @@ function safeClient(overrides: Partial<{
         : {} as T)),
     ).runModelSetup,
     createRun: overrides.createRun ?? (async () => ({ runId: "run_1", status: "queued", eventsUrl: "/v1/runs/run_1/events" })),
+    getRun: overrides.getRun ?? (async (runId) => ({ runId, sessionId: "ses_1", agentId: "primary", status: "completed" as const, fifoSequence: 0, parentRunId: null, rootRunId: runId, delegationDepth: 0, budget: { modelTurns: 0, toolCalls: 0, childRuns: 0, delegationDepth: 0, activeExecutionSeconds: 0, toolOutputBytes: 0 }, createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z" })),
     stream: overrides.stream ?? (async () => sseResponse([eventFrame(1, "run.completed", { result: null })])),
     listPendingApprovals: overrides.listPendingApprovals ?? (async () => ({ approvals: overrides.approvals ?? [] })),
     decideApproval: overrides.decideApproval ?? (async (approvalId, decision) => ({

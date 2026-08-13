@@ -56,6 +56,8 @@ import {
   approvalsResponseSchema,
   createRunResponseSchema,
   runResponseSchema,
+  runHistoryResponseSchema,
+  sessionHistoryResponseSchema,
 } from "../http/schemas.js";
 import { TuiTokensMustDifferError, type TuiCredentials } from "./credentials.js";
 
@@ -125,6 +127,11 @@ export interface ActiveRunView {
     "queued" | "running" | "waiting_approval" | "cancelling"
   >;
 }
+
+export interface RunHistoryInput { readonly agentId: string; readonly sessionKey: string; readonly limit?: number; readonly cursor?: string; }
+export interface RunHistoryView { readonly items: readonly RunView[]; readonly nextCursor?: string | undefined; }
+export interface SessionHistoryInput { readonly agentId?: string; readonly sessionKey?: string; readonly limit?: number; readonly cursor?: string; }
+export interface SessionHistoryView { readonly items: readonly { readonly sessionId: string; readonly agentId: string; readonly sessionKey: string; readonly createdAt: string; readonly updatedAt: string; }[]; readonly nextCursor?: string | undefined; }
 
 export interface PendingApproval {
   readonly approvalId: string;
@@ -226,8 +233,20 @@ export class TuiClient {
     return this.requestAndParse(this.runClient, runResponseSchema, `/v1/runs/${encodeURIComponent(runId)}`);
   }
 
+  cancelRun(runId: string, expectedRevision: string): Promise<RunView> {
+    return this.requestAndParse(this.runClient, runResponseSchema, `/v1/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST", body: { confirm: true, expectedRevision } });
+  }
+
   listActiveRuns(): Promise<{ readonly runs: readonly ActiveRunView[] }> {
     return this.requestAndParse(this.runClient, activeRunsResponseSchema, "/v1/runs?state=active");
+  }
+
+  listRunHistory(input: RunHistoryInput): Promise<RunHistoryView> {
+    return this.requestAndParse(this.runClient, runHistoryResponseSchema, `/v1/runs?${historyQuery({ agentId: input.agentId, sessionKey: input.sessionKey, limit: input.limit, cursor: input.cursor })}`);
+  }
+
+  listSessions(input: SessionHistoryInput = {}): Promise<SessionHistoryView> {
+    return this.requestAndParse(this.runClient, sessionHistoryResponseSchema, `/v1/sessions?${historyQuery({ agentId: input.agentId, sessionKey: input.sessionKey, limit: input.limit, cursor: input.cursor })}`);
   }
 
   decideApproval(approvalId: string, decision: "approve" | "deny"): Promise<ApprovalDecision> {
@@ -575,6 +594,12 @@ export class TuiClient {
   stream(path: string, lastEventId?: string, signal?: AbortSignal): Promise<Response> {
     return this.runClient.stream(path, lastEventId, signal);
   }
+}
+
+function historyQuery(input: Record<string, string | number | undefined>): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(input)) if (value !== undefined) query.set(key, String(value));
+  return query.toString();
 }
 
 interface RequestInitBody {

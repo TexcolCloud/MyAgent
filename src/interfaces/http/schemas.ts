@@ -21,6 +21,7 @@ export const createRunSchema = z.strictObject({
   input: z.strictObject({ type: z.literal("text"), text: z.string() }),
   source: z.strictObject({ kind: z.literal("http"), externalId: z.string().optional() }).optional(),
 });
+export const cancelRunSchema = z.strictObject({ confirm: z.literal(true), expectedRevision: z.string().datetime() });
 export const decisionSchema = z.strictObject({ decision: z.enum(["approve", "deny"]) });
 export const reconciliationSchema = z.strictObject({
   outcome: z.enum(["succeeded", "failed", "retry"]),
@@ -86,6 +87,16 @@ export const runResponseSchema = z.strictObject({
   createdAt: z.string(),
   updatedAt: z.string(),
 });
+export const runHistoryQuerySchema = z.strictObject({
+  agentId: agentIdSchema,
+  sessionKey: sessionKeySchema,
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  cursor: z.string().min(1).optional(),
+});
+export const runHistoryResponseSchema = z.strictObject({
+  items: z.array(runResponseSchema),
+  nextCursor: z.string().optional(),
+});
 export const approvalsResponseSchema = z.strictObject({
   approvals: z.array(z.strictObject({
     approvalId: z.string(),
@@ -117,6 +128,14 @@ export const sessionsResponseSchema = z.strictObject({
     createdAt: z.string(),
     updatedAt: z.string(),
   })),
+});
+export const sessionHistoryQuerySchema = z.strictObject({
+  agentId: agentIdSchema.optional(), sessionKey: sessionKeySchema.optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(), cursor: z.string().min(1).optional(),
+});
+export const sessionHistoryResponseSchema = z.strictObject({
+  items: z.array(z.strictObject({ sessionId: z.string(), agentId: agentIdSchema, sessionKey: sessionKeySchema, createdAt: z.string(), updatedAt: z.string() })),
+  nextCursor: z.string().optional(),
 });
 export const backupResponseSchema = z.strictObject({
   destination: z.string(),

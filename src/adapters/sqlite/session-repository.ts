@@ -9,6 +9,8 @@ import type {
   SessionMessage,
   SessionMetadata,
   SessionLookupStore,
+  SessionHistoryPage,
+  SessionHistoryQuery,
   SessionStore,
   SessionSummary,
 } from "../../ports/session-store.js";
@@ -50,6 +52,21 @@ export class SqliteSessionRepository implements SessionStore, SessionLookupStore
        FROM sessions WHERE agent_id = ? AND session_key = ? AND owner_session_id IS NULL`,
     ).get(agentId, sessionKey) as SessionRow | undefined;
     return row === undefined ? null : { sessionId: row.session_id as SessionId, agentId: row.agent_id, sessionKey: row.session_key, createdAt: new Date(row.created_at), updatedAt: new Date(row.updated_at) };
+  }
+
+  listHistory(query: SessionHistoryQuery): SessionHistoryPage {
+    const rows = this.db.prepare(
+      `SELECT session_id, agent_id, session_key, created_at, updated_at FROM sessions
+       WHERE owner_session_id IS NULL
+         AND (? IS NULL OR agent_id = ?) AND (? IS NULL OR session_key = ?)
+         AND (? IS NULL OR updated_at < ? OR (updated_at = ? AND session_id < ?))
+       ORDER BY updated_at DESC, session_id DESC LIMIT ?`,
+    ).all(query.agentId ?? null, query.agentId ?? null, query.sessionKey ?? null, query.sessionKey ?? null,
+      query.cursor?.updatedAt.toISOString() ?? null, query.cursor?.updatedAt.toISOString() ?? null,
+      query.cursor?.updatedAt.toISOString() ?? null, query.cursor?.sessionId ?? null, query.limit + 1) as unknown as SessionRow[];
+    const items = rows.slice(0, query.limit).map(mapMetadata);
+    const last = items.at(-1);
+    return { items, ...(rows.length > query.limit && last !== undefined ? { nextCursor: { updatedAt: last.updatedAt, sessionId: last.sessionId } } : {}) };
   }
 
   delete(sessionId: SessionId): void {
@@ -238,6 +255,10 @@ export class SqliteSessionRepository implements SessionStore, SessionLookupStore
       occurredAt,
     );
   }
+}
+
+function mapMetadata(row: SessionRow): SessionMetadata {
+  return { sessionId: row.session_id as SessionId, agentId: row.agent_id, sessionKey: row.session_key, createdAt: new Date(row.created_at), updatedAt: new Date(row.updated_at) };
 }
 
 function mapMessage(row: MessageRow): SessionMessage {

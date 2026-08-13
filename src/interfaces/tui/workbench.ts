@@ -20,6 +20,8 @@ import { PiTuiPrompt } from "./pi-tui-prompt.js";
 import { ApprovalScreen } from "./screens/approvals.js";
 import { AgentScreen } from "./screens/agents.js";
 import { ChatScreen } from "./screens/chat.js";
+import { RunsScreen } from "./screens/runs.js";
+import { SessionsScreen } from "./screens/sessions.js";
 import { InspectorScreen } from "./screens/inspector.js";
 import { NavigationScreen, type WorkbenchDestination } from "./screens/navigation.js";
 import { runModelSetupScreen } from "./screens/model-setup.js";
@@ -38,7 +40,7 @@ type WorkbenchClient = Pick<TuiClient,
   | "createModelProfile" | "promoteModelProfile" | "retireModelProfile" | "verifyModel"
   | "getModelVerificationAt" | "cancelModelVerification" | "getModelAssignment" | "assignModel"
   | "getDefaultModelProfile" | "setDefaultModelProfile"
-  | "createManagedAgent"
+  | "createManagedAgent" | "listRunHistory" | "listSessions" | "getRun"
 >>;
 
 export interface RunWorkbenchOptions {
@@ -121,6 +123,14 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     latestExitAttempt = attempt;
   };
   const refresh = (destination: WorkbenchDestination) => {
+    if (destination === "runs" && isRunHistoryClient(options.client)) {
+      const screen = new RunsScreen({ client: options.client, agentId: "primary", sessionKey: "default", onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
+    }
+    if (destination === "sessions" && isSessionHistoryClient(options.client)) {
+      const screen = new SessionsScreen({ client: options.client, onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
+    }
     if (destination === "providers" && isProviderClient(options.client)) {
       const screen = new ProviderScreen({
         client: options.client,
@@ -146,6 +156,10 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     if (destination === "verifications" && isVerificationClient(options.client)) {
       const screen = new VerificationScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
       verificationScreen = screen; center = screen; tui.setFocus(screen); tui.requestRender(); return;
+    }
+    if (destination === "agents" && !isAgentClient(options.client) && isAssignmentClient(options.client)) {
+      const screen = new AssignmentScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      assignmentScreen = screen; center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
     }
     if (destination === "agents" && isAgentClient(options.client)) {
       const screen = new AgentScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onAssignments: () => { if (!isAssignmentClient(options.client)) return; const assignments = new AssignmentScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = screen; tui.setFocus(screen); tui.requestRender(); } }); assignmentScreen = assignments; center = assignments; tui.setFocus(assignments); void assignments.load().finally(() => tui.requestRender()); }, onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
@@ -293,7 +307,15 @@ function isAssignmentClient(client: WorkbenchClient): client is WorkbenchClient 
   return typeof client.getModelProfile === "function" && typeof client.getModelAssignment === "function" && typeof client.assignModel === "function" && typeof client.getDefaultModelProfile === "function" && typeof client.setDefaultModelProfile === "function";
 }
 
-function isAgentClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof AgentScreen>[0]["client"] {
+function isRunHistoryClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof RunsScreen>[0]["client"] {
+  return typeof client.listRunHistory === "function";
+}
+
+function isSessionHistoryClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof SessionsScreen>[0]["client"] {
+  return typeof client.listSessions === "function";
+}
+
+function isAgentClient(client: WorkbenchClient): client is WorkbenchClient & Required<Pick<TuiClient, "createManagedAgent">> {
   return typeof client.createManagedAgent === "function";
 }
 

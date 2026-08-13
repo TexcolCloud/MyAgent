@@ -96,6 +96,46 @@ describe("HTTP Runs", () => {
     }
   });
 
+  it("lists durable Run history by Agent and Session newest first with an opaque cursor", async () => {
+    const harness = await startTestApp({ databasePath: tempPath("http-run-history.db") });
+    try {
+      const create = async (idempotencyKey: string, agentId: string, sessionKey: string) => {
+        const response = await harness.app.inject({
+          method: "POST", url: "/v1/runs", headers: { ...auth, "idempotency-key": idempotencyKey },
+          payload: { agentId, sessionKey, input: { type: "text", text: idempotencyKey } },
+        });
+        return response.json().runId as RunId;
+      };
+      const first = await create("history-primary-first", "primary", "session:history");
+      const second = await create("history-primary-second", "primary", "session:history");
+      await create("history-primary-other", "primary", "session:other");
+      const timestamp = "2026-08-13T10:00:00.000Z";
+      harness.connection.db.prepare("UPDATE runs SET updated_at = ? WHERE run_id IN (?, ?)")
+        .run(timestamp, first, second);
+
+      const page = await harness.app.inject({
+        method: "GET",
+        url: "/v1/runs?agentId=primary&sessionKey=session%3Ahistory&limit=1",
+        headers: auth,
+      });
+
+      expect(page.statusCode).toBe(200);
+      expect(page.json()).toMatchObject({
+        items: [{ runId: [first, second].sort().reverse()[0] }],
+        nextCursor: expect.any(String),
+      });
+      const next = await harness.app.inject({
+        method: "GET",
+        url: `/v1/runs?agentId=primary&sessionKey=session%3Ahistory&limit=100&cursor=${encodeURIComponent(page.json().nextCursor)}`,
+        headers: auth,
+      });
+      expect(next.statusCode).toBe(200);
+      expect(next.json().items).toMatchObject([{ runId: [first, second].sort().reverse()[1] }]);
+    } finally {
+      await harness.close();
+    }
+  });
+
   it.each([
     ["missing state", "/v1/runs"],
     ["wrong state", "/v1/runs?state=completed"],
@@ -178,10 +218,19 @@ describe("HTTP Runs", () => {
         headers: { ...auth, "idempotency-key": "request-0003" },
         payload: { agentId: "primary", sessionKey: "session:cancel", input: { type: "text", text: "hello" } },
       });
+      const unconfirmed = await harness.app.inject({
+        method: "POST",
+        url: `/v1/runs/${created.json().runId}/cancel`,
+        headers: auth,
+        payload: {},
+      });
+      expect(unconfirmed.statusCode).toBe(400);
+      const detail = await harness.app.inject({ method: "GET", url: `/v1/runs/${created.json().runId}`, headers: auth });
       const cancelled = await harness.app.inject({
         method: "POST",
         url: `/v1/runs/${created.json().runId}/cancel`,
         headers: auth,
+        payload: { confirm: true, expectedRevision: detail.json().updatedAt },
       });
       expect(cancelled.statusCode).toBe(200);
       expect(cancelled.json()).toMatchObject({ runId: created.json().runId, status: "cancelled" });
@@ -322,8 +371,9 @@ describe("HTTP Runs", () => {
     const runs = {
       getRun: () => { throw new Error("unused"); },
       listActiveRuns: () => [],
+      listHistory: () => ({ items: [] }),
       listEventsAfter: () => [],
-    } as unknown as Pick<RunStore, "getRun" | "listActiveRuns" | "listEventsAfter">;
+    } as unknown as Pick<RunStore, "getRun" | "listActiveRuns" | "listHistory" | "listEventsAfter">;
     const cancelRuns = { execute: () => { throw new Error("unused"); } } as unknown as CancelRunService;
     const app = createHttpApp({ bearerToken: "test-token", createRuns, runs, cancelRuns });
     try {
