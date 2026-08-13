@@ -4,6 +4,7 @@ import {
   agentConfigSchema,
   agentConfigV2Schema,
   globalConfigV2Schema,
+  localProjectConfigSchema,
   policyConfigSchema,
 } from "../../src/config/schemas.js";
 
@@ -53,6 +54,15 @@ describe("configuration schemas", () => {
     });
     expect(() => globalConfigV2Schema.parse({ ...VALID_V2, models: {} })).toThrow();
     expect(() => agentConfigV2Schema.parse({ ...VALID_V2_AGENT, model: "default" })).toThrow();
+  });
+
+  it("accepts the minimal local-project configuration without Model defaults", () => {
+    expect(localProjectConfigSchema.parse(VALID_V2)).toMatchObject({ version: 2 });
+    expect(() => localProjectConfigSchema.parse({ ...VALID_V2, models: {} })).toThrow();
+    expect(() => localProjectConfigSchema.parse({
+      ...VALID_V2,
+      modelControl: {},
+    })).toThrow();
   });
 
   it("rejects unknown Policy fields and unsupported M2 Agent fields", () => {

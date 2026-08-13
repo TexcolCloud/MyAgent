@@ -1,0 +1,114 @@
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+
+import { loadBootConfig } from "../../src/config/boot-config.js";
+import {
+  initializeProjectState,
+  inspectProjectState,
+  resolveLocalProjectPaths,
+} from "../../src/interfaces/local/project-state.js";
+
+const localMinimalFixture = path.resolve(
+  "test",
+  "fixtures",
+  "config",
+  "local-minimal",
+  "myagent.yaml",
+);
+
+describe("local project state", () => {
+  it("resolves the default state below .myagent and reports it absent", async () => {
+    const paths = resolveLocalProjectPaths("C:\\repo");
+
+    expect(paths.configPath).toBe(path.resolve("C:\\repo", ".myagent", "myagent.yaml"));
+    expect(paths.root).toBe(path.resolve("C:\\repo", ".myagent"));
+    expect(paths.databasePath).toBe(path.resolve("C:\\repo", ".myagent", "state.sqlite"));
+    expect(await inspectProjectState(paths)).toBe("absent");
+  });
+
+  it("initializes the minimum model-free state in a real workspace", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+    const paths = resolveLocalProjectPaths(workspace);
+    try {
+      await initializeProjectState(paths);
+
+      expect(await inspectProjectState(paths)).toBe("ready");
+      expect(await loadBootConfig(paths.configPath)).toMatchObject({
+        version: 2,
+        server: {
+          host: "127.0.0.1",
+          port: 8787,
+          bearerToken: { fromEnvironment: "MYAGENT_BEARER_TOKEN" },
+          adminToken: { fromEnvironment: "MYAGENT_ADMIN_TOKEN" },
+        },
+        database: { path: "state.sqlite" },
+        agentRoots: ["agents"],
+        skillRoots: ["skills"],
+      });
+      expect(await readdir(paths.agentsRoot)).toEqual([]);
+      expect(await readdir(paths.skillsRoot)).toEqual([]);
+      expect((await readdir(paths.root)).sort()).toEqual([
+        "agents",
+        "myagent.yaml",
+        "skills",
+      ]);
+      expect(await readFile(paths.configPath, "utf8"))
+        .toBe(await readFile(localMinimalFixture, "utf8"));
+      expect(await readFile(paths.configPath, "utf8"))
+        .not.toMatch(/(?:^|\n)(?:models|model|provider|default):/);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("uses an explicit config path without selecting a workspace-root myagent.yaml", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+    const explicit = path.join(workspace, "settings", "myagent.yaml");
+    try {
+      await writeFile(path.join(workspace, "myagent.yaml"), "version: 3\n");
+      const paths = resolveLocalProjectPaths(workspace, explicit);
+
+      expect(paths.configPath).toBe(explicit);
+      expect(paths.root).toBe(path.join(workspace, "settings"));
+      expect(await inspectProjectState(paths)).toBe("absent");
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses partial or existing state without mutating it", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+    const paths = resolveLocalProjectPaths(workspace);
+    try {
+      await mkdir(paths.root, { recursive: true });
+      await writeFile(paths.configPath, "version: 2\n");
+
+      expect(await inspectProjectState(paths)).toBe("partial");
+      await expect(initializeProjectState(paths)).rejects.toThrow("partial");
+      expect(await inspectProjectState(paths)).toBe("partial");
+
+      await rm(paths.root, { recursive: true });
+      await initializeProjectState(paths);
+      await expect(initializeProjectState(paths)).rejects.toThrow("ready");
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a configuration directory as partial state", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+    const paths = resolveLocalProjectPaths(workspace);
+    try {
+      await mkdir(paths.configPath, { recursive: true });
+      await mkdir(paths.agentsRoot);
+      await mkdir(paths.skillsRoot);
+
+      expect(await inspectProjectState(paths)).toBe("partial");
+      await expect(initializeProjectState(paths)).rejects.toThrow("partial");
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+});

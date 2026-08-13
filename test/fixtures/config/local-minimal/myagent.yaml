@@ -1,0 +1,16 @@
+version: 2
+server:
+  host: 127.0.0.1
+  port: 8787
+  bearerToken:
+    fromEnvironment: MYAGENT_BEARER_TOKEN
+  adminToken:
+    fromEnvironment: MYAGENT_ADMIN_TOKEN
+database:
+  path: state.sqlite
+  busyTimeoutMs: 5000
+agentRoots:
+  - agents
+skillRoots:
+  - skills
+toolEnvironmentAllowlist: []

@@ -103,6 +103,11 @@ export const globalConfigV2Schema = z.strictObject({
   }),
 });
 
+/** The intentionally model-free configuration written for a new local project. */
+export const localProjectConfigSchema = globalConfigV2Schema.omit({
+  modelControl: true,
+});
+
 export const agentConfigV2Schema = z.strictObject({
   id: z.string().regex(AGENT_ID_PATTERN),
   displayName: z.string().min(1),
