@@ -1,4 +1,5 @@
 import type { JsonValue } from "../../domain/json.js";
+import { isValidProviderCompatibilityRuntime } from "../../domain/pi-runtime.js";
 import {
   ModelProviderError,
   type ModelChunk,
@@ -24,6 +25,9 @@ export class PiAiModelAdapter implements ModelPort {
     if (signal.aborted) throw abortError();
     const contract = request.model.piRuntime;
     if (contract === undefined) throw protocolError();
+    if (!isValidProviderCompatibilityRuntime(contract)) {
+      throw protocolError();
+    }
     if (!isValidPiContextInput(request.input)) throw protocolError();
     const route = this.options.gateway.routeFor(request.model);
     let toolCall: { id: string; name: string; arguments: string } | undefined;
@@ -34,6 +38,7 @@ export class PiAiModelAdapter implements ModelPort {
       for await (const event of this.options.client.stream({
         contract,
         route,
+        purpose: request.purpose,
         input: request.input,
         tools: request.tools,
         toolChoice: request.toolChoice,
@@ -124,7 +129,9 @@ function finishReasonFromPi(reason: "stop" | "length" | "toolUse"): ModelFinishR
 function providerError(event: {
   status?: number;
   retryAfterMs?: number;
+  protocolError?: boolean;
 }): ModelProviderError {
+  if (event.protocolError === true) return protocolError();
   const { status } = event;
   if (status === undefined) {
     return new ModelProviderError({ transient: true, code: "provider_unavailable" });

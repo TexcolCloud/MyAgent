@@ -17,6 +17,7 @@ import {
 import { NodeProviderHttpTransport } from "../../src/adapters/provider-http-transport.js";
 import { providerConnectionRevisionIdFromUuid } from "../../src/domain/ids.js";
 import type { ModelChunk, ModelInput, ModelRequest } from "../../src/ports/model.js";
+import { FakeOpenAiProvider } from "../helpers/fake-openai-provider.js";
 
 describe("PiAiModelAdapter", () => {
   it("maps Pi text, usage, and one function call into ModelChunk values", async () => {
@@ -230,6 +231,104 @@ describe("PiAiModelAdapter", () => {
     expect(clientCalls).toBe(0);
     expect(routeCalls).toBe(0);
   });
+
+  it("rejects an unknown captured compatibility contract before provider egress", async () => {
+    let clientCalls = 0;
+    let routeCalls = 0;
+    const request = piRequest();
+    const model = new PiAiModelAdapter({
+      client: {
+        async *stream() {
+          clientCalls += 1;
+          yield { type: "text_delta", text: "must-not-run" };
+          yield {
+            type: "done",
+            reason: "stop",
+            usage: { inputTokens: 1, outputTokens: 1 },
+          };
+        },
+      },
+      gateway: {
+        routeFor() {
+          routeCalls += 1;
+          return { baseUrl: "unreachable", apiKey: "unreachable" };
+        },
+      },
+    });
+    const captured = {
+      ...request,
+      model: {
+        ...request.model,
+        piRuntime: {
+          ...request.model.piRuntime!,
+          providerCompatibilityContract: "unknown-v9",
+        },
+      },
+    } as unknown as ModelRequest;
+
+    const rejection = await collect(model.streamAttempt(captured, signal())).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(rejection).toMatchObject({ code: "model_protocol_error", transient: false });
+    expect(String(rejection)).not.toContain("unknown-v9");
+    expect(clientCalls).toBe(0);
+    expect(routeCalls).toBe(0);
+  });
+
+  it.each([
+    ["driver", { driverId: "pi/openai" }],
+    ["provider", { catalogProviderId: "openai" }],
+    ["API", { api: "openai-completions" }],
+    ["model", { modelId: "deepseek-chat" }],
+    ["Pi version", { piVersion: "0.74.0" }],
+    ["context window", { contextWindow: 128_000 }],
+    ["output limit", { maxOutputTokens: 8_192 }],
+    ["compatibility", { compatibility: { supportsUsageInStreaming: true } }],
+    ["null compatibility", { compatibility: null }],
+    ["missing compatibility", { compatibility: undefined }],
+  ] as const)(
+    "rejects a captured DeepSeek Responses contract paired with another %s before egress",
+    async (_case, override) => {
+      let clientCalls = 0;
+      let routeCalls = 0;
+      const request = deepSeekResponsesRequest("https://provider.invalid/v1");
+      const model = new PiAiModelAdapter({
+        client: {
+          async *stream() {
+            clientCalls += 1;
+            yield { type: "text_delta", text: "must-not-run" };
+            yield {
+              type: "done",
+              reason: "stop",
+              usage: { inputTokens: 1, outputTokens: 1 },
+            };
+          },
+        },
+        gateway: {
+          routeFor() {
+            routeCalls += 1;
+            return { baseUrl: "unreachable", apiKey: "unreachable" };
+          },
+        },
+      });
+      const captured = {
+        ...request,
+        model: {
+          ...request.model,
+          piRuntime: { ...request.model.piRuntime!, ...override },
+        },
+      } as unknown as ModelRequest;
+
+      const rejection = await collect(model.streamAttempt(captured, signal())).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(rejection).toMatchObject({ code: "model_protocol_error", transient: false });
+      expect(clientCalls).toBe(0);
+      expect(routeCalls).toBe(0);
+    },
+  );
 
   it("rejects a second Pi function call before emitting a terminal chunk", async () => {
     const chunks: ModelChunk[] = [];
@@ -471,6 +570,299 @@ describe("PiAiModelAdapter", () => {
 });
 
 describe("PiAiSdkClient", () => {
+  it.each([
+    ["a non-object body", "malformed"],
+    ["an array body", [{ store: true }]],
+    ["a missing model", { input: [], stream: true }],
+    ["a missing input", { model: "deepseek-v4-flash", stream: true }],
+    ["a missing stream flag", { model: "deepseek-v4-flash", input: [] }],
+    ["non-array input", { model: "deepseek-v4-flash", input: {}, stream: true }],
+    ["a non-array tools field", {
+      model: "deepseek-v4-flash", input: [], stream: true, tools: {},
+    }],
+    ["a non-object tool", {
+      model: "deepseek-v4-flash", input: [], stream: true, tools: ["bad-tool"],
+    }],
+  ] as const)("rejects %s in the DeepSeek payload hook", async (_case, payload) => {
+    const client = new PiAiSdkClient({
+      stream: async function* (model, _context, options) {
+        await options?.onPayload?.(payload, model);
+        yield { type: "text_delta", delta: "accepted" } as never;
+        yield piDoneEvent(model, { input: 1, cacheRead: 0, cacheWrite: 0 });
+      },
+    });
+    const request = deepSeekResponsesRequest("https://provider.invalid/v1");
+
+    await expect(collect(new PiAiModelAdapter({
+      client,
+      gateway: gatewayRoute(),
+    }).streamAttempt(request, signal()))).rejects.toMatchObject({
+      code: "model_protocol_error",
+      transient: false,
+    });
+  });
+
+  it("does not forward an unwhitelisted malformed body through the gateway", async () => {
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{ type: "text", text: "must-not-run" }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const malformedPayload = [{ store: true, future_field: "must-not-cross" }];
+    const client = new PiAiSdkClient({
+      stream: async function* (model, _context, options) {
+        const transformed = await options?.onPayload?.(malformedPayload, model);
+        const response = await fetch(`${model.baseUrl}/responses`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${options?.apiKey ?? ""}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(transformed ?? malformedPayload),
+        });
+        await response.text();
+        yield { type: "text_delta", delta: "accepted" } as never;
+        yield piDoneEvent(model, { input: 1, cacheRead: 0, cacheWrite: 0 });
+      },
+    });
+    const request = deepSeekResponsesRequest(provider.baseUrl);
+
+    try {
+      await expect(collect(new PiAiModelAdapter({ client, gateway }).streamAttempt(
+        request,
+        signal(),
+      ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+      expect(provider.responsesRequests).toHaveLength(0);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
+  it("maps Pi's swallowed payload validation error to a non-transient protocol error", async () => {
+    const client = new PiAiSdkClient({
+      stream: async function* (model) {
+        yield {
+          type: "error",
+          reason: "error",
+          error: {
+            role: "assistant",
+            content: [],
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "error",
+            errorMessage: "pi_payload_protocol_error",
+            timestamp: 0,
+          },
+        } as never;
+      },
+    });
+
+    await expect(collect(new PiAiModelAdapter({
+      client,
+      gateway: gatewayRoute(),
+    }).streamAttempt(
+      deepSeekResponsesRequest("https://provider.invalid/v1"),
+      signal(),
+    ))).rejects.toMatchObject({ code: "model_protocol_error", transient: false });
+  });
+
+  it("whitelists the DeepSeek Responses verification payload after Pi serialization", async () => {
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{
+        type: "tool",
+        callId: "provider-verification-call",
+        name: "capability_probe",
+        arguments: { nonce: "00000000-0000-4000-8000-000000000001" },
+      }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const request = deepSeekResponsesRequest(provider.baseUrl, {
+      purpose: "verification_tool",
+      input: [{
+        type: "message",
+        role: "user",
+        content: "Call capability_probe with nonce 00000000-0000-4000-8000-000000000001",
+      }],
+      tools: [capabilityProbeTool()],
+      toolChoice: "required",
+    });
+
+    try {
+      await collect(new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway,
+      }).streamAttempt(request, signal()));
+
+      expect(provider.responsesRequests).toHaveLength(1);
+      const body = provider.responsesRequests[0]!.body as Record<string, unknown>;
+      expect(body).toMatchObject({
+        model: "deepseek-v4-flash",
+        stream: true,
+        input: expect.any(Array),
+        tools: [expect.any(Object)],
+        tool_choice: "required",
+      });
+      expect(body).not.toHaveProperty("store");
+      expect(body).not.toHaveProperty("parallel_tool_calls");
+      expect(body.tools).toEqual([
+        expect.not.objectContaining({ strict: expect.anything() }),
+      ]);
+      expect(Object.keys(body).sort()).toEqual([
+        "input",
+        "model",
+        "stream",
+        "tool_choice",
+        "tools",
+      ]);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
+  it("omits tool choice from a regular DeepSeek Responses run with tools", async () => {
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{ type: "text", text: "done" }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const request = deepSeekResponsesRequest(provider.baseUrl, {
+      tools: [capabilityProbeTool()],
+    });
+
+    try {
+      await collect(new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway,
+      }).streamAttempt(request, signal()));
+
+      expect(provider.responsesRequests).toHaveLength(1);
+      const body = provider.responsesRequests[0]!.body as Record<string, unknown>;
+      expect(body).not.toHaveProperty("tool_choice");
+      expect(Object.keys(body).sort()).toEqual(["input", "model", "stream", "tools"]);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
+  it("preserves the provider call ID in a whitelisted DeepSeek Responses continuation", async () => {
+    const providerCallId = "provider-continuation-call";
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{ type: "text", text: "continued" }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const request = deepSeekResponsesRequest(provider.baseUrl, {
+      input: [
+        { type: "message", role: "user", content: "Probe it" },
+        {
+          type: "assistant_tool_call",
+          callId: providerCallId,
+          name: "capability_probe",
+          arguments: { nonce: "continuation-nonce" },
+        },
+        {
+          type: "tool_result",
+          callId: providerCallId,
+          name: "capability_probe",
+          output: { accepted: true },
+        },
+      ],
+      tools: [capabilityProbeTool()],
+    });
+
+    try {
+      await collect(new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway,
+      }).streamAttempt(request, signal()));
+
+      expect(provider.responsesRequests).toHaveLength(1);
+      const body = provider.responsesRequests[0]!.body as Record<string, unknown>;
+      expect(body).not.toHaveProperty("tool_choice");
+      expect(body).not.toHaveProperty("store");
+      expect(body).not.toHaveProperty("parallel_tool_calls");
+      expect(body.tools).toEqual([
+        expect.not.objectContaining({ strict: expect.anything() }),
+      ]);
+      expect(body.input).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "function_call", call_id: providerCallId }),
+        expect.objectContaining({ type: "function_call_output", call_id: providerCallId }),
+      ]));
+      expect(Object.keys(body).sort()).toEqual(["input", "model", "stream", "tools"]);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
+  it("keeps the existing manual Responses transform for the same DeepSeek model ID", async () => {
+    const provider = await FakeOpenAiProvider.start({
+      responses: [{ type: "text", text: "manual" }],
+    });
+    const gateway = await new ProviderEgressGateway({
+      transport: new NodeProviderHttpTransport({
+        secretResolver: { resolve: () => "must-not-resolve" },
+      }),
+    }).start();
+    const request = deepSeekResponsesRequest(provider.baseUrl, {
+      purpose: "verification_tool",
+      tools: [capabilityProbeTool()],
+      toolChoice: "required",
+      model: {
+        ...deepSeekResponsesRequest(provider.baseUrl).model,
+        piRuntime: {
+          ...deepSeekResponsesRequest(provider.baseUrl).model.piRuntime!,
+          driverId: "pi/openai-compatible",
+          providerCompatibilityContract: "none",
+        },
+      },
+    });
+
+    try {
+      await collect(new PiAiModelAdapter({
+        client: new PiAiSdkClient(),
+        gateway,
+      }).streamAttempt(request, signal()));
+
+      expect(provider.responsesRequests).toHaveLength(1);
+      const body = provider.responsesRequests[0]!.body as Record<string, unknown>;
+      expect(body).not.toHaveProperty("tool_choice");
+      expect(body).not.toHaveProperty("store");
+      expect(body).toHaveProperty("parallel_tool_calls", false);
+      expect(body.tools).toEqual([
+        expect.not.objectContaining({ strict: expect.anything() }),
+      ]);
+    } finally {
+      await gateway.stop();
+      await provider.close();
+    }
+  });
+
   it("constructs the Pi model and context only from the frozen contract and gateway route", async () => {
     const captured: Array<{ model: unknown; context: unknown; options: unknown }> = [];
     let transformedPayload: unknown;
@@ -565,6 +957,7 @@ describe("PiAiSdkClient", () => {
     const clientInput = {
       contract: request.model.piRuntime!,
       route,
+      purpose: request.purpose,
       input: request.input,
       tools: request.tools,
       toolChoice: request.toolChoice,
@@ -684,6 +1077,7 @@ function piRequest(overrides: Partial<ModelRequest> = {}): ModelRequest {
         driverId: "pi/deepseek",
         catalogProviderId: "deepseek",
         api: "openai-completions",
+        providerCompatibilityContract: "none",
         modelId: "deepseek-v4-flash",
         contextWindow: 8_192,
         maxOutputTokens: 2_048,
@@ -693,6 +1087,47 @@ function piRequest(overrides: Partial<ModelRequest> = {}): ModelRequest {
     input: [{ type: "message", role: "user", content: "Hello" }],
     tools: [],
     ...overrides,
+  };
+}
+
+function deepSeekResponsesRequest(
+  baseUrl: string,
+  overrides: Partial<ModelRequest> = {},
+): ModelRequest {
+  const base = piRequest();
+  return {
+    ...base,
+    model: {
+      ...base.model,
+      baseUrl,
+      allowInsecureHttp: true,
+      invocationProtocol: "pi_ai",
+      piRuntime: {
+        ...base.model.piRuntime!,
+        api: "openai-responses",
+        providerCompatibilityContract: "deepseek-responses-v1",
+        contextWindow: 1_000_000,
+        maxOutputTokens: 384_000,
+        compatibility: {
+          requiresReasoningContentOnAssistantMessages: true,
+          thinkingFormat: "deepseek",
+        },
+      },
+    },
+    ...overrides,
+  };
+}
+
+function capabilityProbeTool(): ModelRequest["tools"][number] {
+  return {
+    name: "capability_probe",
+    description: "Return the supplied nonce",
+    inputSchema: {
+      type: "object",
+      properties: { nonce: { type: "string" } },
+      required: ["nonce"],
+      additionalProperties: false,
+    },
   };
 }
 

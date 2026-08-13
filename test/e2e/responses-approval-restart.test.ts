@@ -18,7 +18,7 @@ describe("Responses Approval restart recovery", () => {
 
     try {
       const provider = cleanup.use(await FakeOpenAiProvider.start({
-        models: ["responses-approval-model"],
+        models: ["deepseek-v4-flash"],
         responses: [
         { type: "verification_text", text: "responses verification passed" },
         { type: "verification_tool", callId: "verify-responses-approval" },
@@ -45,8 +45,11 @@ describe("Responses Approval restart recovery", () => {
         connectionSlug: "responses-approval",
         profileSlug: "responses-approval",
         providerBaseUrl: provider.baseUrl,
-        modelId: "responses-approval-model",
+        modelId: "deepseek-v4-flash",
         protocol: "responses",
+        driverId: "pi/deepseek",
+        catalogCandidateId: "pi/deepseek:deepseek-v4-flash-responses",
+        apiKeyEnvironment: "MYAGENT_BEARER_TOKEN",
         agentId: "primary",
       });
       provider.clearCapturedRequests();

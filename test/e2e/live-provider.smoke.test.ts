@@ -5,7 +5,15 @@ import { describe, expect, it } from "vitest";
 
 import { startRealTestApp } from "../helpers/start-test-app.js";
 
+const deepseekResponsesModel = "deepseek-v4-flash";
+const deepseekResponsesCandidate = "pi/deepseek:deepseek-v4-flash-responses";
+const unsupportedDeepSeekModel = process.env.MYAGENT_DEEPSEEK_MODEL !== undefined &&
+  process.env.MYAGENT_DEEPSEEK_MODEL !== deepseekResponsesModel;
 const settings = smokeSettings();
+
+it.skipIf(!unsupportedDeepSeekModel)("rejects unsupported DeepSeek variants before provider setup", () => {
+  throw new Error("deepseek_responses_variant_requires_v4_flash");
+});
 
 describe.skipIf(settings === null)("live Pi DeepSeek provider smoke", () => {
   it("discovers, verifies, assigns, and completes one contained no-Tool Pi Run", async () => {
@@ -19,10 +27,10 @@ describe.skipIf(settings === null)("live Pi DeepSeek provider smoke", () => {
         connectionSlug: "deepseek-live",
         profileSlug: "deepseek-live",
         providerBaseUrl: settings.baseUrl,
-        modelId: settings.model,
+        modelId: deepseekResponsesModel,
         protocol: "responses",
         driverId: "pi/deepseek",
-        catalogCandidateId: `pi/deepseek:${settings.model}`,
+        catalogCandidateId: deepseekResponsesCandidate,
         apiKeyEnvironment: settings.apiKeyEnvironment,
         agentId: "primary",
         verificationTimeoutMs: 120_000,
@@ -49,7 +57,9 @@ describe.skipIf(settings === null)("live Pi DeepSeek provider smoke", () => {
                   json_extract(agent_revisions.content_json, '$.model.piRuntime.piVersion')
                     AS pi_version,
                   json_extract(agent_revisions.content_json, '$.model.piRuntime.driverId')
-                    AS driver_id
+                    AS driver_id,
+                  json_extract(agent_revisions.content_json, '$.model.piRuntime.providerCompatibilityContract')
+                    AS provider_compatibility_contract
            FROM runs JOIN agent_revisions
              ON agent_revisions.revision_id = runs.agent_revision_id
            WHERE runs.run_id = ?`,
@@ -57,6 +67,7 @@ describe.skipIf(settings === null)("live Pi DeepSeek provider smoke", () => {
           protocol: "pi_ai",
           pi_version: "0.73.1",
           driver_id: "pi/deepseek",
+          provider_compatibility_contract: "deepseek-responses-v1",
         });
       } finally {
         database.close();
@@ -71,19 +82,18 @@ describe.skipIf(settings === null)("live Pi DeepSeek provider smoke", () => {
 });
 
 function smokeSettings(): {
-  model: string;
   baseUrl: string;
   apiKeyEnvironment: "MYAGENT_DEEPSEEK_API_KEY";
 } | null {
   const baseUrl = process.env.MYAGENT_DEEPSEEK_BASE_URL;
   const apiKey = process.env.MYAGENT_DEEPSEEK_API_KEY;
+  if (unsupportedDeepSeekModel) return null;
   if (
     baseUrl === undefined || baseUrl.length === 0 ||
     apiKey === undefined || apiKey.length === 0
   ) return null;
   return {
     baseUrl,
-    model: process.env.MYAGENT_DEEPSEEK_MODEL || "deepseek-v4-flash",
     apiKeyEnvironment: "MYAGENT_DEEPSEEK_API_KEY",
   };
 }

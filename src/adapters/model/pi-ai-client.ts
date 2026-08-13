@@ -27,12 +27,14 @@ export type PiStreamEvent =
       reason: "aborted" | "error";
       status?: number;
       retryAfterMs?: number;
+      protocolError?: boolean;
     };
 
 export interface PiAiClient {
   stream(input: {
     contract: PiRuntimeContract;
     route: PiGatewayRoute;
+    purpose: ModelRequest["purpose"];
     input: readonly ModelInput[];
     tools: ModelRequest["tools"];
     toolChoice: ModelRequest["toolChoice"];
@@ -60,6 +62,7 @@ export class PiAiSdkClient implements PiAiClient {
   async *stream(input: {
     contract: PiRuntimeContract;
     route: PiGatewayRoute;
+    purpose: ModelRequest["purpose"];
     input: readonly ModelInput[];
     tools: ModelRequest["tools"];
     toolChoice: ModelRequest["toolChoice"];
@@ -76,45 +79,53 @@ export class PiAiSdkClient implements PiAiClient {
         : { maxTokens: input.contract.maxOutputTokens }),
       ...(input.toolChoice === undefined ? {} : { toolChoice: input.toolChoice }),
       maxRetries: 0,
-      onPayload: (payload) => transformPayload(input.contract, payload),
+      onPayload: (payload) => transformPayload(input.contract, input.purpose, payload),
       onResponse(response) {
         status = response.status;
         retryAfterMs = parseRetryAfter(response.headers);
       },
     });
 
-    for await (const event of events) {
-      if (event.type === "text_delta") {
-        if (event.delta.length > 0) yield { type: "text_delta", text: event.delta };
-      } else if (event.type === "toolcall_end") {
-        yield {
-          type: "tool_call",
-          id: event.toolCall.id,
-          name: event.toolCall.name,
-          arguments: JSON.stringify(event.toolCall.arguments),
-        };
-      } else if (event.type === "done") {
-        yield {
-          type: "done",
-          reason: event.reason,
-          usage: {
-            inputTokens: totalInputTokens(event.message.usage),
-            outputTokens: event.message.usage.output,
-          },
-        };
-      } else if (event.type === "error") {
-        const metadata = gatewayErrorMetadata(event.error.errorMessage);
-        yield {
-          type: "error",
-          reason: event.reason,
-          ...(status === undefined
-            ? metadata?.status === undefined ? {} : { status: metadata.status }
-            : { status }),
-          ...(retryAfterMs === undefined
-            ? metadata?.retryAfterMs === undefined ? {} : { retryAfterMs: metadata.retryAfterMs }
-            : { retryAfterMs }),
-        };
+    try {
+      for await (const event of events) {
+        if (event.type === "text_delta") {
+          if (event.delta.length > 0) yield { type: "text_delta", text: event.delta };
+        } else if (event.type === "toolcall_end") {
+          yield {
+            type: "tool_call",
+            id: event.toolCall.id,
+            name: event.toolCall.name,
+            arguments: JSON.stringify(event.toolCall.arguments),
+          };
+        } else if (event.type === "done") {
+          yield {
+            type: "done",
+            reason: event.reason,
+            usage: {
+              inputTokens: totalInputTokens(event.message.usage),
+              outputTokens: event.message.usage.output,
+            },
+          };
+        } else if (event.type === "error") {
+          const metadata = gatewayErrorMetadata(event.error.errorMessage);
+          yield {
+            type: "error",
+            reason: event.reason,
+            ...(event.error.errorMessage === PI_PAYLOAD_PROTOCOL_ERROR
+              ? { protocolError: true }
+              : {}),
+            ...(status === undefined
+              ? metadata?.status === undefined ? {} : { status: metadata.status }
+              : { status }),
+            ...(retryAfterMs === undefined
+              ? metadata?.retryAfterMs === undefined ? {} : { retryAfterMs: metadata.retryAfterMs }
+              : { retryAfterMs }),
+          };
+        }
       }
+    } catch (error) {
+      if (error instanceof PiPayloadProtocolError) throw protocolError();
+      throw error;
     }
   }
 }
@@ -230,8 +241,12 @@ function assistantMessage(
 
 function transformPayload(
   contract: PiRuntimeContract,
+  purpose: ModelRequest["purpose"],
   payload: unknown,
 ): unknown | undefined {
+  if (contract.providerCompatibilityContract === "deepseek-responses-v1") {
+    return deepSeekResponsesPayload(purpose, payload);
+  }
   if (
     contract.api !== "openai-completions" &&
     contract.api !== "openai-responses" &&
@@ -250,18 +265,68 @@ function transformPayload(
   return { ...sanitized, parallel_tool_calls: false };
 }
 
+function deepSeekResponsesPayload(
+  purpose: ModelRequest["purpose"],
+  payload: unknown,
+): Record<string, unknown> | undefined {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new PiPayloadProtocolError();
+  }
+  const source = payload as Record<string, unknown>;
+  if (
+    typeof source.model !== "string" || source.model.length === 0 ||
+    !Array.isArray(source.input) || source.stream !== true
+  ) {
+    throw new PiPayloadProtocolError();
+  }
+  const sanitized: Record<string, unknown> = {
+    model: source.model,
+    input: source.input,
+    stream: source.stream,
+  };
+  if (Object.hasOwn(source, "tools")) {
+    if (!Array.isArray(source.tools) || !source.tools.every(isUnknownRecord)) {
+      throw new PiPayloadProtocolError();
+    }
+    sanitized.tools = source.tools.map(omitToolStrict);
+  }
+  if (
+    purpose === "verification_tool" &&
+    Array.isArray(sanitized.tools) &&
+    sanitized.tools.length > 0
+  ) {
+    sanitized.tool_choice = "required";
+  }
+  return sanitized;
+}
+
+const PI_PAYLOAD_PROTOCOL_ERROR = "pi_payload_protocol_error";
+
+class PiPayloadProtocolError extends Error {
+  constructor() {
+    super(PI_PAYLOAD_PROTOCOL_ERROR);
+    this.name = "PiPayloadProtocolError";
+  }
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function omitToolStrict(tool: unknown): unknown {
+  if (typeof tool !== "object" || tool === null || Array.isArray(tool)) return tool;
+  const sanitized = { ...tool } as Record<string, unknown>;
+  delete sanitized.strict;
+  return sanitized;
+}
+
 function omitManualResponsesCompatibilityFields(
   payload: object,
 ): Record<string, unknown> {
   const sanitized = { ...payload } as Record<string, unknown>;
   delete sanitized.store;
   if (Array.isArray(sanitized.tools)) {
-    sanitized.tools = sanitized.tools.map((tool) => {
-      if (typeof tool !== "object" || tool === null || Array.isArray(tool)) return tool;
-      const sanitizedTool = { ...tool } as Record<string, unknown>;
-      delete sanitizedTool.strict;
-      return sanitizedTool;
-    });
+    sanitized.tools = sanitized.tools.map(omitToolStrict);
   }
   return sanitized;
 }

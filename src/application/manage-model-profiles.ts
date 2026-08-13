@@ -199,6 +199,7 @@ function requiredText(value: string): string {
 function freezePiRuntime(runtime: PiRuntimeContract): PiRuntimeContract {
   return Object.freeze({
     ...runtime,
+    providerCompatibilityContract: runtime.providerCompatibilityContract,
     compatibility: Object.freeze({ ...runtime.compatibility }),
   });
 }
