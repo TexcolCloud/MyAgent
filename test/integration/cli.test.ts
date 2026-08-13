@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { fileURLToPath } from "node:url";
@@ -207,6 +207,36 @@ describe("CLI HTTP boundary", () => {
     });
   });
 
+  it("rejects a linked local state root before any local state action", async (context) => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-linked-root-${randomUUID()}`);
+    const outside = tempPath(`cli-local-linked-root-outside-${randomUUID()}`);
+    await mkdir(workspace, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(path.join(outside, "keep.txt"), "keep\n");
+    try {
+      await symlink(outside, path.join(workspace, ".myagent"), "junction");
+    } catch (error) {
+      if (!hasCode(error, "EPERM") && !hasCode(error, "EACCES")) throw error;
+      context.skip(`junction creation unavailable: ${String((error as Error).message)}`);
+    }
+    const inspectProjectState = vi.fn(async () => "ready" as const);
+    const runLocalHost = vi.fn(async () => 0);
+
+    await expect(executeCli([], {
+      workspace,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      inspectProjectState,
+      runLocalHost,
+      writeError: () => {},
+    })).resolves.toBe(2);
+
+    expect(inspectProjectState).not.toHaveBeenCalled();
+    expect(runLocalHost).not.toHaveBeenCalled();
+    expect(await readdir(outside)).toEqual(["keep.txt"]);
+  });
+
   it.each([
     {
       name: "incompatible",
@@ -267,6 +297,50 @@ describe("CLI HTTP boundary", () => {
       expect(inspectProjectState).not.toHaveBeenCalled();
       expect(runLocalHost).not.toHaveBeenCalled();
     }
+  });
+
+  it("rejects a linked durable path in an otherwise compatible explicit config", async (context) => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-linked-agents-${randomUUID()}`);
+    const root = path.join(workspace, ".myagent");
+    const outside = tempPath(`cli-local-linked-agents-outside-${randomUUID()}`);
+    const configPath = path.join(workspace, "controlled", "local.yaml");
+    await mkdir(root, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await mkdir(path.dirname(configPath), { recursive: true });
+    await writeFile(path.join(outside, "keep.txt"), "keep\n");
+    try {
+      await symlink(outside, path.join(root, "agents"), "junction");
+    } catch (error) {
+      if (!hasCode(error, "EPERM") && !hasCode(error, "EACCES")) throw error;
+      context.skip(`junction creation unavailable: ${String((error as Error).message)}`);
+    }
+    await writeFile(configPath, [
+      "version: 2",
+      "server:",
+      "  bearerToken: { fromEnvironment: RUN_TOKEN }",
+      "  adminToken: { fromEnvironment: ADMIN_TOKEN }",
+      "database: { path: ../.myagent/state.sqlite }",
+      "agentRoots: [../.myagent/agents]",
+      "skillRoots: [../.myagent/skills]",
+      "toolEnvironmentAllowlist: []",
+      "",
+    ].join("\n"));
+    const inspectProjectState = vi.fn(async () => "ready" as const);
+    const runLocalHost = vi.fn(async () => 0);
+
+    await expect(executeCli(["tui", "--config", configPath], {
+      workspace,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      inspectProjectState,
+      runLocalHost,
+      writeError: () => {},
+    })).resolves.toBe(2);
+
+    expect(inspectProjectState).not.toHaveBeenCalled();
+    expect(runLocalHost).not.toHaveBeenCalled();
+    expect(await readdir(outside)).toEqual(["keep.txt"]);
   });
 
   it("fails noninteractively before creating absent project state", async () => {
@@ -752,6 +826,13 @@ describe("CLI HTTP boundary", () => {
     }
   });
 });
+
+function hasCode(error: unknown, code: string): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && error.code === code;
+}
 
 function injectFetcher(app: FastifyInstance, beforeRequest?: (url: URL) => void): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {

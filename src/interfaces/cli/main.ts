@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { loadBootConfig } from "../../config/boot-config.js";
@@ -255,6 +255,7 @@ async function executeLocalTui(flags: CliFlags, options: ExecuteCliOptions): Pro
     options.workspace ?? process.cwd(),
     explicitConfigPath,
   );
+  await assertPhysicallyConfinedLocalState(paths);
   if (explicitConfigPath !== undefined) {
     await assertWorkspaceOwnedLocalConfig(paths);
   }
@@ -302,6 +303,61 @@ async function assertWorkspaceOwnedLocalConfig(
   if (durablePaths.some((candidate) => !isPathWithin(paths.root, candidate))) {
     throw localConfigOutsideProjectState();
   }
+  await Promise.all(durablePaths.map((candidate) =>
+    assertPhysicallyConfinedPath(paths.root, candidate)));
+}
+
+async function assertPhysicallyConfinedLocalState(
+  paths: LocalProjectPaths,
+): Promise<void> {
+  try {
+    const canonicalWorkspace = await canonicalizeExistingPath(paths.workspace);
+    const canonicalRoot = await canonicalizeExistingPath(paths.root);
+    if (!isPathWithin(canonicalWorkspace, canonicalRoot)) {
+      throw localConfigOutsideProjectState();
+    }
+    await assertPhysicallyConfinedPath(paths.workspace, paths.root);
+  } catch (error) {
+    if (error instanceof CliUsageError) throw error;
+    throw localConfigOutsideProjectState();
+  }
+}
+
+async function assertPhysicallyConfinedPath(
+  root: string,
+  candidate: string,
+): Promise<void> {
+  const canonicalRoot = await canonicalizeExistingPath(root);
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  let current = canonicalRoot;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    try {
+      current = await realpath(path.join(current, segment));
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return;
+      throw localConfigOutsideProjectState();
+    }
+    if (!isPathWithin(canonicalRoot, current)) {
+      throw localConfigOutsideProjectState();
+    }
+  }
+}
+
+async function canonicalizeExistingPath(candidate: string): Promise<string> {
+  let current = path.resolve(candidate);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      const canonical = await realpath(current);
+      return path.join(canonical, ...missing.reverse());
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOENT")) throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
 }
 
 function localConfigOutsideProjectState(): CliUsageError {
@@ -326,6 +382,13 @@ async function isFile(candidate: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && error.code === code;
 }
 
 function normalizeAttachedOrigin(value: string): URL {
