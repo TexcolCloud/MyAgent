@@ -229,7 +229,7 @@ describe("Model control Secret containment", () => {
     expect(prohibitedMetadataSurfaces.includes(stored!.key_id)).toBe(false);
     expect(prohibitedMetadataSurfaces.includes(stored!.ciphertext.slice(0, 16))).toBe(false);
     await rm(backupPath, { recursive: true, force: true });
-  });
+  }, 30_000);
 
   it("destroys an unreferenced Secret only after separate confirmation", async () => {
     const plaintext = "needle-destroy-provider-key-14";

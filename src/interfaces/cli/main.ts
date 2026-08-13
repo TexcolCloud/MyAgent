@@ -256,7 +256,9 @@ async function executeLocalTui(flags: CliFlags, options: ExecuteCliOptions): Pro
     explicitConfigPath,
   );
   await assertPhysicallyConfinedLocalState(paths);
-  if (explicitConfigPath !== undefined) {
+  const defaultConfigReady = explicitConfigPath === undefined &&
+    await inspectProjectState(paths) === "ready";
+  if (explicitConfigPath !== undefined || defaultConfigReady) {
     await assertWorkspaceOwnedLocalConfig(paths);
   }
   const inspect = options.inspectProjectState ?? inspectProjectState;
@@ -279,7 +281,7 @@ async function executeLocalTui(flags: CliFlags, options: ExecuteCliOptions): Pro
     }
     await (options.initializeProjectState ?? initializeProjectState)(paths);
   }
-  if (explicitConfigPath === undefined) {
+  if (explicitConfigPath === undefined && !defaultConfigReady) {
     await assertWorkspaceOwnedLocalConfig(paths);
   }
   if (options.runLocalHost !== undefined) {

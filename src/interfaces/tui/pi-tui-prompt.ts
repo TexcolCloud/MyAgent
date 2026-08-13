@@ -38,7 +38,6 @@ const theme: SelectListTheme = {
 export class PiTuiPrompt implements CliPrompt {
   private pending = false;
   private cancelPending: (() => void) | undefined;
-  private activeDialog: Component | undefined;
 
   constructor(private readonly dialogs: PiTuiDialogHost) {}
 
@@ -90,10 +89,6 @@ export class PiTuiPrompt implements CliPrompt {
 
   cancel(): void { this.cancelPending?.(); }
 
-  focus(): void {
-    if (this.activeDialog !== undefined) this.dialogs.setFocus(this.activeDialog);
-  }
-
   private editor(message: string, initial: string): Promise<string> {
     return this.open<string>((finish, cancel) => {
       const editor = new Editor(this.dialogs as unknown as TUI, {
@@ -123,7 +118,6 @@ export class PiTuiPrompt implements CliPrompt {
         overlay.handle?.hide();
         this.pending = false;
         this.cancelPending = undefined;
-        this.activeDialog = undefined;
         complete();
       };
       const dialog = create(
@@ -131,7 +125,6 @@ export class PiTuiPrompt implements CliPrompt {
         (clear) => close(() => reject(new CliPromptCancelledError()), clear),
         (clear) => { cancellationCleanup = clear; },
       );
-      this.activeDialog = dialog;
       overlay.handle = this.dialogs.showOverlay(dialog);
       this.cancelPending = () => close(() => reject(new CliPromptCancelledError()), cancellationCleanup);
       this.dialogs.setFocus(dialog);

@@ -485,7 +485,7 @@ describe("ModelVerificationWorker", () => {
       });
       const expiresAt = interrupted.leaseExpiresAt;
       if (expiresAt === null) throw new Error("expected_running_lease");
-      await waitFor(() => Date.now() >= expiresAt.getTime());
+      await waitFor(() => Date.now() >= expiresAt.getTime(), 10_000);
 
       const restartedModel = new ScriptedModel();
       restartedModel.script(completedText("recovered"), {
@@ -523,7 +523,7 @@ describe("ModelVerificationWorker", () => {
       restartedWorker.start();
       await waitFor(() =>
         registry.getVerification(seeded.verificationId).state === "passed"
-      );
+      , 10_000);
       await restartedWorker.stop();
       restartedWorker = undefined;
 

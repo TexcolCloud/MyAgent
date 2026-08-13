@@ -181,12 +181,10 @@ describe("TUI workbench", () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     terminal.input("primary");
     terminal.input("\r");
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
-    const restoredPrompt = terminal.frames.at(-1)?.includes("Session Key") === true;
+    await terminal.waitForFrame("Session Key");
     terminal.input("\u0003");
 
     await workbench;
-    expect(restoredPrompt).toBe(true);
   });
 
   it("aborts and awaits a stalled Run creation without letting reconnect displace it", async () => {

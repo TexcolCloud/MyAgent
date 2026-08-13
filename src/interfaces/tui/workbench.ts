@@ -105,10 +105,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
         exitPrompt = undefined;
         handle.hide();
         if (confirmed) stopped();
-        else {
-          chatPrompt?.focus();
-          tui.requestRender();
-        }
+        else tui.requestRender();
       });
       exitPrompt = prompt;
       const handle: OverlayHandle = tui.showOverlay(prompt, { width: "75%", maxHeight: "80%" });
