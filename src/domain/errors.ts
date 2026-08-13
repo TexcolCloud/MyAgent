@@ -135,9 +135,11 @@ export const APPLICATION_ERROR_CODES = [
   "approval_already_resolved",
   "backup_destination_exists",
   "idempotency_conflict",
+  "invalid_managed_agent",
   "legacy_import_already_completed",
   "model_assignment_required",
   "model_provider_locked",
+  "managed_agent_exists",
   "reconciliation_result_too_large",
   "reconciliation_retry_cancelled_run",
   "reconciliation_retry_result_forbidden",
@@ -145,6 +147,7 @@ export const APPLICATION_ERROR_CODES = [
   "restart_required",
   "revision_conflict",
   "tool_call_already_reconciled",
+  "unmanaged_agent_root",
   "verification_required",
 ] as const;
 
@@ -156,11 +159,13 @@ export const CONTROL_PLANE_PROBLEM_CODES = [
   "insecure_provider_url",
   "invalid_model_context_window",
   "invalid_model_profile",
+  "invalid_managed_agent",
   "invalid_provider_connection",
   "invalid_provider_url",
   "legacy_assignment_forbidden",
   "legacy_import_already_completed",
   "manual_model_entry_required",
+  "managed_agent_exists",
   "model_assignment_required",
   "model_profile_not_found",
   "model_profile_revision_not_found",
@@ -176,6 +181,7 @@ export const CONTROL_PLANE_PROBLEM_CODES = [
   "secret_locked",
   "verification_required",
   "verification_terminal",
+  "unmanaged_agent_root",
 ] as const;
 
 export type ControlPlaneProblemCode =

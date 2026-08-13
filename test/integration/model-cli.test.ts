@@ -25,7 +25,7 @@ describe("model control CLI", () => {
     [["models", "set-default", "--model", "deepseek-flash", "--expected-revision", "0"], "PUT", "/v1/admin/default-model-profile", { profileId: "deepseek-flash", expectedRevision: 0 }],
     [["agents", "set-model", "--agent", "primary", "--profile-revision", "mpr_1", "--expected-revision", "0"], "PUT", "/v1/admin/agents/primary/model-assignment", { modelProfileRevisionId: "mpr_1", expectedRevision: 0 }],
     [["verifications", "get", "--verification", "ver_1"], "GET", "/v1/admin/model-verifications/ver_1", undefined],
-    [["secrets", "rotate-master-key", "--expected-revision", "4"], "POST", "/v1/admin/managed-secrets/master-key-rotation", { expectedRevision: 4 }],
+    [["internal", "secrets", "rotate-master-key", "--expected-revision", "4"], "POST", "/v1/admin/managed-secrets/master-key-rotation", { expectedRevision: 4 }],
   ] as const)("maps %j to the admin HTTP API", async (argumentsList, method, path, body) => {
     const calls: Array<{ method: string; path: string; body: unknown; authorization: string | null }> = [];
     const output: string[] = [];

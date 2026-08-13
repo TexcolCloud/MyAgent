@@ -5,6 +5,8 @@ import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } 
 import type { CancelRunService } from "../../application/cancel-run.js";
 import type { AssignModelService } from "../../application/assign-model.js";
 import type { CreateBackupService } from "../../application/create-backup.js";
+import type { CreateManagedAgentService } from "../../application/create-managed-agent.js";
+import type { DiagnosticReport } from "../../application/collect-diagnostics.js";
 import type { CreateRunService } from "../../application/create-run.js";
 import type { DecideApprovalService } from "../../application/decide-approval.js";
 import type { DeleteSessionService } from "../../application/delete-session.js";
@@ -24,7 +26,7 @@ import type { SessionLookupStore } from "../../ports/session-store.js";
 import type { ReconciliationStore } from "../../ports/tool-store.js";
 import { isAuthorized, isLoopbackPeer, tokensEqual } from "./auth.js";
 import { sendError, sendProblem } from "./problem.js";
-import { registerHealthRoutes, type ReadinessProbe } from "./routes/health.js";
+import { registerDiagnosticRoutes, registerHealthRoutes, type ReadinessProbe } from "./routes/health.js";
 import { registerAgentRoutes } from "./routes/agents.js";
 import { registerBackupRoutes } from "./routes/backups.js";
 import { registerApprovalRoutes } from "./routes/approvals.js";
@@ -37,6 +39,7 @@ import { registerModelProfileRoutes } from "./routes/model-profiles.js";
 import { registerModelVerificationRoutes } from "./routes/model-verifications.js";
 import { registerModelAssignmentRoutes } from "./routes/model-assignments.js";
 import { registerManagedSecretRoutes } from "./routes/managed-secrets.js";
+import { registerManagedAgentRoutes } from "./routes/managed-agents.js";
 import { registerProviderDriverRoutes } from "./routes/provider-drivers.js";
 import { serializeWithSchema } from "./schemas.js";
 import type { SseStreamOptions } from "./sse.js";
@@ -59,7 +62,7 @@ export interface HttpAppOptions {
   catalog?: CatalogService;
   prepareCatalogReload?: (candidate: CatalogSnapshot) => void;
   createRuns?: CreateRunService;
-  runs?: Pick<RunStore, "getRun" | "listEventsAfter">;
+  runs?: Pick<RunStore, "getRun" | "listActiveRuns" | "listHistory" | "listEventsAfter">;
   cancelRuns?: CancelRunService;
   approvals?: Pick<ApprovalStore, "listPending">;
   decideApprovals?: DecideApprovalService;
@@ -69,8 +72,10 @@ export interface HttpAppOptions {
   deleteSession?: DeleteSessionService;
   sse?: SseStreamOptions;
   createBackups?: CreateBackupService;
+  createManagedAgents?: CreateManagedAgentService;
   logger?: FastifyBaseLogger;
   readiness?: ReadinessProbe;
+  diagnostics?: () => Promise<DiagnosticReport>;
 }
 
 export function createHttpApp(options: HttpAppOptions): FastifyInstance {
@@ -102,6 +107,7 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
       : undefined;
     if (requestPath === "/v1/admin" || requestPath.startsWith("/v1/admin/")) {
       if (options.adminToken === undefined || !isAuthorized(authorization, options.adminToken)) {
+        request.log.warn({ code: "unauthorized" }, "HTTP request authentication failed");
         return sendProblem(reply, request, 401, "unauthorized", "Authentication is required.");
       }
       if (!isLoopbackPeer(request.raw.socket.remoteAddress)) {
@@ -111,6 +117,7 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
     }
     if (requestPath === "/v1" || requestPath.startsWith("/v1/")) {
       if (!isAuthorized(authorization, options.bearerToken)) {
+        request.log.warn({ code: "unauthorized" }, "HTTP request authentication failed");
         return sendProblem(reply, request, 401, "unauthorized", "Authentication is required.");
       }
     }
@@ -164,6 +171,18 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
       registerModelVerificationRoutes(api, options.modelControl!);
       registerModelAssignmentRoutes(api, options.modelControl!);
       registerManagedSecretRoutes(api, options.modelControl!);
+      done();
+    }, { prefix: "/v1/admin" });
+  }
+  if (options.createManagedAgents !== undefined) {
+    app.register((api, _routeOptions, done) => {
+      registerManagedAgentRoutes(api, options.createManagedAgents!);
+      done();
+    }, { prefix: "/v1/admin" });
+  }
+  if (options.diagnostics !== undefined) {
+    app.register((api, _routeOptions, done) => {
+      registerDiagnosticRoutes(api, options.diagnostics!);
       done();
     }, { prefix: "/v1/admin" });
   }

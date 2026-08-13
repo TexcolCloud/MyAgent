@@ -287,3 +287,27 @@ export const masterKeyRotationResponseSchema = z.strictObject({
   currentKeyId: z.string(),
   recordRevision: z.number().int().nonnegative(),
 });
+
+export type ProviderDriversResponse = z.infer<typeof providerDriversResponseSchema>;
+export type ProviderAuthInput = z.infer<typeof providerAuthInputSchema>;
+export type CreateProviderConnectionInput = z.infer<typeof createProviderConnectionSchema>;
+export type ReviseProviderConnectionInput = z.infer<typeof reviseProviderConnectionSchema>;
+export type ProviderConnectionResponse = z.infer<typeof providerConnectionResponseSchema>;
+export type ProviderConnectionsResponse = z.infer<typeof providerConnectionsResponseSchema>;
+export type DiscoverModelsInput = z.infer<typeof discoverModelsSchema>;
+export type DiscoveryResponse = z.infer<typeof discoveryResponseSchema>;
+export type CreateModelProfileInput = z.infer<typeof createModelProfileSchema>;
+export type ModelProfileResponse = z.infer<typeof modelProfileResponseSchema>;
+export type ModelProfilesResponse = z.infer<typeof modelProfilesResponseSchema>;
+export type QueueModelVerificationInput = z.infer<typeof queueModelVerificationSchema>;
+export type ExpectedRevisionInput = z.infer<typeof expectedRevisionSchema>;
+export type ConfirmedDestructionInput = z.infer<typeof confirmedDestructionSchema>;
+export type PromoteProviderConnectionInput = z.infer<typeof promoteProviderConnectionSchema>;
+export type PromoteModelProfileInput = z.infer<typeof promoteModelProfileSchema>;
+export type QueuedModelVerificationResponse = z.infer<typeof queuedModelVerificationResponseSchema>;
+export type ModelVerificationResponse = z.infer<typeof modelVerificationResponseSchema>;
+export type PutModelAssignmentInput = z.infer<typeof putModelAssignmentSchema>;
+export type ModelAssignmentResponse = z.infer<typeof modelAssignmentResponseSchema>;
+export type PutDefaultModelProfileInput = z.infer<typeof putDefaultModelProfileSchema>;
+export type DefaultModelProfileResponse = z.infer<typeof defaultModelProfileResponseSchema>;
+export type MasterKeyRotationResponse = z.infer<typeof masterKeyRotationResponseSchema>;

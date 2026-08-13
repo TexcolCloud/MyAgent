@@ -1,19 +1,19 @@
 import {
   CliPromptCancelledError,
-  setupModel,
   type CliPrompt,
   type CliPromptChoice,
   type SetupModelProgressCallback,
 } from "../../cli/commands/model-setup.js";
-import type { AdminClient, AdminRequestInit } from "../../cli/commands/providers.js";
 import { isRevisionConflict } from "../tui-client.js";
 
 export interface ModelSetupAdminClient {
-  adminRequest<T>(path: string, init?: {
-    method?: string;
-    body?: unknown;
-    idempotencyKey?: string;
-  }): Promise<T>;
+  runModelSetup(input: {
+    readonly prompt: CliPrompt;
+    readonly sleep: (milliseconds: number) => Promise<void>;
+    readonly write: (line: string) => void;
+    readonly onProgress?: SetupModelProgressCallback;
+    readonly signal?: AbortSignal;
+  }): Promise<number>;
 }
 
 export interface RunModelSetupScreenOptions {
@@ -33,35 +33,23 @@ export type ModelSetupScreenOutcome =
 
 export async function runModelSetupScreen(options: RunModelSetupScreenOptions): Promise<ModelSetupScreenOutcome> {
   const output: string[] = [];
-  const client: AdminClient = {
-    request: async <T>(path: string, init: AdminRequestInit = {}) => {
-      assertNotAborted(options.signal);
-      const result = await options.client.adminRequest<T>(path, {
-        ...(init.method === undefined ? {} : { method: init.method }),
-        ...(init.body === undefined ? {} : { body: init.body }),
-        ...(init.idempotencyKey === undefined ? {} : { idempotencyKey: init.idempotencyKey }),
-      });
-      assertNotAborted(options.signal);
-      return result;
-    },
-  };
   let exitCode: number;
   try {
-    exitCode = await setupModel(
-      client,
-      abortablePrompt(options.prompt, options.signal),
-      (milliseconds) => options.sleep === undefined
+    exitCode = await awaitCancellation(options.client.runModelSetup({
+      prompt: abortablePrompt(options.prompt, options.signal),
+      sleep: (milliseconds) => options.sleep === undefined
         ? delay(milliseconds, options.signal)
         : awaitCancellation(options.sleep(milliseconds), options.signal),
-      (line) => {
+      write: (line) => {
         output.push(line);
         options.write(line);
       },
-      true,
-      options.onProgress,
-    );
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+    }), options.signal);
   } catch (error) {
     output.length = 0;
+    if (error instanceof CliPromptCancelledError) return { status: "cancelled" };
     if (isRevisionConflict(error)) return { status: "conflict", reloadRequired: true };
     throw error;
   }
@@ -112,6 +100,7 @@ function awaitCancellation<T>(operation: Promise<T>, signal: AbortSignal | undef
 }
 
 function delay(milliseconds: number, signal: AbortSignal | undefined): Promise<void> {
+  assertNotAborted(signal);
   return new Promise((resolve, reject) => {
     const abort = () => {
       clearTimeout(timer);

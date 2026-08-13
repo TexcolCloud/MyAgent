@@ -14,8 +14,31 @@ export class CatalogService {
     return this.#snapshot;
   }
 
+  restoreIfCurrent(expected: CatalogSnapshot, replacement: CatalogSnapshot): boolean {
+    if (this.#snapshot !== expected) return false;
+    this.#snapshot = Object.freeze(replacement);
+    return true;
+  }
+
+  revision(): string {
+    return catalogRevision(this.#snapshot);
+  }
+
+  assertRevision(expectedRevision: string): void {
+    if (this.revision() !== expectedRevision) {
+      throw new ApplicationError("revision_conflict", 409);
+    }
+  }
+
   validate(): Promise<CatalogSnapshot> {
     return loadCatalog(this.#snapshot.configPath);
+  }
+
+  async refreshAndAssertRevision(expectedRevision: string): Promise<void> {
+    const candidate = await this.validate();
+    assertReloadableGlobal(this.#snapshot, candidate);
+    this.#snapshot = Object.freeze(candidate);
+    this.assertRevision(expectedRevision);
   }
 
   reload(): Promise<CatalogSnapshot>;
@@ -32,6 +55,23 @@ export class CatalogService {
     return result;
   }
 
+  reloadExpected<Result>(
+    expectedRevision: string,
+    prepare: (candidate: CatalogSnapshot) => Result,
+  ): Promise<Result>;
+  async reloadExpected<Result>(
+    expectedRevision: string,
+    prepare: (candidate: CatalogSnapshot) => Result,
+  ): Promise<Result> {
+    this.assertRevision(expectedRevision);
+    const candidate = await this.validate();
+    this.assertRevision(expectedRevision);
+    assertReloadableGlobal(this.#snapshot, candidate);
+    const result = prepare(candidate);
+    this.#snapshot = Object.freeze(candidate);
+    return result;
+  }
+
   resolve(agentId: AgentId): AvailableAgent {
     const agent = this.#snapshot.byId.get(agentId);
     if (agent === undefined) {
@@ -39,6 +79,19 @@ export class CatalogService {
     }
     return agent;
   }
+}
+
+const canonicalizeJson = canonicalizeModule as unknown as (
+  input: unknown,
+) => string | undefined;
+
+function catalogRevision(snapshot: CatalogSnapshot): string {
+  const canonical = canonicalizeJson({
+    sources: snapshot.sources,
+    unavailable: snapshot.unavailable,
+  });
+  if (canonical === undefined) throw new Error("catalog_revision_not_canonicalizable");
+  return `catalog_${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
 function assertReloadableGlobal(
@@ -71,3 +124,6 @@ function staticGlobalFields(snapshot: CatalogSnapshot): object {
         }),
   };
 }
+import { createHash } from "node:crypto";
+
+import canonicalizeModule from "canonicalize";

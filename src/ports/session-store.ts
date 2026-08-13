@@ -32,6 +32,18 @@ export interface SessionMetadata {
   updatedAt: Date;
 }
 
+export interface SessionHistoryQuery {
+  readonly agentId?: string;
+  readonly sessionKey?: string;
+  readonly limit: number;
+  readonly cursor?: { readonly updatedAt: Date; readonly sessionId: SessionId };
+}
+
+export interface SessionHistoryPage {
+  readonly items: readonly SessionMetadata[];
+  readonly nextCursor?: { readonly updatedAt: Date; readonly sessionId: SessionId };
+}
+
 export type SaveSessionSummaryInput = SessionSummary;
 
 export interface SaveLeasedSessionSummaryInput {
@@ -57,4 +69,5 @@ export interface SessionStore {
 
 export interface SessionLookupStore {
   findByIdentity(agentId: string, sessionKey: string): SessionMetadata | null;
+  listHistory(query: SessionHistoryQuery): SessionHistoryPage;
 }

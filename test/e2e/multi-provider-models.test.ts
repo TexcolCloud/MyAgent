@@ -1233,8 +1233,13 @@ describe("multi-provider model registry release isolation", () => {
         idempotencyKey: "provider-cancellation-run",
       });
       await service.waitForRunStatus(cancellation.runId, "running");
+      const cancellationDetail = await jsonRequest(
+        service.runRequest(`/v1/runs/${cancellation.runId}`),
+        200,
+      ) as { updatedAt: string };
       await jsonRequest(service.runRequest(`/v1/runs/${cancellation.runId}/cancel`, {
         method: "POST",
+        body: JSON.stringify({ confirm: true, expectedRevision: cancellationDetail.updatedAt }),
       }), 200);
       await service.waitForRunStatus(cancellation.runId, "cancelled");
       expect(assignment()).toBe(frozenAssignment);

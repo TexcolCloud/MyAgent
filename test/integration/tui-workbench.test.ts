@@ -2,15 +2,191 @@ import type { Terminal } from "@mariozechner/pi-tui";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 
-import type { CliPrompt } from "../../src/interfaces/cli/commands/model-setup.js";
+import {
+  CliPromptCancelledError,
+  setupModel,
+  type CliPrompt,
+  type SetupModelProgressCallback,
+} from "../../src/interfaces/cli/commands/model-setup.js";
+import type { AdminClient } from "../../src/interfaces/cli/commands/providers.js";
 import { CliHttpError } from "../../src/interfaces/cli/client.js";
 import { runWorkbench } from "../../src/interfaces/tui/workbench.js";
 import { ApprovalScreen } from "../../src/interfaces/tui/screens/approvals.js";
 import { InspectorScreen } from "../../src/interfaces/tui/screens/inspector.js";
 import { runModelSetupScreen } from "../../src/interfaces/tui/screens/model-setup.js";
 import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
+import type { ModelProfileResponse } from "../../src/interfaces/http/model-control-schemas.js";
 
 describe("TUI workbench", () => {
+  it("exits immediately without a prompt when no durable work is active", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const beforeExit = vi.fn(async () => ({ activeRuns: [], pendingApprovalCount: 0 }));
+    const workbench = runWorkbench({ client: safeClient(), terminal, beforeExit });
+
+    await terminal.ready();
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    expect(beforeExit).toHaveBeenCalledOnce();
+    expect(plainLines(terminal.frames.join("\n")).join("\n")).not.toContain("Exit MyAgent?");
+  });
+
+  it("shows active Run IDs and pending Approval count, then resumes after exit is declined", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const beforeExit = vi.fn(async () => ({
+      activeRuns: [
+        { runId: "run_queued", status: "queued" as const },
+        { runId: "run_cancelling", status: "cancelling" as const },
+      ],
+      pendingApprovalCount: 3,
+    }));
+    const workbench = runWorkbench({ client: safeClient(), terminal, beforeExit });
+
+    await terminal.ready();
+    terminal.input("\u0003");
+    await terminal.waitForFrame("run_cancelling");
+    expect(plainLines(terminal.frames.at(-1) ?? "").join("\n")).toContain("3 pending Approvals");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await terminal.waitForFrame("Navigation");
+    expect(terminal.stopCalls).toBe(0);
+
+    terminal.input("\u0003");
+    await vi.waitFor(() => { expect(beforeExit).toHaveBeenCalledTimes(2); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    terminal.input("\r");
+
+    await expect(workbench).resolves.toBe(0);
+    expect(beforeExit).toHaveBeenCalledTimes(2);
+    expect(terminal.stopCalls).toBe(1);
+  });
+
+  it("takes the exit snapshot after an in-flight Run creation settles and blocks new mutations", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const events: string[] = [];
+    let resolveCreate: ((value: {
+      readonly runId: string;
+      readonly status: "queued";
+      readonly eventsUrl: string;
+    }) => void) | undefined;
+    const createRun = vi.fn(() => {
+      events.push("create_started");
+      return new Promise<{
+        readonly runId: string;
+        readonly status: "queued";
+        readonly eventsUrl: string;
+      }>((resolve) => { resolveCreate = resolve; });
+    });
+    let committed = false;
+    let resolveInspection: (() => void) | undefined;
+    const inspectionRelease = new Promise<void>((resolve) => { resolveInspection = resolve; });
+    const beforeExit = vi.fn(() => {
+      events.push("inspection_started");
+      const snapshot = committed
+        ? { activeRuns: [{ runId: "run_committed", status: "queued" as const }], pendingApprovalCount: 0 }
+        : { activeRuns: [], pendingApprovalCount: 0 };
+      return inspectionRelease.then(() => snapshot);
+    });
+    const listPendingApprovals = vi.fn(async () => ({ approvals: [] }));
+    let adminRequestCount = 0;
+    const adminRequest = async <T>(
+      path: string,
+      init?: { readonly method?: string },
+    ): Promise<T> => {
+      adminRequestCount += 1;
+      void path;
+      void init;
+      return {} as T;
+    };
+    const client = safeClient({
+      createRun,
+      stream: async () => sseResponse([
+        eventFrame(1, "run.completed", { result: { type: "text", text: "done" } }),
+      ]),
+      listPendingApprovals,
+      adminRequest,
+    });
+    const workbench = runWorkbench({ client, terminal, beforeExit });
+
+    await terminal.ready();
+    terminal.input("c");
+    await terminal.waitForFrame("Agent ID");
+    terminal.input("primary");
+    terminal.input("\r");
+    await terminal.waitForFrame("Session Key");
+    terminal.input("tui:barrier");
+    terminal.input("\r");
+    await terminal.waitForFrame("Message");
+    terminal.input("commit first");
+    terminal.input("\r");
+    await vi.waitFor(() => { expect(createRun).toHaveBeenCalledOnce(); });
+    terminal.input("\u0003");
+
+    committed = true;
+    events.push("create_committed");
+    resolveCreate?.({
+      runId: "run_committed",
+      status: "queued",
+      eventsUrl: "/v1/runs/run_committed/events",
+    });
+    await vi.waitFor(() => { expect(beforeExit).toHaveBeenCalledOnce(); });
+    terminal.input("c");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    terminal.input("\u001b");
+    terminal.input("a");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    terminal.input("\u001b");
+    terminal.input("m");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    resolveInspection?.();
+    const outcome = await Promise.race([
+      workbench.then(() => "resolved" as const),
+      terminal.waitForFrame("Exit MyAgent?").then(() => "prompt" as const),
+    ]);
+    if (outcome === "prompt") {
+      terminal.input("\r");
+      await workbench;
+    }
+
+    expect(outcome).toBe("prompt");
+    expect(events.slice(0, 3)).toEqual([
+      "create_started",
+      "create_committed",
+      "inspection_started",
+    ]);
+    expect(createRun).toHaveBeenCalledOnce();
+    expect(listPendingApprovals).not.toHaveBeenCalled();
+    expect(adminRequestCount).toBe(0);
+  });
+
+  it("restores the exact active prompt and focus after exit is declined", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    let inspections = 0;
+    const beforeExit = vi.fn(async () => {
+      inspections += 1;
+      return inspections === 1
+        ? { activeRuns: [{ runId: "run_1", status: "running" as const }], pendingApprovalCount: 0 }
+        : { activeRuns: [], pendingApprovalCount: 0 };
+    });
+    const workbench = runWorkbench({ client: safeClient(), terminal, beforeExit });
+
+    await terminal.ready();
+    terminal.input("c");
+    await terminal.waitForFrame("Agent ID");
+    terminal.input("\u0003");
+    await terminal.waitForFrame("Exit MyAgent?");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    terminal.input("primary");
+    terminal.input("\r");
+    await terminal.waitForFrame("Session Key");
+    terminal.input("\u0003");
+
+    await workbench;
+  });
+
   it("aborts and awaits a stalled Run creation without letting reconnect displace it", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     let createSignal: AbortSignal | undefined;
@@ -65,9 +241,16 @@ describe("TUI workbench", () => {
       eventsUrl: "/v1/runs/run_1/events",
     }));
     const cursors: (string | undefined)[] = [];
+    const getRun = vi.fn(async () => ({
+      runId: "run_1", sessionId: "ses_1", agentId: "primary", status: "completed" as const,
+      fifoSequence: 0, parentRunId: null, rootRunId: "run_1", delegationDepth: 0,
+      budget: { modelTurns: 0, toolCalls: 0, childRuns: 0, delegationDepth: 0, activeExecutionSeconds: 0, toolOutputBytes: 0 },
+      createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z",
+    }));
     let attempt = 0;
     const client = safeClient({
       createRun,
+      getRun,
       stream: async (_path, lastEventId) => {
         cursors.push(lastEventId);
         attempt += 1;
@@ -102,6 +285,7 @@ describe("TUI workbench", () => {
       text: "read status",
     }));
     expect(cursors).toEqual([undefined, "4"]);
+    expect(getRun).toHaveBeenCalledExactlyOnceWith("run_1");
   });
 
   it("opens pending Approvals and dispatches one selected decision", async () => {
@@ -352,6 +536,42 @@ describe("TUI workbench", () => {
     expect(terminal.frames.at(-1)).toContain("Research Agent");
   });
 
+  it("exposes Sessions in navigation and opens selected Session Run history", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const client = {
+      ...safeClient(),
+      listSessions: async () => ({ items: [{ sessionId: "ses_1", agentId: "researcher", sessionKey: "session:review", createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z" }] }),
+      listRunHistory: vi.fn(async (input: { agentId: string; sessionKey: string }) => ({ items: [{ runId: "run_1", sessionId: "ses_1", agentId: input.agentId, status: "completed" as const, fifoSequence: 0, parentRunId: null, rootRunId: "run_1", delegationDepth: 0, budget: { modelTurns: 0, toolCalls: 0, childRuns: 0, delegationDepth: 0, activeExecutionSeconds: 0, toolOutputBytes: 0 }, createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z" }] })),
+      getRun: async () => ({ runId: "run_1", sessionId: "ses_1", agentId: "researcher", status: "completed" as const, fifoSequence: 0, parentRunId: null, rootRunId: "run_1", delegationDepth: 0, budget: { modelTurns: 0, toolCalls: 0, childRuns: 0, delegationDepth: 0, activeExecutionSeconds: 0, toolOutputBytes: 0 }, createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z" }),
+      cancelRun: async () => { throw new Error("unused"); },
+    };
+    const workbench = runWorkbench({ client, terminal });
+    await terminal.ready();
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    terminal.input("\r");
+    await terminal.waitForFrame("Sessions");
+    terminal.input("\r");
+    await terminal.waitForFrame("run_1");
+    terminal.input("\u0003");
+    await expect(workbench).resolves.toBe(0);
+    expect(client.listRunHistory).toHaveBeenCalledWith(expect.objectContaining({ agentId: "researcher", sessionKey: "session:review" }));
+  });
+
+  it("opens typed Admin diagnostics from navigation", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const workbench = runWorkbench({
+      client: { ...safeClient(), getDiagnostics: async () => ({ checks: [{ id: "config" as const, status: "ok" as const, detail: "config_readable" }] }) },
+      terminal,
+    });
+    await terminal.ready();
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    terminal.input("\r");
+    await terminal.waitForFrame("Diagnostics");
+    await terminal.waitForFrame("config: ok (config_readable)");
+    terminal.input("\u0003");
+    await expect(workbench).resolves.toBe(0);
+  });
+
   it("loads safe Provider Connection and Model Profile summaries through navigation", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     const workbench = runWorkbench({ client: safeClient(), terminal });
@@ -368,6 +588,77 @@ describe("TUI workbench", () => {
     await expect(workbench).resolves.toBe(0);
     expect(terminal.frames.at(-1)).toContain("Profiles");
     expect(terminal.frames.at(-1)).toContain("Model One");
+  });
+
+  it("routes Profiles, Assignments, and Verification q/x controls through the workbench", async () => {
+    const cancelModelVerification = vi.fn(async () => verificationView("cancelled", 4));
+    const client = {
+      ...safeClient(),
+      getModelProfile: async () => modelProfileView(),
+      createModelProfile: async () => modelProfileView(),
+      promoteModelProfile: async () => modelProfileView(),
+      retireModelProfile: async () => modelProfileView(),
+      getProviderConnection: async () => providerConnectionView(),
+      verifyModel: async () => ({
+        verificationId: "ver_one", profileRevisionId: "mpr_verified",
+        capabilityBaseline: "text_and_single_tool_call_v1" as const,
+        status: "queued" as const, recordRevision: 1,
+        operationUrl: "/v1/admin/operations/opaque-verification-status",
+      }),
+      getModelVerification: async () => verificationView("running", 3),
+      getModelVerificationAt: async () => verificationView("running", 3),
+      cancelModelVerification,
+      getModelAssignment: async () => ({ agentId: "research", state: "unassigned" as const, modelProfileRevisionId: null, source: null, recordRevision: null, updatedAt: null }),
+      assignModel: async () => ({ agentId: "research", state: "assigned" as const, modelProfileRevisionId: "mpr_verified", source: "explicit" as const, recordRevision: 1, updatedAt: "2026-08-13T00:00:00.000Z" }),
+      getDefaultModelProfile: async () => ({ state: "unset" as const, profileId: null, recordRevision: null }),
+      setDefaultModelProfile: async () => ({ state: "configured" as const, profileId: "model-one", recordRevision: 1 }),
+    };
+    await navigateWorkbench(client, ["\u001b[B", "\u001b[B"], "Profiles");
+    await navigateWorkbench(client, ["\u001b[A"], "Assignments");
+
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const workbench = runWorkbench({ client, terminal });
+    await terminal.ready();
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    terminal.input("\r");
+    await terminal.waitForFrame("Verifications");
+    terminal.input("q");
+    await terminal.waitForFrame("Profile revision ID");
+    terminal.input("mpr_verified"); terminal.input("\r");
+    await terminal.waitForFrame("Profile record revision");
+    terminal.input("2"); terminal.input("\r");
+    await terminal.waitForFrame("ver_one (running)");
+    terminal.input("x");
+    await terminal.waitForFrame("Cancel this Verification?"); terminal.input("\r");
+    await vi.waitFor(() => expect(cancelModelVerification).toHaveBeenCalledWith("ver_one", { expectedRevision: 3 }));
+    await terminal.waitForFrame("ver_one (cancelled)");
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+  });
+
+  it("does not instantiate Verifications when the client lacks opaque operation polling", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const verifyModel = vi.fn();
+    const client = {
+      ...safeClient(),
+      verifyModel,
+      getModelVerification: vi.fn(),
+      cancelModelVerification: vi.fn(),
+    };
+    const workbench = runWorkbench({ client, terminal });
+
+    await terminal.ready();
+    for (const key of ["\u001b[B", "\u001b[B", "\u001b[B"]) terminal.input(key);
+    terminal.input("\r");
+    await terminal.waitForFrame("Verifications");
+    terminal.input("q");
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    expect(verifyModel).not.toHaveBeenCalled();
+    expect(plainLines(terminal.frames.at(-1) ?? "").join("\n")).not.toContain("Profile revision ID");
+    terminal.input("\u0003");
+    await expect(workbench).resolves.toBe(0);
   });
 
   it("does not render control sequences or credential lines from typed list summaries", async () => {
@@ -471,10 +762,10 @@ describe("TUI workbench", () => {
           retiredAt: null,
         }] };
       },
-      adminRequest: async (path: string) => {
-        setupRequests.push(path);
-        throw new CliHttpError(409, "revision_conflict", "stale", "trace_1");
-      },
+      runModelSetup: modelSetupCapability(async (path: string) => {
+          setupRequests.push(path);
+          throw new CliHttpError(409, "revision_conflict", "stale", "trace_1");
+        }).runModelSetup,
     };
     const workbench = runWorkbench({ client, terminal });
 
@@ -530,9 +821,9 @@ describe("TUI workbench", () => {
     const requests: { path: string; body: unknown }[] = [];
     let pollStarted: (() => void) | undefined;
     const pollStartedPromise = new Promise<void>((resolve) => { pollStarted = resolve; });
-    const setup = setupClient(requests, () => "running");
-    const client = safeClient({
-      adminRequest: async <T>(path: string, init?: { readonly method?: string }) => {
+    const setupRequest = createSetupRequest(requests, () => "running");
+    const setupCapability = modelSetupCapability(
+      async <T>(path: string, init?: { readonly method?: string }) => {
         if (path === "/v1/admin/provider-drivers") return {
           piVersion: "0.73.1",
           drivers: [{
@@ -545,10 +836,12 @@ describe("TUI workbench", () => {
             }],
           }],
         } as T;
+        const response = await setupRequest<T>(path, init);
         if (path === "/v1/admin/model-verifications/ver_1") pollStarted?.();
-        return setup.adminRequest<T>(path, init);
+        return response;
       },
-    });
+    );
+    const client = safeClient({ runModelSetup: setupCapability.runModelSetup });
     const workbench = runWorkbench({ client, terminal });
 
     await terminal.ready();
@@ -577,12 +870,12 @@ describe("TUI workbench", () => {
     await terminal.waitForFrame("Use resolved context limit");
     terminal.input("\r");
     await pollStartedPromise;
-    const requestCountAtCancel = requests.length;
+    const requestsAtCancel = requests.map((request) => request.path);
     terminal.input("\u0003");
 
     await expect(workbench).resolves.toBe(0);
     await new Promise<void>((resolve) => setTimeout(resolve, 300));
-    expect(requests).toHaveLength(requestCountAtCancel);
+    expect(requests.map((request) => request.path)).toEqual(requestsAtCancel);
     expect(requests.some((request) => request.path.includes("/promotions"))).toBe(false);
     expect(requests.some((request) => request.path.includes("model-assignment"))).toBe(false);
   });
@@ -666,16 +959,16 @@ describe("model setup screen", () => {
   it("returns a reload requirement after one conflicting Promotion and clears review output", async () => {
     const requests: { path: string; body: unknown }[] = [];
     const output: string[] = [];
-    const setup = setupClient(requests);
-    const client = {
-      adminRequest: async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
+    const setupRequest = createSetupRequest(requests);
+    const client = modelSetupCapability(
+      async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
         if (path.endsWith("/promotions")) {
           requests.push({ path, body: init?.body });
           throw new CliHttpError(409, "revision_conflict", "provider-secret stale response", "trace-secret");
         }
-        return setup.adminRequest<T>(path, init);
+        return setupRequest<T>(path, init);
       },
-    };
+    );
     const outcome = await runModelSetupScreen({
       client,
       prompt: scriptedPrompt({
@@ -695,15 +988,15 @@ describe("model setup screen", () => {
 
   it("does not convert unrelated HTTP failures into revision conflicts", async () => {
     const requests: { path: string; body: unknown }[] = [];
-    const setup = setupClient(requests);
-    const client = {
-      adminRequest: async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
+    const setupRequest = createSetupRequest(requests);
+    const client = modelSetupCapability(
+      async <T>(path: string, init?: { readonly method?: string; readonly body?: unknown }) => {
         if (path.endsWith("/promotions")) {
           throw new CliHttpError(503, "provider_unavailable", "safe detail", "trace_1");
         }
-        return setup.adminRequest<T>(path, init);
+        return setupRequest<T>(path, init);
       },
-    };
+    );
 
     await expect(runModelSetupScreen({
       client,
@@ -827,9 +1120,12 @@ function safeClient(overrides: Partial<{
   connections: readonly { readonly connectionId: string; readonly displayName: string; readonly activeRevisionId: string | null; readonly retiredAt: string | null }[];
   profiles: readonly { readonly profileId: string; readonly displayName: string; readonly activeRevisionId: string | null; readonly retiredAt: string | null }[];
   adminRequest: <T>(path: string, init?: { readonly method?: string }) => Promise<T>;
+  runModelSetup: ReturnType<typeof modelSetupCapability>["runModelSetup"];
   createRun: (input: { readonly agentId: string; readonly sessionKey: string; readonly text: string; readonly idempotencyKey?: string; readonly signal?: AbortSignal }) => Promise<{ readonly runId: string; readonly status: "queued"; readonly eventsUrl: string }>;
+  getRun: (runId: string) => Promise<{ readonly runId: string; readonly sessionId: string; readonly agentId: string; readonly status: "queued" | "running" | "waiting_approval" | "cancelling" | "waiting_reconciliation" | "completed" | "failed" | "cancelled"; readonly fifoSequence: number; readonly parentRunId: string | null; readonly rootRunId: string; readonly delegationDepth: number; readonly budget: { readonly modelTurns: number; readonly toolCalls: number; readonly childRuns: number; readonly delegationDepth: number; readonly activeExecutionSeconds: number; readonly toolOutputBytes: number }; readonly createdAt: string; readonly updatedAt: string }>;
   stream: (path: string, lastEventId?: string, signal?: AbortSignal) => Promise<Response>;
   approvals: readonly ReturnType<typeof pendingApproval>[];
+  listPendingApprovals: () => Promise<{ readonly approvals: readonly ReturnType<typeof pendingApproval>[] }>;
   decideApproval: (approvalId: string, decision: "approve" | "deny") => Promise<{ readonly approvalId: string; readonly runId: string; readonly state: "approved" | "denied"; readonly resolvedAt: string | null }>;
 }> = {}) {
   return {
@@ -837,18 +1133,102 @@ function safeClient(overrides: Partial<{
     listProviderConnections: async () => ({ connections: overrides.connections ?? [{ connectionId: "provider-one", displayName: "Provider One", activeRevisionId: "pcr_1", retiredAt: null }] }),
     listModelProfiles: async () => ({ profiles: overrides.profiles ?? [{ profileId: "model-one", displayName: "Model One", activeRevisionId: "mpr_1", retiredAt: null }] }),
     listProviderDrivers: async () => ({ piVersion: "0.73.1" as const, drivers: [] }),
-    adminRequest: overrides.adminRequest ?? (async <T>(path: string) => (path === "/v1/admin/provider-drivers"
-      ? { piVersion: "0.73.1", drivers: [] } as T
-      : {} as T)),
+    runModelSetup: overrides.runModelSetup ?? modelSetupCapability(
+      overrides.adminRequest ?? (async <T>(path: string) => (path === "/v1/admin/provider-drivers"
+        ? { piVersion: "0.73.1", drivers: [] } as T
+        : {} as T)),
+    ).runModelSetup,
     createRun: overrides.createRun ?? (async () => ({ runId: "run_1", status: "queued", eventsUrl: "/v1/runs/run_1/events" })),
+    getRun: overrides.getRun ?? (async (runId) => ({ runId, sessionId: "ses_1", agentId: "primary", status: "completed" as const, fifoSequence: 0, parentRunId: null, rootRunId: runId, delegationDepth: 0, budget: { modelTurns: 0, toolCalls: 0, childRuns: 0, delegationDepth: 0, activeExecutionSeconds: 0, toolOutputBytes: 0 }, createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z" })),
     stream: overrides.stream ?? (async () => sseResponse([eventFrame(1, "run.completed", { result: null })])),
-    listPendingApprovals: async () => ({ approvals: overrides.approvals ?? [] }),
+    listPendingApprovals: overrides.listPendingApprovals ?? (async () => ({ approvals: overrides.approvals ?? [] })),
     decideApproval: overrides.decideApproval ?? (async (approvalId, decision) => ({
       approvalId,
       runId: "run_1",
       state: decision === "approve" ? "approved" : "denied",
       resolvedAt: "2026-08-12T00:00:00.000Z",
     })),
+  };
+}
+
+async function navigateWorkbench(
+  client: Parameters<typeof runWorkbench>[0]["client"],
+  keys: readonly string[],
+  expected: string,
+): Promise<void> {
+  const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+  const workbench = runWorkbench({ client, terminal });
+  await terminal.ready();
+  for (const key of keys) terminal.input(key);
+  terminal.input("\r");
+  await terminal.waitForFrame(expected);
+  terminal.input("\u0003");
+  await expect(workbench).resolves.toBe(0);
+}
+
+function modelProfileView(): ModelProfileResponse {
+  return {
+    profileId: "model-one",
+    displayName: "Model One",
+    activeRevisionId: "mpr_verified",
+    retiredAt: null,
+    recordRevision: 2,
+    revisions: [{
+      revisionId: "mpr_verified",
+      profileId: "model-one",
+      connectionRevisionId: "pcr_one",
+      providerModelId: "model-one",
+      invocationProtocol: "responses" as const,
+      maxInputTokens: 128_000,
+      contextWindowSource: "preset" as const,
+      capabilityBaseline: "text_and_single_tool_call_v1" as const,
+      verifiedCapabilities: ["streaming_text", "single_tool_call"],
+      state: "verified" as const,
+      createdAt: "2026-08-13T00:00:00.000Z",
+    }],
+  };
+}
+
+function providerConnectionView() {
+  return {
+    connectionId: "provider-one",
+    displayName: "Provider One",
+    providerKind: "openai" as const,
+    providerDriver: "pi/openai",
+    activeRevisionId: "pcr_one",
+    retiredAt: null,
+    recordRevision: 1,
+    credentialConfigured: true,
+    revisions: [{
+      revisionId: "pcr_one",
+      connectionId: "provider-one",
+      state: "active" as const,
+      baseUrl: "https://api.openai.com/v1",
+      allowInsecureHttp: false,
+      protocolPreference: "responses" as const,
+      presetVersion: "2026-08-01",
+      credentialConfigured: true,
+      createdAt: "2026-08-13T00:00:00.000Z",
+    }],
+  };
+}
+
+function verificationView(status: "running" | "cancelled", recordRevision: number) {
+  return {
+    verificationId: "ver_one",
+    profileRevisionId: "mpr_verified",
+    capabilityBaseline: "text_and_single_tool_call_v1" as const,
+    status,
+    resultCode: null,
+    safeStatus: null,
+    capabilities: [],
+    traceId: "trace_one",
+    recordRevision,
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+    cancellationRequestedAt: null,
+    fallbackProfileRevisionId: null,
+    fallbackVerificationId: null,
   };
 }
 
@@ -946,8 +1326,14 @@ function setupClient(
   requests: { path: string; body: unknown }[],
   verificationStatus: () => "running" | "passed" = () => "passed",
 ) {
-  return {
-    adminRequest: async <T>(path: string, options: { method?: string; body?: unknown } = {}) => {
+  return modelSetupCapability(createSetupRequest(requests, verificationStatus));
+}
+
+function createSetupRequest(
+  requests: { path: string; body: unknown }[],
+  verificationStatus: () => "running" | "passed" = () => "passed",
+): AdminClient["request"] {
+  return async <T>(path: string, options: { method?: string; body?: unknown } = {}) => {
       requests.push({ path, body: options.body });
       if (path === "/v1/admin/provider-drivers") return {
         piVersion: "0.73.1",
@@ -966,6 +1352,28 @@ function setupClient(
       if (path === "/v1/admin/model-verifications/ver_1") return { verificationId: "ver_1", profileRevisionId: "mpr_1", status: verificationStatus(), resultCode: null, capabilities: [], traceId: "trace", fallbackProfileRevisionId: null, fallbackVerificationId: null } as T;
       if (path === "/v1/admin/model-profiles/deepseek-chat") return { profileId: "deepseek-chat", recordRevision: 1, revisions: [{ revisionId: "mpr_1", invocationProtocol: "responses", maxInputTokens: 65536, contextWindowSource: "preset" }] } as T;
       return {} as T;
-    },
+    };
+}
+
+function modelSetupCapability(request: AdminClient["request"]) {
+  return {
+    runModelSetup: (input: {
+      readonly prompt: CliPrompt;
+      readonly sleep: (milliseconds: number) => Promise<void>;
+      readonly write: (line: string) => void;
+      readonly onProgress?: SetupModelProgressCallback;
+      readonly signal?: AbortSignal;
+    }) => setupModel(
+      {
+        request: <T>(path: string, init?: Parameters<AdminClient["request"]>[1]) => input.signal?.aborted === true
+          ? Promise.reject(new CliPromptCancelledError())
+          : request<T>(path, init),
+      },
+      input.prompt,
+      input.sleep,
+      input.write,
+      true,
+      input.onProgress,
+    ),
   };
 }

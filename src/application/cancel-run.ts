@@ -3,7 +3,7 @@ import type { Clock } from "../ports/clock.js";
 import type { ExecutionRegistry } from "../runtime/execution-registry.js";
 
 export interface RunCancellationStore {
-  cancel(input: { runId: RunId; occurredAt: Date }): unknown;
+  cancel(input: { runId: RunId; occurredAt: Date; expectedRevision?: string }): unknown;
 }
 
 export class CancelRunService {
@@ -13,8 +13,8 @@ export class CancelRunService {
     private readonly clock: Pick<Clock, "now">,
   ) {}
 
-  execute(input: { runId: RunId }): unknown {
-    const result = this.runs.cancel({ runId: input.runId, occurredAt: this.clock.now() });
+  execute(input: { runId: RunId; expectedRevision?: string }): unknown {
+    const result = this.runs.cancel({ runId: input.runId, occurredAt: this.clock.now(), ...(input.expectedRevision === undefined ? {} : { expectedRevision: input.expectedRevision }) });
     this.executions.abort(input.runId);
     return result;
   }

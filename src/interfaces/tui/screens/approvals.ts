@@ -141,6 +141,7 @@ export class ApprovalScreen implements Component, Focusable {
       lines.push(...this.approvals.map((approval, index) => `${index === this.selectedIndex ? ">" : " "} ${approval.toolName} (${approval.approvalId})`));
       const selected = this.selected;
       if (selected !== undefined) {
+        lines.push(`Run: ${selected.runId}`);
         lines.push(`Tool Call: ${selected.toolCallId}`);
         lines.push("Argument shape:", ...selected.argumentSummary);
         lines.push(...safeDisplayLines(`Expires: ${selected.expiresAt}`));

@@ -19,6 +19,45 @@ const ADMIN_SECRET = "admin-secret-seeded";
 const PROVIDER_SECRET = "provider-secret-seeded";
 
 describe("Secret containment", () => {
+  it("redacts injected bootstrap authentication from startup, auth failure, and shutdown logs", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "myagent-bootstrap-auth-logs-"));
+    const configRoot = path.join(root, "config");
+    await cp(VALID_FIXTURE, configRoot, { recursive: true });
+    const logs: string[] = [];
+    const auth = { bearerToken: "local-run-secret", adminToken: "local-admin-secret" };
+    let service: Awaited<ReturnType<typeof bootstrap>> | undefined;
+
+    try {
+      service = await bootstrap(path.join(configRoot, "myagent.yaml"), {
+        auth,
+        listen: { host: "127.0.0.1", port: 0 },
+        signals: false,
+        log: { write: (line) => { logs.push(line); } },
+      });
+      const response = await fetch(`${service.url}/v1/agents`, {
+        headers: { authorization: "Bearer wrong-token" },
+      });
+      expect(response.status).toBe(401);
+      await service.shutdown();
+
+      const events = logs.map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ level: "info", message: expect.stringContaining("Server listening") }),
+      ]));
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ level: "warn", code: "unauthorized" }),
+      ]));
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ level: "info", code: "service_stopped" }),
+      ]));
+      expect(logs.join("\n")).not.toContain(auth.bearerToken);
+      expect(logs.join("\n")).not.toContain(auth.adminToken);
+    } finally {
+      await service?.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps resolved Secrets out of logs, HTTP, events, and revision snapshots", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "myagent-secret-leak-"));
     const configRoot = path.join(root, "config");

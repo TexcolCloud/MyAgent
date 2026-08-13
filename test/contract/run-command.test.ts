@@ -534,14 +534,22 @@ describe("run_command Tool", () => {
       ...executionContext,
       signal: controller.signal,
     });
-    const descendantPid = Number(
-      await waitForFile(path.join(workspace, "descendant.pid")),
-    );
+    try {
+      const descendantPid = Number(
+        await waitForFile(
+          path.join(workspace, "descendant.pid"),
+          NORMAL_COMMAND_TIMEOUT_MS,
+        ),
+      );
 
-    controller.abort(new DOMException("run cancelled", "AbortError"));
+      controller.abort(new DOMException("run cancelled", "AbortError"));
 
-    await expect(execution).rejects.toMatchObject({ name: "AbortError" });
-    await expectProcessToExit(descendantPid);
+      await expect(execution).rejects.toMatchObject({ name: "AbortError" });
+      await expectProcessToExit(descendantPid);
+    } finally {
+      controller.abort(new DOMException("test cleanup", "AbortError"));
+      await execution.catch(() => undefined);
+    }
   }, 10_000);
 
   it("does not resolve Secrets or spawn after cancellation during cwd resolution", async () => {
@@ -648,8 +656,8 @@ function jsonStringPayloadBytes(value: string): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8") - 2;
 }
 
-async function waitForFile(filePath: string): Promise<string> {
-  const deadline = Date.now() + 2_000;
+async function waitForFile(filePath: string, timeoutMs = 2_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
       return await readFile(filePath, "utf8");

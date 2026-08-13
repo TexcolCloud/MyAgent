@@ -1,6 +1,6 @@
 import { matchesKey, truncateToWidth, type Component, type Focusable } from "@mariozechner/pi-tui";
 
-export type WorkbenchDestination = "agents" | "runs" | "providers" | "profiles" | "verifications";
+export type WorkbenchDestination = "agents" | "runs" | "sessions" | "providers" | "profiles" | "verifications" | "diagnostics";
 
 const destinations: readonly { readonly id: WorkbenchDestination; readonly label: string }[] = [
   { id: "agents", label: "Agents" },
@@ -8,6 +8,8 @@ const destinations: readonly { readonly id: WorkbenchDestination; readonly label
   { id: "providers", label: "Providers" },
   { id: "profiles", label: "Profiles" },
   { id: "verifications", label: "Verifications" },
+  { id: "sessions", label: "Sessions" },
+  { id: "diagnostics", label: "Diagnostics" },
 ];
 
 export class NavigationScreen implements Component, Focusable {

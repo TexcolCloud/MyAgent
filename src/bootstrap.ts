@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, access } from "node:fs/promises";
 import { isIP } from "node:net";
 import path from "node:path";
 
@@ -44,7 +44,9 @@ import { AdvanceRunService } from "./application/advance-run.js";
 import { AgentResolver } from "./application/agent-resolver.js";
 import { AssignModelService } from "./application/assign-model.js";
 import { CancelRunService } from "./application/cancel-run.js";
+import { activeSecretReferencesResolvable, collectDiagnostics, projectStatePermissionsAvailable } from "./application/collect-diagnostics.js";
 import { CreateBackupService } from "./application/create-backup.js";
+import { CreateManagedAgentService } from "./application/create-managed-agent.js";
 import { CreateRunService } from "./application/create-run.js";
 import { DecideApprovalService } from "./application/decide-approval.js";
 import { DelegateAgentService } from "./application/delegate-agent.js";
@@ -62,6 +64,7 @@ import { loadBootConfig } from "./config/boot-config.js";
 import { loadCatalog } from "./config/catalog-loader.js";
 import { CatalogService } from "./config/catalog-service.js";
 import { createHttpApp } from "./interfaces/http/app.js";
+import { resolveLocalProjectPaths } from "./interfaces/local/project-state.js";
 import { createStructuredLogger } from "./observability/logger.js";
 import { MutableDynamicRedactionRegistry } from "./observability/redactor.js";
 import type { Clock } from "./ports/clock.js";
@@ -74,7 +77,12 @@ import { ModelVerificationWorker } from "./runtime/model-verification-worker.js"
 import { RunWorker } from "./runtime/run-worker.js";
 
 export interface BootstrapOptions {
+  auth?: {
+    readonly bearerToken: string;
+    readonly adminToken: string;
+  };
   listen?: { host?: string; port?: number };
+  projectStateRoot?: string;
   signals?: boolean;
   log?: {
     write?: (line: string) => void;
@@ -99,6 +107,22 @@ export interface BootstrappedService {
   shutdown(): Promise<void>;
 }
 
+export function resolveBootstrapProjectStateRoot(
+  configPath: string,
+  projectStateRoot?: string,
+): string {
+  if (projectStateRoot !== undefined) return path.resolve(projectStateRoot);
+  const resolvedConfigPath = path.resolve(configPath);
+  const configDirectory = path.dirname(resolvedConfigPath);
+  if (
+    path.basename(configDirectory) === ".myagent"
+    && path.basename(resolvedConfigPath) === "myagent.yaml"
+  ) {
+    return configDirectory;
+  }
+  return resolveLocalProjectPaths(process.cwd()).root;
+}
+
 const DEFAULT_MODEL_CONTROL = Object.freeze({
   discoveryCacheSeconds: 600,
   discoveryTimeoutMs: 10_000,
@@ -114,16 +138,28 @@ export async function bootstrap(
   options: BootstrapOptions = {},
 ): Promise<BootstrappedService> {
   assertSupportedRuntime();
+  const injectedAuth = options.auth === undefined ? undefined : Object.freeze({
+    bearerToken: options.auth.bearerToken,
+    adminToken: options.auth.adminToken,
+  });
+  if (injectedAuth !== undefined) {
+    assertValidHttpAuth(injectedAuth);
+    Object.freeze(options.auth);
+  }
   const absoluteConfigPath = path.resolve(configPath);
+  const projectStateRoot = resolveBootstrapProjectStateRoot(
+    absoluteConfigPath,
+    options.projectStateRoot,
+  );
   const bootConfig = await loadBootConfig(absoluteConfigPath);
   const redactionRegistry = new MutableDynamicRedactionRegistry();
   const environmentSecrets = new EnvironmentSecretResolver();
-  const bearerToken = environmentSecrets.resolve(
-    bootConfig.server.bearerToken,
-  );
-  const adminToken = environmentSecrets.resolve(
-    bootConfig.server.adminToken,
-  );
+  const auth = injectedAuth ?? {
+    bearerToken: environmentSecrets.resolve(bootConfig.server.bearerToken),
+    adminToken: environmentSecrets.resolve(bootConfig.server.adminToken),
+  };
+  const { bearerToken, adminToken } = auth;
+  assertValidHttpAuth(auth);
   redactionRegistry.register(bearerToken);
   redactionRegistry.register(adminToken);
   const logger = createStructuredLogger({
@@ -330,6 +366,10 @@ export async function bootstrap(
         );
       },
     });
+    const listen = {
+      host: options.listen?.host ?? catalog.current().global.server.host,
+      port: options.listen?.port ?? catalog.current().global.server.port,
+    };
     app = createHttpApp({
       bearerToken,
       adminToken,
@@ -360,6 +400,11 @@ export async function bootstrap(
         catalog,
         clock,
       ),
+      createManagedAgents: new CreateManagedAgentService(catalog, {
+        afterReload(candidate) {
+          assignments.synchronizeAgents(candidate.available.map(({ id }) => id));
+        },
+      }),
       logger,
       readiness: createReadinessProbe(
         catalog,
@@ -369,15 +414,21 @@ export async function bootstrap(
           verificationWorker?.isHealthy() === true &&
           expirer?.isHealthy() === true,
       ),
+      diagnostics: () => collectDiagnostics({
+        config: async () => { await loadBootConfig(absoluteConfigPath); },
+        permissions: () => projectStatePermissionsAvailable(projectStateRoot, databaseConfig.path, access),
+        sqlite: () => arraysEqual(readMigrationVersions(connection.db), expectedMigrationVersions),
+        secrets: () => activeSecretReferencesResolvable(modelRegistry, process.env, (versionId) => manageSecrets.assertVersionActive(versionId)),
+        workers: () => runWorker?.isHealthy() === true && verificationWorker?.isHealthy() === true && expirer?.isHealthy() === true,
+        gateway: () => providerGateway?.isAvailable === true,
+        tty: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+        binding: () => isLoopbackHost(listen.host),
+      }),
       sse: { faults },
     });
     runWorker.start();
     expirer.start();
     verificationWorker.start();
-    const listen = {
-      host: options.listen?.host ?? catalog.current().global.server.host,
-      port: options.listen?.port ?? catalog.current().global.server.port,
-    };
     const address = await app.listen(listen);
     if (!isLoopbackHost(listen.host)) {
       logger.warn(
@@ -397,6 +448,7 @@ export async function bootstrap(
         () => providerGateway?.stop(),
         () => connection.close(),
       ]);
+      logger.info({ code: "service_stopped" }, "service shutdown completed");
     };
     if (options.signals !== false) {
       const onSignal = (): void => {
@@ -474,6 +526,12 @@ function readMigrationVersions(database: DatabaseSync): number[] {
 
 function arraysEqual(left: readonly number[], right: readonly number[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function assertValidHttpAuth(auth: { bearerToken: string; adminToken: string }): void {
+  if (auth.bearerToken.length === 0) throw new Error("http_bearer_token_required");
+  if (auth.adminToken.length === 0) throw new Error("http_admin_token_required");
+  if (auth.bearerToken === auth.adminToken) throw new Error("http_admin_token_must_differ");
 }
 
 function isLoopbackHost(host: string): boolean {

@@ -230,6 +230,7 @@ describe("HTTP catalog and session routes", () => {
           method: "POST",
           url: `/v1/runs/${runId}/cancel`,
           headers,
+          payload: await cancellationPayload(harness.app, runId),
         });
         expect(cancelled.statusCode).toBe(200);
         expect(cancelled.json()).toMatchObject({ status: "cancelled" });
@@ -299,6 +300,7 @@ describe("HTTP catalog and session routes", () => {
         method: "POST",
         url: `/v1/runs/${runId}/cancel`,
         headers,
+        payload: await cancellationPayload(harness.app, runId),
       });
 
       const retried = await harness.app.inject({
@@ -372,6 +374,7 @@ describe("HTTP catalog and session routes", () => {
         method: "POST",
         url: `/v1/runs/${runId}/cancel`,
         headers,
+        payload: await cancellationPayload(harness.app, runId),
       });
       expect(cancelled.statusCode).toBe(200);
       expect(cancelled.json()).toMatchObject({ status: "cancelled" });
@@ -432,6 +435,19 @@ describe("HTTP catalog and session routes", () => {
     expect(deleteIfIdle).toHaveBeenCalledExactlyOnceWith(sessionId);
   });
 });
+
+async function cancellationPayload(
+  app: Awaited<ReturnType<typeof startTestApp>>["app"],
+  runId: string,
+): Promise<{ confirm: true; expectedRevision: string }> {
+  const current = await app.inject({
+    method: "GET",
+    url: `/v1/runs/${runId}`,
+    headers,
+  });
+  expect(current.statusCode).toBe(200);
+  return { confirm: true, expectedRevision: current.json().updatedAt as string };
+}
 
 function seedPendingApproval(db: import("node:sqlite").DatabaseSync, runId: string): void {
   const now = "2026-08-07T00:00:00.000Z";

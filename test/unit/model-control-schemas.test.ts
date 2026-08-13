@@ -6,7 +6,12 @@ import type {
   PublicProblemCode,
   VerificationResultCode,
 } from "../../src/domain/errors.js";
-import { modelVerificationResponseSchema } from "../../src/interfaces/http/model-control-schemas.js";
+import {
+  modelVerificationResponseSchema,
+  providerConnectionResponseSchema,
+  type ModelVerificationResponse,
+  type ProviderConnectionResponse,
+} from "../../src/interfaces/http/model-control-schemas.js";
 
 const controlPlaneProblemCode: ControlPlaneProblemCode = "revision_conflict";
 const publicRunProblemCode: PublicProblemCode = "agent_unavailable";
@@ -41,6 +46,60 @@ const verificationResponse = {
 } as const;
 
 describe("Model control response schemas", () => {
+  it("derives public response types from schemas without Secret-value fields", () => {
+    const provider: ProviderConnectionResponse = providerConnectionResponseSchema.parse({
+      connectionId: "deepseek",
+      displayName: "DeepSeek",
+      providerKind: "deepseek",
+      activeRevisionId: "pcr_1",
+      retiredAt: null,
+      recordRevision: 1,
+      credentialConfigured: true,
+      secretVersionId: "msv_1",
+      revisions: [{
+        revisionId: "pcr_1",
+        connectionId: "deepseek",
+        state: "active",
+        baseUrl: "https://api.deepseek.com/v1",
+        allowInsecureHttp: false,
+        protocolPreference: "responses",
+        presetVersion: "2026-08-13",
+        credentialConfigured: true,
+        secretVersionId: "msv_1",
+        createdAt: "2026-08-13T00:00:00.000Z",
+      }],
+    });
+    const verification: ModelVerificationResponse = modelVerificationResponseSchema.parse(
+      verificationResponse,
+    );
+
+    expect(provider.credentialConfigured).toBe(true);
+    expect(provider.secretVersionId).toBe("msv_1");
+    expect(verification.resultCode).toBe("provider_unavailable");
+    // @ts-expect-error Provider responses never expose write-only API keys.
+    void provider.apiKey;
+    // @ts-expect-error Verification responses never expose raw provider payloads.
+    void verification.providerResponse;
+  });
+
+  it.each([
+    ["apiKey", "must-not-appear"],
+    ["value", "must-not-appear"],
+    ["fromEnvironment", "DEEPSEEK_API_KEY"],
+  ])("rejects Provider response Secret-value field %s", (field, value) => {
+    expect(providerConnectionResponseSchema.safeParse({
+      connectionId: "deepseek",
+      displayName: "DeepSeek",
+      providerKind: "deepseek",
+      activeRevisionId: null,
+      retiredAt: null,
+      recordRevision: 0,
+      credentialConfigured: false,
+      revisions: [],
+      [field]: value,
+    }).success).toBe(false);
+  });
+
   it.each([
     "verification_required",
     "model_assignment_required",

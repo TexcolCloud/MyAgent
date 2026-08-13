@@ -1,0 +1,7 @@
+# Migrate to a TUI-first automation surface
+
+Interactive Operator workflows move to the TUI, while the documented, versioned `/v1` HTTP Automation Surface remains the supported contract for CI, scripts, diagnostics, backups, and integrations. MyAgent does not add a parallel `myagent api` wrapper: automated clients use the HTTP contract directly, while exceptional repair and security operations may retain narrowly scoped internal Recovery Commands. Existing resource-management CLI commands remain compatible and tested through the next minor release, but leave normal help and product guidance with deprecation notices; they are removed in the next major release after the HTTP automation contract is formally documented.
+
+## Consequences
+
+The public interactive entry set remains small (`myagent`, local or attached `tui`, `serve`, configuration validation, doctor, and backup). Through the migration period, `providers *`, `models *`, `model setup`, `agents set-model`, `verifications get`, `run *`, `approvals *`, and `sessions *` are deprecated resource-management commands. `tools reconcile`, `secrets rotate-master-key`, and `config reload` become internal Recovery Commands rather than normal TUI-first entry points. HTTP black-box tests and automation remain supported throughout the transition; a resource-management CLI command is not silently made internal or removed before its documented major-release boundary.

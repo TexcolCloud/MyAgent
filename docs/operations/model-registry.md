@@ -8,18 +8,28 @@ Use configuration version 2. It contains `server.bearerToken`, `server.adminToke
 
 ## Interactive TUI
 
-Start the workbench with `myagent tui` from a terminal that provides both an
-interactive stdin TTY and stdout TTY. Redirected input/output, CI, and other
-non-interactive invocations fail with `interactive_tty_required` before the
-workbench starts.
+Start Local Integrated Mode with `myagent`, `myagent tui`, or
+`myagent tui --local`. These entries own a random-port loopback service and use
+fresh in-memory Run/Admin capabilities; they do not read the attached-TUI token
+environment variables. See [Local Integrated Mode](local-integrated-mode.md)
+for the complete command, consent, lifetime, and recovery boundaries. Normal
+interactive Model Registry management is TUI-first; use the documented HTTP
+Automation Surface for CI and integrations. Legacy resource CLI commands remain
+temporarily compatible with a stderr deprecation notice and are not a new
+automation contract.
 
-The TUI reads its Run credential only from `MYAGENT_RUN_TOKEN` and its Admin
-credential only from `MYAGENT_ADMIN_TOKEN`. If either variable is absent, the
-TUI asks for that value with hidden input. The two values must differ. Do not
-put either token in command arguments: `--token` and `--admin-token` are
-rejected for `myagent tui`. Run creation, Run reads, committed SSE events, and
-Approval decisions use Run authority. Provider Connection and Model Profile
-reads and mutations use Admin authority.
+Use `myagent tui --api-url <origin>` only to attach to an existing service.
+Attached mode reads its Run credential from `MYAGENT_RUN_TOKEN` and its Admin
+credential from `MYAGENT_ADMIN_TOKEN`, an available credential helper, or
+hidden terminal input. The two values must differ. Do not put either token in
+command arguments: `--token` and `--admin-token` are rejected for all TUI
+entries. Run creation, Run reads, committed SSE events, and Approval decisions
+use Run authority. Provider Connection and Model Profile reads and mutations
+use Admin authority.
+
+All TUI modes require interactive stdin and stdout. Redirected input/output,
+CI, and other noninteractive invocations fail with
+`interactive_tty_required` before initialization or credential acquisition.
 
 The workbench observes one durable Run created for the Operator's exact Agent,
 Session Key, and message. If its SSE connection is interrupted, use reconnect;
@@ -42,7 +52,14 @@ state, then make a fresh setup and Promotion choice.
 
 ## Initial Setup
 
-Run `myagent model setup` for the guided flow, or use the individual `providers`, `models`, and `agents` commands for automation. The lifecycle order is fixed:
+Use the TUI Provider, Profile, Verification, and Assignment workflows for
+interactive setup. For automation, use the Admin HTTP surface directly:
+`POST /v1/admin/provider-connections`,
+`POST /v1/admin/provider-connection-revisions/:revisionId/discover`,
+`POST /v1/admin/model-profiles`,
+`POST /v1/admin/model-profile-revisions/:revisionId/verifications`, and the
+promotion and assignment routes listed in the [HTTP Automation Surface](http-automation-v1.md).
+The lifecycle order is fixed:
 
 1. Create a Provider Connection and discover its models.
 2. Create a Model Profile from a discovered model. If discovery is unsupported, acknowledge manual eligibility and supply the model ID and context-window source explicitly.
@@ -50,7 +67,9 @@ Run `myagent model setup` for the guided flow, or use the individual `providers`
 4. Promote the Connection Revision, then promote the terminal passing Profile Revision shown by the CLI. Never promote the earlier failed preferred-protocol candidate.
 5. Set the default Profile or assign the exact active Profile Revision to an Agent.
 
-Promotion never moves an existing Agent Assignment. Use `myagent agents set-model` for each deliberate rebind.
+Promotion never moves an existing Agent Assignment. Rebind deliberately in the
+TUI, or use `PUT /v1/admin/agents/:agentId/model-assignment` with the current
+`expectedRevision` for automation.
 
 ## Pi Drivers, Catalog, And Discovery
 
@@ -102,7 +121,11 @@ Use this four-step two-key procedure:
 
 1. Record the current Keyring record revision, retain the old 32-byte key material, and generate a new 32-byte key outside MyAgent.
 2. Set `MYAGENT_MASTER_KEY` to the new Base64 key material and `MYAGENT_PREVIOUS_MASTER_KEY` to the old Base64 key material, then restart. Existing Secrets remain readable through the previous key while new managed-Secret writes use the new current key until transactional rotation completes.
-3. Run `myagent secrets rotate-master-key --expected-revision <keyring-revision>`. A successful response reports only the re-encrypted row count, the derived current Key ID, and the next Keyring record revision.
+3. As an internal recovery operation, run `myagent internal secrets
+rotate-master-key --expected-revision <keyring-revision>`. A successful response
+reports only the re-encrypted row count, the derived current Key ID, and the
+next Keyring record revision. Automation uses `POST
+/v1/admin/managed-secrets/master-key-rotation` with `expectedRevision`.
 4. Remove `MYAGENT_PREVIOUS_MASTER_KEY` and restart. Confirm readiness, access to managed-Secret-backed resources, and creation of a new managed Secret before retiring the old key material.
 
 Never pass master-key material through CLI flags, HTTP payloads, logs, or the database. Supply key material only through the two environment variables. The rotation endpoint accepts only the expected Keyring record revision; use `0` before the first rotation and the `recordRevision` returned by each successful rotation thereafter.

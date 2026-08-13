@@ -1,0 +1,35 @@
+import { matchesKey, truncateToWidth, type Component, type Focusable } from "@mariozechner/pi-tui";
+
+import type { CliPrompt } from "../../cli/commands/model-setup.js";
+import type { ModelProfileResponse } from "../../http/model-control-schemas.js";
+import { safeDisplayLines } from "../safe-display-text.js";
+import { isRevisionConflict, type TuiClient } from "../tui-client.js";
+import type { InspectorScreen } from "./inspector.js";
+
+type AssignmentClient = Pick<TuiClient, "listAgents" | "listModelProfiles" | "getModelProfile" | "getModelAssignment" | "assignModel" | "getDefaultModelProfile" | "setDefaultModelProfile">;
+
+export class AssignmentScreen implements Component, Focusable {
+  focused = false;
+  private agents: readonly { readonly id: string; readonly displayName: string }[] = [];
+  private profiles: readonly ModelProfileResponse[] = [];
+  private pending = false;
+  private reloadRequired = false;
+  private operation: Promise<unknown> | undefined;
+  constructor(private readonly options: { readonly client: AssignmentClient; readonly inspector: InspectorScreen; readonly promptFactory?: () => CliPrompt; readonly onChange?: () => void; readonly onExit?: () => void }) {}
+  async load(): Promise<void> { if (this.operation !== undefined) return; this.pending = true; const operation = Promise.all([this.options.client.listAgents(), this.options.client.listModelProfiles(), this.options.client.getDefaultModelProfile()]).then(async ([agents, profiles, fallback]) => { this.agents = agents.agents; this.profiles = await Promise.all(profiles.profiles.map((profile) => this.options.client.getModelProfile(profile.profileId))); this.reloadRequired = false; this.options.inspector.showAssignmentSummary({ agents: this.agents.length, defaultProfileId: fallback.profileId }); }).catch(() => this.options.inspector.showProblem({ code: "assignment_list_failed", detail: "Assignments are unavailable.", traceId: "tui" })).finally(() => { this.pending = false; if (this.operation === operation) this.operation = undefined; this.changed(); }); this.operation = operation; await operation; }
+  async settled(): Promise<void> { await this.operation; }
+  handleInput(data: string): void { if (this.pending) return; if (matchesKey(data, "escape")) return this.options.onExit?.(); if (this.reloadRequired) { if (data === "r") void this.load(); return; } if (data === "a") void this.run(() => this.assign()); if (data === "d") void this.run(() => this.setDefault()); this.changed(); }
+  render(width: number): string[] { const lines = ["Assignments", ...this.agents.map((agent) => `Agent: ${agent.displayName} (${agent.id})`), ...(this.reloadRequired ? ["Reload required. Press r."] : ["[a] assign revision  [d] default Profile  [Esc] navigation"] )]; return lines.flatMap(safeDisplayLines).map((line) => truncateToWidth(line, width)); }
+  invalidate(): void {}
+  private async assign(): Promise<void> { const prompt = this.prompt(); const agentId = await prompt.select("Agent", this.agents.map(({ id }) => id)); const revision = await prompt.select("Verified Profile revision", this.verifiedRevisions()); const profile = this.profileForRevision(revision); if (profile === undefined) { this.options.inspector.showProblem({ code: "verification_required", detail: "Verification required before Assignment.", traceId: "tui" }); return; } const current = await this.options.client.getModelAssignment(agentId); const expectedRevision = current.recordRevision ?? 0; this.options.inspector.showAssignmentReview({ agentId, profileRevisionId: revision, source: "explicit", confirmation: "required" }); if (!await prompt.confirm("Confirm Agent Assignment?")) return; const assigned = await this.options.client.assignModel(agentId, { modelProfileRevisionId: revision, expectedRevision }); this.options.inspector.showAssignmentReview({ agentId, profileRevisionId: assigned.modelProfileRevisionId ?? revision, source: assigned.source ?? "explicit", confirmation: "confirmed", outcome: "Assignment updated." }); }
+  private async setDefault(): Promise<void> { const prompt = this.prompt(); const profileId = await prompt.select("Default Profile", this.profiles.filter((profile) => profile.revisions.some(assignable)).map(({ profileId: id }) => id)); const current = await this.options.client.getDefaultModelProfile(); const expectedRevision = current.recordRevision ?? 0; this.options.inspector.showAssignmentReview({ agentId: "default", profileRevisionId: profileId, source: "default", confirmation: "required", outcome: "Existing Assignments are not rewritten." }); if (!await prompt.confirm("Confirm default Profile?")) return; await this.options.client.setDefaultModelProfile({ profileId, expectedRevision }); this.options.inspector.showAssignmentReview({ agentId: "default", profileRevisionId: profileId, source: "default", confirmation: "confirmed", outcome: "Default updated. Existing Assignments are not rewritten." }); }
+  private verifiedRevisions(): readonly string[] { return this.profiles.flatMap((profile) => profile.revisions.filter(assignable).map(({ revisionId }) => revisionId)); }
+  private profileForRevision(revisionId: string): ModelProfileResponse | undefined { return this.profiles.find((profile) => profile.revisions.some((revision) => revision.revisionId === revisionId && assignable(revision))); }
+  private async run(action: () => Promise<void>): Promise<void> { if (this.operation !== undefined || this.reloadRequired) return; this.pending = true; const operation = action().catch((error: unknown) => { if (isRevisionConflict(error)) { this.reloadRequired = true; this.options.inspector.showConflict(); } else this.options.inspector.showProblem({ code: "assignment_operation_failed", detail: "The Assignment operation was not accepted.", traceId: "tui" }); }).finally(() => { this.pending = false; if (this.operation === operation) this.operation = undefined; this.changed(); }); this.operation = operation; await operation; }
+  private prompt(): CliPrompt { const prompt = this.options.promptFactory?.(); if (prompt === undefined) throw new Error("assignment_prompt_unavailable"); return prompt; }
+  private changed(): void { this.options.onChange?.(); }
+}
+
+function assignable(revision: ModelProfileResponse["revisions"][number]): boolean {
+  return revision.state === "verified" || revision.state === "active";
+}
