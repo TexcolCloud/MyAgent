@@ -65,8 +65,6 @@ loopback authority.
 | PUT /v1/admin/default-model-profile | Admin | Set the default Model Profile with `expectedRevision`. |
 | POST /v1/admin/managed-secret-versions/:secretVersionId/destruction | Admin | Confirmed Secret Version destruction with `expectedRevision`. |
 | POST /v1/admin/managed-secrets/master-key-rotation | Admin | Rotate the managed Secret master key with `expectedRevision`. |
-| POST /v1/admin/agents | Admin | Create a managed Agent with `expectedCatalogRevision`. |
-| GET /v1/admin/diagnostics | Admin | Read secret-safe operator diagnostics. |
 
 ## CLI Migration
 
@@ -75,5 +73,5 @@ Public CLI entry points are `myagent`, `tui`, `serve`, `config validate`,
 release and write exactly one deprecation notice to stderr; their normal exit
 codes and JSON stdout are unchanged. Use the TUI for interactive operations or
 the routes above for automation. Recovery commands require the explicit
-`myagent internal` prefix: `config reload`, `tools reconcile`, and `secrets
-rotate-master-key`.
+`myagent internal config reload`, `myagent internal tools reconcile`, and
+`myagent internal secrets rotate-master-key`.

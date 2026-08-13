@@ -5,6 +5,26 @@ import { describe, expect, it } from "vitest";
 import { startTestApp } from "../helpers/start-test-app.js";
 
 describe("HTTP Automation Surface v1", () => {
+  it("parses exact Route cells and rejects phantom documentation routes", () => {
+    const document = [
+      "| Route | Authority | Automation purpose |",
+      "| --- | --- | --- |",
+      "| GET /v1/runs | Run | List Runs. |",
+      "| POST /v1/runs | Run | Create a Run. |",
+      "| GET /v1/phantom | Run | Stale route. |",
+    ].join("\n");
+
+    expect(automationDocumentRoutes(document)).toEqual([
+      "GET /v1/phantom",
+      "GET /v1/runs",
+      "POST /v1/runs",
+    ]);
+    expect(automationDocumentRoutes(document)).not.toEqual([
+      "GET /v1/runs",
+      "POST /v1/runs",
+    ]);
+  });
+
   it("documents every registered /v1 route", async () => {
     const document = await readFile("docs/operations/http-automation-v1.md", "utf8");
     const app = await startTestApp();
@@ -13,7 +33,7 @@ describe("HTTP Automation Surface v1", () => {
       const routes = routeInventory(app.app.printRoutes({ commonPrefix: false }));
 
       expect(routes.length).toBeGreaterThan(0);
-      for (const route of routes) expect(document).toContain(`| ${route} |`);
+      expect(automationDocumentRoutes(document)).toEqual(routes);
     } finally {
       await app.close();
     }
@@ -24,14 +44,16 @@ function routeInventory(tree: string): readonly string[] {
   const currentPath: string[] = [];
   const routes: string[] = [];
   for (const line of tree.split("\n")) {
-    const depth = line.search(/\S/u);
-    const path = line.match(/(?:^|\s)(\/[^\s(]+)/u)?.[1];
+    const branch = Math.max(line.indexOf("├"), line.indexOf("└"));
+    if (branch < 0) continue;
+    const depth = branch / 4;
+    const path = line.match(/[├└]── (\/[^\s(]+)/u)?.[1];
     const methods = line.match(/\(([^)]+)\)/u)?.[1]
       ?.split(",")
       .map((method) => method.trim()) ?? [];
     if (path !== undefined) {
-      currentPath[Math.floor(depth / 4)] = path;
-      currentPath.length = Math.floor(depth / 4) + 1;
+      currentPath[depth] = path;
+      currentPath.length = depth + 1;
     }
     const url = currentPath.join("").replaceAll("//", "/");
     if (!url.startsWith("/v1/")) continue;
@@ -39,5 +61,17 @@ function routeInventory(tree: string): readonly string[] {
       if (["GET", "POST", "PUT", "DELETE"].includes(method)) routes.push(`${method} ${url}`);
     }
   }
+  return [...new Set(routes)].sort();
+}
+
+function automationDocumentRoutes(document: string): readonly string[] {
+  const routes = document.split("\n")
+    .flatMap((line) => {
+      const cells = line.split("|").map((cell) => cell.trim());
+      const route = cells[1];
+      return route !== undefined && /^(?:GET|POST|PUT|DELETE) \/v1\//u.test(route)
+        ? [route]
+        : [];
+    });
   return [...new Set(routes)].sort();
 }
