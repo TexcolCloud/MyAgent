@@ -34,6 +34,13 @@ export class CatalogService {
     return loadCatalog(this.#snapshot.configPath);
   }
 
+  async refreshAndAssertRevision(expectedRevision: string): Promise<void> {
+    const candidate = await this.validate();
+    assertReloadableGlobal(this.#snapshot, candidate);
+    this.#snapshot = Object.freeze(candidate);
+    this.assertRevision(expectedRevision);
+  }
+
   reload(): Promise<CatalogSnapshot>;
   reload<Result>(
     prepare: (candidate: CatalogSnapshot) => Result,

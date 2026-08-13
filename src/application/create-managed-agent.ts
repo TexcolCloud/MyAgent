@@ -45,11 +45,12 @@ export class CreateManagedAgentService {
   ) {}
 
   async execute(input: CreateManagedAgentInput): Promise<CreatedManagedAgent> {
-    return runCatalogExclusive(this.catalog, () => this.create(input));
+    const mutationKey = await managedMutationKey(this.catalog.current());
+    return runManagedRootExclusive(mutationKey, () => this.create(input));
   }
 
   private async create(input: CreateManagedAgentInput): Promise<CreatedManagedAgent> {
-    this.catalog.assertRevision(input.expectedCatalogRevision);
+    await this.catalog.refreshAndAssertRevision(input.expectedCatalogRevision);
     const id = parseManagedAgentId(input.id);
     const managedRoot = await resolveManagedRoot(this.catalog.current());
     assertManagedRelativePath(input.workspace);
@@ -83,12 +84,13 @@ export class CreateManagedAgentService {
       await write(path.join(temporary, "AGENT.md"), input.prompt);
       await write(path.join(temporary, "policy.yaml"), stringifyYaml({ version: 1, rules: policy.rules }));
       await exclusiveWrite(path.join(temporary, ownershipFile), ownershipToken);
+      await assertWorkspaceConfined(temporary, input.workspace);
 
       const stagedAgent = await validateAgentDirectory(temporary, this.catalog.current().global);
       if (!("definition" in stagedAgent) || stagedAgent.id !== id) {
         throw new ApplicationError("invalid_managed_agent", 422);
       }
-      this.catalog.assertRevision(input.expectedCatalogRevision);
+      await this.catalog.refreshAndAssertRevision(input.expectedCatalogRevision);
       await rename(temporary, target);
       renamed = true;
       const result = await this.catalog.reloadExpected(input.expectedCatalogRevision, (candidate) => {
@@ -122,23 +124,36 @@ export class CreateManagedAgentService {
   }
 }
 
-const catalogTails = new WeakMap<CatalogService, Promise<void>>();
+const managedRootTails = new Map<string, Promise<void>>();
 
-async function runCatalogExclusive<Result>(
-  catalog: CatalogService,
+async function runManagedRootExclusive<Result>(
+  key: string,
   operation: () => Promise<Result>,
 ): Promise<Result> {
-  const previous = catalogTails.get(catalog) ?? Promise.resolve();
+  const previous = managedRootTails.get(key) ?? Promise.resolve();
   let release: (() => void) | undefined;
   const tail = new Promise<void>((resolve) => { release = resolve; });
-  catalogTails.set(catalog, tail);
+  managedRootTails.set(key, tail);
   await previous;
   try {
     return await operation();
   } finally {
     release?.();
-    if (catalogTails.get(catalog) === tail) catalogTails.delete(catalog);
+    if (managedRootTails.get(key) === tail) managedRootTails.delete(key);
   }
+}
+
+async function managedMutationKey(snapshot: CatalogSnapshot): Promise<string> {
+  const [configPath, managedRoot] = await Promise.all([
+    realpath(snapshot.configPath),
+    resolveManagedRoot(snapshot),
+  ]);
+  return `${canonicalPathKey(configPath)}\0${canonicalPathKey(managedRoot)}`;
+}
+
+function canonicalPathKey(value: string): string {
+  const normalized = path.normalize(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 async function rollbackPublishedAgent(
@@ -207,6 +222,28 @@ function assertManagedRelativePath(value: string): void {
   if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) {
     throw new ApplicationError("invalid_managed_agent", 422);
   }
+}
+
+async function assertWorkspaceConfined(agentRoot: string, workspace: string): Promise<void> {
+  const canonicalRoot = await realpath(agentRoot);
+  const relative = path.relative(agentRoot, path.resolve(agentRoot, workspace));
+  let current = canonicalRoot;
+  for (const segment of relative.split(path.sep).filter((value) => value.length > 0)) {
+    try {
+      current = await realpath(path.join(current, segment));
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return;
+      throw new ApplicationError("invalid_managed_agent", 422);
+    }
+    if (!isWithin(canonicalRoot, current)) {
+      throw new ApplicationError("invalid_managed_agent", 422);
+    }
+  }
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`);
 }
 
 function parsePolicy(value: CreateManagedAgentInput["policy"]) {

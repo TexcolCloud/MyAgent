@@ -46,7 +46,10 @@ describe("CreateManagedAgentService", () => {
 
       await new CreateManagedAgentService(catalog).execute(input(catalog.revision()));
 
-      expect(scannedDirectories).toEqual([["writer"]]);
+      expect(scannedDirectories.at(-1)).toEqual(["writer"]);
+      expect(scannedDirectories.every((entries) =>
+        entries.every((entry) => !entry.includes("tmp")),
+      )).toBe(true);
     } finally { await project.close(); }
   });
 
@@ -177,16 +180,17 @@ describe("CreateManagedAgentService", () => {
     } finally { await project.close(); }
   });
 
-  it("serializes concurrent creates across service instances sharing a catalog", async () => {
+  it("serializes concurrent creates across independently loaded catalogs for one root", async () => {
     const project = await localProject();
     try {
-      const catalog = new CatalogService(await loadCatalog(project.configPath));
-      const revision = catalog.revision();
+      const firstCatalog = new CatalogService(await loadCatalog(project.configPath));
+      const secondCatalog = new CatalogService(await loadCatalog(project.configPath));
+      const revision = firstCatalog.revision();
       const results = await Promise.allSettled([
-        new CreateManagedAgentService(catalog).execute({
+        new CreateManagedAgentService(firstCatalog).execute({
           ...input(revision), id: "alpha", displayName: "Alpha",
         }),
-        new CreateManagedAgentService(catalog).execute({
+        new CreateManagedAgentService(secondCatalog).execute({
           ...input(revision), id: "beta", displayName: "Beta",
         }),
       ]);
@@ -197,7 +201,8 @@ describe("CreateManagedAgentService", () => {
       )).toEqual(["revision_conflict"]);
       const directories = await readdir(project.agentsRoot);
       expect(directories).toHaveLength(1);
-      expect(catalog.current().available.map(({ id }) => id)).toEqual(directories);
+      expect(firstCatalog.current().available.map(({ id }) => id)).toEqual(directories);
+      expect(secondCatalog.current().available.map(({ id }) => id)).toEqual(directories);
     } finally { await project.close(); }
   });
 
@@ -254,16 +259,29 @@ describe("CreateManagedAgentService", () => {
     } finally { await project.close(); await rm(outside, { recursive: true, force: true }); }
   });
 
-  it("rejects a workspace junction escape without touching its external target", async () => {
+  it("rejects a lexically in-root workspace junction escape", async (context) => {
     const project = await localProject();
     const outside = await mkdtemp(path.join(os.tmpdir(), "myagent-workspace-outside-"));
     try {
       await writeFile(path.join(outside, "keep.txt"), "keep\n");
-      await symlink(outside, path.join(project.agentsRoot, "linked-workspace"), "junction");
       const catalog = new CatalogService(await loadCatalog(project.configPath));
+      let writes = 0;
+      const service = new CreateManagedAgentService(catalog, {
+        writeFile: async (file, content) => {
+          await writeFile(file, content, { flag: "wx" });
+          writes += 1;
+          if (writes !== 3) return;
+          try {
+            await symlink(outside, path.join(path.dirname(file), "workspace"), "junction");
+          } catch (error) {
+            if (!hasCode(error, "EPERM") && !hasCode(error, "EACCES")) throw error;
+            context.skip(`junction creation unavailable: ${String((error as Error).message)}`);
+          }
+        },
+      });
 
-      await expect(new CreateManagedAgentService(catalog).execute({
-        ...input(catalog.revision()), workspace: "../linked-workspace",
+      await expect(service.execute({
+        ...input(catalog.revision()), workspace: "./workspace/child",
       })).rejects.toMatchObject({ code: "invalid_managed_agent" });
 
       expect(await readFile(path.join(outside, "keep.txt"), "utf8")).toBe("keep\n");
@@ -293,4 +311,8 @@ async function localProject(options: { agentRoots?: readonly string[] } = {}) {
     toolEnvironmentAllowlist: [],
   }));
   return { workspace, root, agentsRoot, configPath, close: () => rm(workspace, { recursive: true, force: true }) };
+}
+
+function hasCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
