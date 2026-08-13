@@ -32,6 +32,10 @@ import type {
   QueueModelVerificationInput,
   ReviseProviderConnectionInput,
 } from "../http/model-control-schemas.js";
+import type { CreateManagedAgentInput } from "../../application/create-managed-agent.js";
+import {
+  createdManagedAgentResponseSchema,
+} from "../http/routes/managed-agents.js";
 import {
   defaultModelProfileResponseSchema,
   discoveryResponseSchema,
@@ -143,6 +147,7 @@ export interface ApprovalDecision {
 export type ProviderDriverCatalog = ReadonlyResponse<ProviderDriversResponse>;
 
 export interface AgentListView {
+  readonly catalogRevision?: string;
   readonly agents: readonly { readonly id: string; readonly revisionId: string; readonly displayName: string }[];
   readonly unavailable: readonly { readonly label: string; readonly code: "invalid_agent_config" }[];
 }
@@ -243,6 +248,15 @@ export class TuiClient {
 
   listAgents(): Promise<AgentListView> {
     return this.requestAndParse(this.runClient, agentsResponseSchema, "/v1/agents");
+  }
+
+  createManagedAgent(
+    input: CreateManagedAgentInput,
+  ): Promise<z.output<typeof createdManagedAgentResponseSchema>> {
+    return this.requestAdmin(createdManagedAgentResponseSchema, "/v1/admin/agents", {
+      method: "POST",
+      body: input,
+    });
   }
 
   listProviderConnections(): Promise<ProviderConnectionsView> {

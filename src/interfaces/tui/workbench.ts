@@ -18,6 +18,7 @@ import type { ExitImpact } from "../local/exit-impact.js";
 import { safeDisplayLines } from "./safe-display-text.js";
 import { PiTuiPrompt } from "./pi-tui-prompt.js";
 import { ApprovalScreen } from "./screens/approvals.js";
+import { AgentScreen } from "./screens/agents.js";
 import { ChatScreen } from "./screens/chat.js";
 import { InspectorScreen } from "./screens/inspector.js";
 import { NavigationScreen, type WorkbenchDestination } from "./screens/navigation.js";
@@ -37,6 +38,7 @@ type WorkbenchClient = Pick<TuiClient,
   | "createModelProfile" | "promoteModelProfile" | "retireModelProfile" | "verifyModel"
   | "getModelVerificationAt" | "cancelModelVerification" | "getModelAssignment" | "assignModel"
   | "getDefaultModelProfile" | "setDefaultModelProfile"
+  | "createManagedAgent"
 >>;
 
 export interface RunWorkbenchOptions {
@@ -54,6 +56,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   let profileScreen: ProfileScreen | undefined;
   let verificationScreen: VerificationScreen | undefined;
   let assignmentScreen: AssignmentScreen | undefined;
+  let agentScreen: AgentScreen | undefined;
   let center: Component = chat;
   let closed = false;
   let modelSetupPending = false;
@@ -144,9 +147,9 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
       const screen = new VerificationScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
       verificationScreen = screen; center = screen; tui.setFocus(screen); tui.requestRender(); return;
     }
-    if (destination === "agents" && isAssignmentClient(options.client)) {
-      const screen = new AssignmentScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
-      assignmentScreen = screen; center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
+    if (destination === "agents" && isAgentClient(options.client)) {
+      const screen = new AgentScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onAssignments: () => { if (!isAssignmentClient(options.client)) return; const assignments = new AssignmentScreen({ client: options.client, inspector, promptFactory: () => new PiTuiPrompt(tui), onChange: () => tui.requestRender(), onExit: () => { center = screen; tui.setFocus(screen); tui.requestRender(); } }); assignmentScreen = assignments; center = assignments; tui.setFocus(assignments); void assignments.load().finally(() => tui.requestRender()); }, onChange: () => tui.requestRender(), onExit: () => { center = chat; tui.setFocus(navigation); tui.requestRender(); } });
+      agentScreen = screen; center = screen; tui.setFocus(screen); void screen.load().finally(() => tui.requestRender()); return;
     }
     center = chat;
     tui.setFocus(navigation);
@@ -269,6 +272,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     await profileScreen?.settled();
     await verificationScreen?.settled();
     await assignmentScreen?.settled();
+    await agentScreen?.settled();
     return 0;
   } finally {
     if (!closed && tui.hasOverlay()) tui.hideOverlay();
@@ -287,6 +291,10 @@ function isVerificationClient(client: WorkbenchClient): client is WorkbenchClien
 
 function isAssignmentClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof AssignmentScreen>[0]["client"] {
   return typeof client.getModelProfile === "function" && typeof client.getModelAssignment === "function" && typeof client.assignModel === "function" && typeof client.getDefaultModelProfile === "function" && typeof client.setDefaultModelProfile === "function";
+}
+
+function isAgentClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof AgentScreen>[0]["client"] {
+  return typeof client.createManagedAgent === "function";
 }
 
 function isProviderClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof ProviderScreen>[0]["client"] {

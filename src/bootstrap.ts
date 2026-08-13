@@ -45,6 +45,7 @@ import { AgentResolver } from "./application/agent-resolver.js";
 import { AssignModelService } from "./application/assign-model.js";
 import { CancelRunService } from "./application/cancel-run.js";
 import { CreateBackupService } from "./application/create-backup.js";
+import { CreateManagedAgentService } from "./application/create-managed-agent.js";
 import { CreateRunService } from "./application/create-run.js";
 import { DecideApprovalService } from "./application/decide-approval.js";
 import { DelegateAgentService } from "./application/delegate-agent.js";
@@ -372,6 +373,11 @@ export async function bootstrap(
         catalog,
         clock,
       ),
+      createManagedAgents: new CreateManagedAgentService(catalog, {
+        afterReload(candidate) {
+          assignments.synchronizeAgents(candidate.available.map(({ id }) => id));
+        },
+      }),
       logger,
       readiness: createReadinessProbe(
         catalog,

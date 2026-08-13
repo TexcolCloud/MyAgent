@@ -5,6 +5,7 @@ import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } 
 import type { CancelRunService } from "../../application/cancel-run.js";
 import type { AssignModelService } from "../../application/assign-model.js";
 import type { CreateBackupService } from "../../application/create-backup.js";
+import type { CreateManagedAgentService } from "../../application/create-managed-agent.js";
 import type { CreateRunService } from "../../application/create-run.js";
 import type { DecideApprovalService } from "../../application/decide-approval.js";
 import type { DeleteSessionService } from "../../application/delete-session.js";
@@ -37,6 +38,7 @@ import { registerModelProfileRoutes } from "./routes/model-profiles.js";
 import { registerModelVerificationRoutes } from "./routes/model-verifications.js";
 import { registerModelAssignmentRoutes } from "./routes/model-assignments.js";
 import { registerManagedSecretRoutes } from "./routes/managed-secrets.js";
+import { registerManagedAgentRoutes } from "./routes/managed-agents.js";
 import { registerProviderDriverRoutes } from "./routes/provider-drivers.js";
 import { serializeWithSchema } from "./schemas.js";
 import type { SseStreamOptions } from "./sse.js";
@@ -69,6 +71,7 @@ export interface HttpAppOptions {
   deleteSession?: DeleteSessionService;
   sse?: SseStreamOptions;
   createBackups?: CreateBackupService;
+  createManagedAgents?: CreateManagedAgentService;
   logger?: FastifyBaseLogger;
   readiness?: ReadinessProbe;
 }
@@ -166,6 +169,12 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
       registerModelVerificationRoutes(api, options.modelControl!);
       registerModelAssignmentRoutes(api, options.modelControl!);
       registerManagedSecretRoutes(api, options.modelControl!);
+      done();
+    }, { prefix: "/v1/admin" });
+  }
+  if (options.createManagedAgents !== undefined) {
+    app.register((api, _routeOptions, done) => {
+      registerManagedAgentRoutes(api, options.createManagedAgents!);
       done();
     }, { prefix: "/v1/admin" });
   }

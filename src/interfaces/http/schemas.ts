@@ -58,6 +58,7 @@ const unavailableAgentResponseSchema = z.strictObject({
   code: z.literal("invalid_agent_config"),
 });
 export const agentsResponseSchema = z.strictObject({
+  catalogRevision: z.string().startsWith("catalog_"),
   agents: z.array(z.strictObject({ id: agentIdSchema, revisionId: z.string(), displayName: z.string() })),
   unavailable: z.array(unavailableAgentResponseSchema),
 });
