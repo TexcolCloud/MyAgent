@@ -6,11 +6,19 @@ import { describe, expect, it } from "vitest";
 
 import {
   captureProjectTextSurfaces,
+  createExactTokenGenerator,
   runLocalCliFixture,
   type CapturedTextSurface,
 } from "../helpers/local-cli-fixture.js";
 
 describe("Local Integrated Mode secret boundary", () => {
+  it("rejects fixture completion unless both supplied capabilities were consumed", () => {
+    const tokens = createExactTokenGenerator(["run-sentinel", "admin-sentinel"]);
+
+    expect(tokens.next()).toBe("run-sentinel");
+    expect(() => tokens.assertConsumed()).toThrow("local_fixture_tokens_not_consumed");
+  });
+
   it("keeps both in-memory capability tokens out of output, logs, project files, and SQLite text", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-local-leak-"));
     const projectRoot = path.join(workspace, ".myagent");

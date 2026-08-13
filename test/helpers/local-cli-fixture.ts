@@ -16,6 +16,7 @@ export interface LocalCliCapture {
   readonly stderr: readonly string[];
   readonly logs: readonly string[];
   readonly consentPrompts: readonly string[];
+  readonly unauthenticatedStatuses: readonly number[];
 }
 
 export interface LocalCliFixtureOptions {
@@ -29,6 +30,27 @@ export interface CapturedTextSurface {
   readonly text: string;
 }
 
+export interface ExactTokenGenerator {
+  next(): string;
+  assertConsumed(): void;
+}
+
+export function createExactTokenGenerator(
+  values: readonly [runToken: string, adminToken: string],
+): ExactTokenGenerator {
+  const remaining = [...values];
+  return {
+    next(): string {
+      const token = remaining.shift();
+      if (token === undefined) throw new Error("local_fixture_token_exhausted");
+      return token;
+    },
+    assertConsumed(): void {
+      if (remaining.length !== 0) throw new Error("local_fixture_tokens_not_consumed");
+    },
+  };
+}
+
 export async function runLocalCliFixture(
   options: LocalCliFixtureOptions,
 ): Promise<LocalCliCapture> {
@@ -38,7 +60,10 @@ export async function runLocalCliFixture(
   const urls: string[] = [];
   const listen: NonNullable<BootstrapOptions["listen"]>[] = [];
   const consentPrompts: string[] = [];
-  const generatedTokens = options.tokens === undefined ? [] : [...options.tokens];
+  const unauthenticatedStatuses: number[] = [];
+  const generatedTokens = options.tokens === undefined
+    ? undefined
+    : createExactTokenGenerator(options.tokens);
 
   const exitCode = await executeCli([], {
     workspace: options.workspace,
@@ -58,15 +83,9 @@ export async function runLocalCliFixture(
     runLocalHost: async ({ configPath }) => runLocalHost({
       configPath,
       dependencies: {
-        ...(generatedTokens.length === 0
+        ...(generatedTokens === undefined
           ? {}
-          : {
-              generateToken: () => {
-                const token = generatedTokens.shift();
-                if (token === undefined) throw new Error("local_fixture_token_exhausted");
-                return token;
-              },
-            }),
+          : { generateToken: () => generatedTokens.next() }),
         bootstrapService: async (capturedConfigPath, bootstrapOptions = {}) => {
           if (bootstrapOptions.listen !== undefined) listen.push(bootstrapOptions.listen);
           const service = await bootstrap(capturedConfigPath, {
@@ -74,6 +93,7 @@ export async function runLocalCliFixture(
             log: { write: (line) => { logs.push(line); } },
           });
           urls.push(service.url);
+          unauthenticatedStatuses.push((await fetch(`${service.url}/v1/agents`)).status);
           return service;
         },
         runTui: async (workbenchOptions) => {
@@ -84,6 +104,7 @@ export async function runLocalCliFixture(
       },
     }),
   });
+  generatedTokens?.assertConsumed();
 
   return {
     exitCode,
@@ -93,6 +114,7 @@ export async function runLocalCliFixture(
     stderr,
     logs,
     consentPrompts,
+    unauthenticatedStatuses,
   };
 }
 

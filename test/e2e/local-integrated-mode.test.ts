@@ -18,6 +18,7 @@ describe("Local Integrated Mode", () => {
       expect(first.consentPrompts).toHaveLength(1);
       expect(first.listen).toEqual([{ host: "127.0.0.1", port: 0 }]);
       expect(first.urls).toHaveLength(1);
+      expect(first.unauthenticatedStatuses).toEqual([401]);
       expect(new URL(first.urls[0]!).hostname).toBe("127.0.0.1");
       expect(Number(new URL(first.urls[0]!).port)).toBeGreaterThan(0);
       await expect(fetch(`${first.urls[0]!}/healthz`, {
