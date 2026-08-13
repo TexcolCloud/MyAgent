@@ -81,7 +81,7 @@ describe("local project state", () => {
       const paths = resolveLocalProjectPaths(workspace, explicit);
 
       expect(paths.configPath).toBe(explicit);
-      expect(paths.root).toBe(path.join(workspace, "settings"));
+      expect(paths.root).toBe(path.join(workspace, ".myagent"));
       expect(await inspectProjectState(paths)).toBe("absent");
     } finally {
       await rm(workspace, { recursive: true, force: true });

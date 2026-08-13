@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+import { stat } from "node:fs/promises";
+import path from "node:path";
+
+import { loadBootConfig } from "../../config/boot-config.js";
 import { CliClient, CliCredentialError, CliHttpError, CliProtocolError, CliValidationError } from "./client.js";
 import { listAgents, setAgentModel } from "./commands/agents.js";
 import { listApprovals, decideApproval } from "./commands/approvals.js";
@@ -246,10 +250,14 @@ async function executeLocalTui(flags: CliFlags, options: ExecuteCliOptions): Pro
     stdinIsTTY: options.stdinIsTTY ?? process.stdin.isTTY === true,
     stdoutIsTTY: options.stdoutIsTTY ?? process.stdout.isTTY === true,
   });
+  const explicitConfigPath = stringFlag(flags, "config");
   const paths = resolveLocalProjectPaths(
     options.workspace ?? process.cwd(),
-    stringFlag(flags, "config"),
+    explicitConfigPath,
   );
+  if (explicitConfigPath !== undefined) {
+    await assertWorkspaceOwnedLocalConfig(paths);
+  }
   const inspect = options.inspectProjectState ?? inspectProjectState;
   const state = await inspect(paths);
   if (state === "partial") {
@@ -275,6 +283,49 @@ async function executeLocalTui(flags: CliFlags, options: ExecuteCliOptions): Pro
   }
   const { runLocalHost } = await import("../local/local-host.js");
   return await runLocalHost({ configPath: paths.configPath, projectStateRoot: paths.root });
+}
+
+async function assertWorkspaceOwnedLocalConfig(
+  paths: LocalProjectPaths,
+): Promise<void> {
+  if (!(await isFile(paths.configPath))) {
+    if (paths.configPath === path.join(paths.root, "myagent.yaml")) return;
+    throw localConfigOutsideProjectState();
+  }
+  const config = await loadBootConfig(paths.configPath);
+  const configDirectory = path.dirname(paths.configPath);
+  const durablePaths = [
+    path.resolve(configDirectory, config.database.path),
+    ...config.agentRoots.map((root) => path.resolve(configDirectory, root)),
+    ...config.skillRoots.map((root) => path.resolve(configDirectory, root)),
+  ];
+  if (durablePaths.some((candidate) => !isPathWithin(paths.root, candidate))) {
+    throw localConfigOutsideProjectState();
+  }
+}
+
+function localConfigOutsideProjectState(): CliUsageError {
+  return new CliUsageError(
+    "local_config_outside_project_state",
+    "Local configuration must use Workspace-owned Project Agent State.",
+  );
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (
+    !path.isAbsolute(relative)
+    && relative !== ".."
+    && !relative.startsWith(`..${path.sep}`)
+  );
+}
+
+async function isFile(candidate: string): Promise<boolean> {
+  try {
+    return (await stat(candidate)).isFile();
+  } catch {
+    return false;
+  }
 }
 
 function normalizeAttachedOrigin(value: string): URL {

@@ -143,32 +143,130 @@ describe("CLI HTTP boundary", () => {
     },
   );
 
-  it("requires first-run consent before initialization and honors an explicit local config", async () => {
+  it("rejects a missing noncanonical local config before inspection or initialization", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
     const workspace = tempPath(`cli-local-init-${randomUUID()}`);
     const configPath = path.join(workspace, "controlled", "local.yaml");
-    const events: string[] = [];
+    const inspectProjectState = vi.fn(async () => "absent" as const);
+    const initializeProjectState = vi.fn(async () => undefined);
+    const runLocalHost = vi.fn(async () => 0);
+    const confirm = vi.fn(async () => true);
+    const stderr: string[] = [];
+
+    await expect(executeCli(["tui", "--config", configPath], {
+      workspace,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      inspectProjectState,
+      initializeProjectState,
+      prompt: {
+        select: async () => { throw new Error("unexpected_select"); },
+        input: async () => { throw new Error("unexpected_input"); },
+        secret: async () => { throw new Error("unexpected_secret"); },
+        confirm,
+      },
+      runLocalHost,
+      writeError: (line) => stderr.push(line),
+    })).resolves.toBe(2);
+
+    expect(stderr).toEqual([
+      "local_config_outside_project_state: Local configuration must use Workspace-owned Project Agent State. (traceId: cli)",
+    ]);
+    expect(inspectProjectState).not.toHaveBeenCalled();
+    expect(initializeProjectState).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(runLocalHost).not.toHaveBeenCalled();
+  });
+
+  it("initializes an explicitly selected canonical local config", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-canonical-${randomUUID()}`);
+    const configPath = path.join(workspace, ".myagent", "myagent.yaml");
+    const initializeProjectState = vi.fn(async () => undefined);
+    const runLocalHost = vi.fn(async () => 0);
 
     await expect(executeCli(["tui", "--config", configPath], {
       workspace,
       stdinIsTTY: true,
       stdoutIsTTY: true,
       inspectProjectState: async () => "absent",
-      initializeProjectState: async () => { events.push("initialize"); },
+      initializeProjectState,
       prompt: {
         select: async () => { throw new Error("unexpected_select"); },
         input: async () => { throw new Error("unexpected_input"); },
         secret: async () => { throw new Error("unexpected_secret"); },
-        confirm: async () => { events.push("confirm"); return true; },
+        confirm: async () => true,
       },
-      runLocalHost: async ({ configPath: selectedConfigPath, projectStateRoot }) => {
-        events.push(`host:${selectedConfigPath}`);
-        events.push(`root:${projectStateRoot}`);
-        return 0;
-      },
+      runLocalHost,
     })).resolves.toBe(0);
 
-    expect(events).toEqual(["confirm", "initialize", `host:${configPath}`, `root:${path.dirname(configPath)}`]);
+    expect(initializeProjectState).toHaveBeenCalledTimes(1);
+    expect(runLocalHost).toHaveBeenCalledWith({
+      configPath,
+      projectStateRoot: path.join(workspace, ".myagent"),
+    });
+  });
+
+  it.each([
+    {
+      name: "incompatible",
+      database: "state.sqlite",
+      agentRoots: ["agents"],
+      skillRoots: ["skills"],
+      expectedExit: 2,
+    },
+    {
+      name: "compatible",
+      database: "../.myagent/state.sqlite",
+      agentRoots: ["../.myagent/agents"],
+      skillRoots: ["../.myagent/skills"],
+      expectedExit: 0,
+    },
+  ])("handles an $name existing explicit local config before host startup", async ({
+    database,
+    agentRoots,
+    skillRoots,
+    expectedExit,
+  }) => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-explicit-${randomUUID()}`);
+    const configPath = path.join(workspace, "controlled", "local.yaml");
+    await mkdir(path.dirname(configPath), { recursive: true });
+    await writeFile(configPath, [
+      "version: 2",
+      "server:",
+      "  bearerToken: { fromEnvironment: RUN_TOKEN }",
+      "  adminToken: { fromEnvironment: ADMIN_TOKEN }",
+      "database:",
+      `  path: ${database}`,
+      "agentRoots:",
+      ...agentRoots.map((root) => `  - ${root}`),
+      "skillRoots:",
+      ...skillRoots.map((root) => `  - ${root}`),
+      "toolEnvironmentAllowlist: []",
+      "",
+    ].join("\n"));
+    const inspectProjectState = vi.fn(async () => "ready" as const);
+    const runLocalHost = vi.fn(async () => 0);
+
+    await expect(executeCli(["tui", "--config", configPath], {
+      workspace,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      inspectProjectState,
+      runLocalHost,
+      writeError: () => {},
+    })).resolves.toBe(expectedExit);
+
+    if (expectedExit === 0) {
+      expect(runLocalHost).toHaveBeenCalledWith({
+        configPath,
+        projectStateRoot: path.join(workspace, ".myagent"),
+      });
+    } else {
+      expect(inspectProjectState).not.toHaveBeenCalled();
+      expect(runLocalHost).not.toHaveBeenCalled();
+    }
   });
 
   it("fails noninteractively before creating absent project state", async () => {

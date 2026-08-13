@@ -33,9 +33,7 @@ export function resolveLocalProjectPaths(
   const resolvedConfigPath = path.resolve(
     configPath ?? path.join(resolvedWorkspace, ".myagent", "myagent.yaml"),
   );
-  const root = configPath === undefined
-    ? path.join(resolvedWorkspace, ".myagent")
-    : path.dirname(resolvedConfigPath);
+  const root = path.join(resolvedWorkspace, ".myagent");
   return {
     workspace: resolvedWorkspace,
     root,
