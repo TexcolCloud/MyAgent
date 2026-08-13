@@ -46,15 +46,30 @@ describe("HTTP Runs", () => {
         return response.json().runId as RunId;
       };
       const queuedRunId = await create("request-active-queued", "session:active-queued");
+      const runningRunId = await create("request-active-running", "session:active-running");
+      const waitingRunId = await create("request-active-waiting", "session:active-waiting");
       const cancellingRunId = await create("request-active-cancelling", "session:active-cancelling");
       const completedRunId = await create("request-active-completed", "session:active-completed");
+      const reconciliationRunId = await create("request-active-reconciliation", "session:active-reconciliation");
       const now = harness.clock.now();
       harness.connection.db.prepare(
-        "UPDATE runs SET state = 'running', cancellation_requested_at = ? WHERE run_id = ?",
-      ).run(now.toISOString(), cancellingRunId);
+        "UPDATE runs SET state = 'running', created_at = ? WHERE run_id = ?",
+      ).run("2026-08-07T00:00:02.000Z", runningRunId);
+      harness.connection.db.prepare(
+        "UPDATE runs SET state = 'waiting_approval', created_at = ? WHERE run_id = ?",
+      ).run("2026-08-07T00:00:03.000Z", waitingRunId);
+      harness.connection.db.prepare(
+        "UPDATE runs SET state = 'running', cancellation_requested_at = ?, created_at = ? WHERE run_id = ?",
+      ).run(now.toISOString(), "2026-08-07T00:00:04.000Z", cancellingRunId);
       harness.connection.db.prepare(
         "UPDATE runs SET state = 'completed', output_json = ? WHERE run_id = ?",
       ).run('{"type":"text","text":"done"}', completedRunId);
+      harness.connection.db.prepare(
+        "UPDATE runs SET state = 'waiting_reconciliation' WHERE run_id = ?",
+      ).run(reconciliationRunId);
+      harness.connection.db.prepare(
+        "UPDATE runs SET created_at = ? WHERE run_id = ?",
+      ).run("2026-08-07T00:00:01.000Z", queuedRunId);
       const before = harness.connection.db.prepare(
         "SELECT run_id, state, cancellation_requested_at FROM runs ORDER BY run_id",
       ).all();
@@ -67,14 +82,47 @@ describe("HTTP Runs", () => {
 
       expect(response.statusCode).toBe(200);
       const body = response.json() as { runs: unknown[] };
-      expect(body.runs).toHaveLength(2);
-      expect(body.runs).toEqual(expect.arrayContaining([
-        { runId: cancellingRunId, status: "cancelling" },
+      expect(body.runs).toEqual([
         { runId: queuedRunId, status: "queued" },
-      ]));
+        { runId: runningRunId, status: "running" },
+        { runId: waitingRunId, status: "waiting_approval" },
+        { runId: cancellingRunId, status: "cancelling" },
+      ]);
       expect(harness.connection.db.prepare(
         "SELECT run_id, state, cancellation_requested_at FROM runs ORDER BY run_id",
       ).all()).toEqual(before);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each([
+    ["missing state", "/v1/runs"],
+    ["wrong state", "/v1/runs?state=completed"],
+    ["extra query", "/v1/runs?state=active&limit=1"],
+    ["duplicate state", "/v1/runs?state=active&state=active"],
+  ])("rejects %s on the active Run boundary", async (_label, url) => {
+    const harness = await startTestApp();
+    try {
+      const response = await harness.app.inject({ method: "GET", url, headers: auth });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({ code: "invalid_request" });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("requires Run authentication for active impact inspection", async () => {
+    const harness = await startTestApp();
+    try {
+      const response = await harness.app.inject({
+        method: "GET",
+        url: "/v1/runs?state=active",
+      });
+
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toMatchObject({ code: "unauthorized" });
     } finally {
       await harness.close();
     }

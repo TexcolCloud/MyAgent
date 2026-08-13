@@ -27,6 +27,7 @@ export class ChatScreen implements Component, Focusable {
   private cursor: RunEventCursor | undefined;
   private controller: AbortController | undefined;
   private operation: Promise<void> | undefined;
+  private createBoundary: Promise<void> | undefined;
   private terminal = false;
 
   constructor(private readonly options: {
@@ -51,7 +52,18 @@ export class ChatScreen implements Component, Focusable {
 
     const controller = new AbortController();
     this.controller = controller;
-    const operation = this.createAndConsume(client, { agentId, sessionKey, text }, controller)
+    let resolveCreateBoundary: (() => void) | undefined;
+    const createBoundary = new Promise<void>((resolve) => { resolveCreateBoundary = resolve; });
+    this.createBoundary = createBoundary;
+    const operation = this.createAndConsume(
+      client,
+      { agentId, sessionKey, text },
+      controller,
+      () => {
+        resolveCreateBoundary?.();
+        if (this.createBoundary === createBoundary) this.createBoundary = undefined;
+      },
+    )
       .finally(() => {
         if (this.controller === controller) this.controller = undefined;
         if (this.operation === operation) this.operation = undefined;
@@ -82,6 +94,10 @@ export class ChatScreen implements Component, Focusable {
     await this.operation;
   }
 
+  async createSettled(): Promise<void> {
+    await this.createBoundary;
+  }
+
   render(width: number): string[] {
     const title = this.destination === "runs" ? "Runs" : titleFor(this.destination);
     return [
@@ -96,12 +112,18 @@ export class ChatScreen implements Component, Focusable {
     client: ChatClient,
     input: ChatSubmission,
     controller: AbortController,
+    createSettled: () => void,
   ): Promise<void> {
-    const created = await client.createRun({
-      ...input,
-      idempotencyKey: randomUUID(),
-      signal: controller.signal,
-    });
+    let created: Awaited<ReturnType<ChatClient["createRun"]>>;
+    try {
+      created = await client.createRun({
+        ...input,
+        idempotencyKey: randomUUID(),
+        signal: controller.signal,
+      });
+    } finally {
+      createSettled();
+    }
     this.destination = "runs";
     this.cursor = { runId: created.runId };
     this.terminal = false;

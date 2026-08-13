@@ -45,12 +45,141 @@ describe("TUI workbench", () => {
     expect(terminal.stopCalls).toBe(0);
 
     terminal.input("\u0003");
-    await terminal.waitForFrame("Exit MyAgent?");
+    await vi.waitFor(() => { expect(beforeExit).toHaveBeenCalledTimes(2); });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     terminal.input("\r");
 
     await expect(workbench).resolves.toBe(0);
     expect(beforeExit).toHaveBeenCalledTimes(2);
     expect(terminal.stopCalls).toBe(1);
+  });
+
+  it("takes the exit snapshot after an in-flight Run creation settles and blocks new mutations", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const events: string[] = [];
+    let resolveCreate: ((value: {
+      readonly runId: string;
+      readonly status: "queued";
+      readonly eventsUrl: string;
+    }) => void) | undefined;
+    const createRun = vi.fn(() => {
+      events.push("create_started");
+      return new Promise<{
+        readonly runId: string;
+        readonly status: "queued";
+        readonly eventsUrl: string;
+      }>((resolve) => { resolveCreate = resolve; });
+    });
+    let committed = false;
+    let resolveInspection: (() => void) | undefined;
+    const inspectionRelease = new Promise<void>((resolve) => { resolveInspection = resolve; });
+    const beforeExit = vi.fn(() => {
+      events.push("inspection_started");
+      const snapshot = committed
+        ? { activeRuns: [{ runId: "run_committed", status: "queued" as const }], pendingApprovalCount: 0 }
+        : { activeRuns: [], pendingApprovalCount: 0 };
+      return inspectionRelease.then(() => snapshot);
+    });
+    const listPendingApprovals = vi.fn(async () => ({ approvals: [] }));
+    let adminRequestCount = 0;
+    const adminRequest = async <T>(
+      path: string,
+      init?: { readonly method?: string },
+    ): Promise<T> => {
+      adminRequestCount += 1;
+      void path;
+      void init;
+      return {} as T;
+    };
+    const client = safeClient({
+      createRun,
+      stream: async () => sseResponse([
+        eventFrame(1, "run.completed", { result: { type: "text", text: "done" } }),
+      ]),
+      listPendingApprovals,
+      adminRequest,
+    });
+    const workbench = runWorkbench({ client, terminal, beforeExit });
+
+    await terminal.ready();
+    terminal.input("c");
+    await terminal.waitForFrame("Agent ID");
+    terminal.input("primary");
+    terminal.input("\r");
+    await terminal.waitForFrame("Session Key");
+    terminal.input("tui:barrier");
+    terminal.input("\r");
+    await terminal.waitForFrame("Message");
+    terminal.input("commit first");
+    terminal.input("\r");
+    await vi.waitFor(() => { expect(createRun).toHaveBeenCalledOnce(); });
+    terminal.input("\u0003");
+
+    committed = true;
+    events.push("create_committed");
+    resolveCreate?.({
+      runId: "run_committed",
+      status: "queued",
+      eventsUrl: "/v1/runs/run_committed/events",
+    });
+    await vi.waitFor(() => { expect(beforeExit).toHaveBeenCalledOnce(); });
+    terminal.input("c");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    terminal.input("\u001b");
+    terminal.input("a");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    terminal.input("\u001b");
+    terminal.input("m");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    resolveInspection?.();
+    const outcome = await Promise.race([
+      workbench.then(() => "resolved" as const),
+      terminal.waitForFrame("Exit MyAgent?").then(() => "prompt" as const),
+    ]);
+    if (outcome === "prompt") {
+      terminal.input("\r");
+      await workbench;
+    }
+
+    expect(outcome).toBe("prompt");
+    expect(events.slice(0, 3)).toEqual([
+      "create_started",
+      "create_committed",
+      "inspection_started",
+    ]);
+    expect(createRun).toHaveBeenCalledOnce();
+    expect(listPendingApprovals).not.toHaveBeenCalled();
+    expect(adminRequestCount).toBe(0);
+  });
+
+  it("restores the exact active prompt and focus after exit is declined", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    let inspections = 0;
+    const beforeExit = vi.fn(async () => {
+      inspections += 1;
+      return inspections === 1
+        ? { activeRuns: [{ runId: "run_1", status: "running" as const }], pendingApprovalCount: 0 }
+        : { activeRuns: [], pendingApprovalCount: 0 };
+    });
+    const workbench = runWorkbench({ client: safeClient(), terminal, beforeExit });
+
+    await terminal.ready();
+    terminal.input("c");
+    await terminal.waitForFrame("Agent ID");
+    terminal.input("\u0003");
+    await terminal.waitForFrame("Exit MyAgent?");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    terminal.input("primary");
+    terminal.input("\r");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    const restoredPrompt = terminal.frames.at(-1)?.includes("Session Key") === true;
+    terminal.input("\u0003");
+
+    await workbench;
+    expect(restoredPrompt).toBe(true);
   });
 
   it("aborts and awaits a stalled Run creation without letting reconnect displace it", async () => {
@@ -872,6 +1001,7 @@ function safeClient(overrides: Partial<{
   createRun: (input: { readonly agentId: string; readonly sessionKey: string; readonly text: string; readonly idempotencyKey?: string; readonly signal?: AbortSignal }) => Promise<{ readonly runId: string; readonly status: "queued"; readonly eventsUrl: string }>;
   stream: (path: string, lastEventId?: string, signal?: AbortSignal) => Promise<Response>;
   approvals: readonly ReturnType<typeof pendingApproval>[];
+  listPendingApprovals: () => Promise<{ readonly approvals: readonly ReturnType<typeof pendingApproval>[] }>;
   decideApproval: (approvalId: string, decision: "approve" | "deny") => Promise<{ readonly approvalId: string; readonly runId: string; readonly state: "approved" | "denied"; readonly resolvedAt: string | null }>;
 }> = {}) {
   return {
@@ -884,7 +1014,7 @@ function safeClient(overrides: Partial<{
       : {} as T)),
     createRun: overrides.createRun ?? (async () => ({ runId: "run_1", status: "queued", eventsUrl: "/v1/runs/run_1/events" })),
     stream: overrides.stream ?? (async () => sseResponse([eventFrame(1, "run.completed", { result: null })])),
-    listPendingApprovals: async () => ({ approvals: overrides.approvals ?? [] }),
+    listPendingApprovals: overrides.listPendingApprovals ?? (async () => ({ approvals: overrides.approvals ?? [] })),
     decideApproval: overrides.decideApproval ?? (async (approvalId, decision) => ({
       approvalId,
       runId: "run_1",

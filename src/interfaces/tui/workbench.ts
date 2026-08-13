@@ -8,6 +8,7 @@ import {
   truncateToWidth,
   visibleWidth,
   type Component,
+  type OverlayHandle,
   type Terminal,
   type SelectItem,
   type SelectListTheme,
@@ -70,25 +71,22 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
       return;
     }
     exitPending = true;
-    const attempt = beforeExit().then((impact) => {
+    const attempt = chat.createSettled().then(beforeExit).then((impact) => {
       if (closed) return;
       if (impact.activeRuns.length === 0 && impact.pendingApprovalCount === 0) {
         stopped();
         return;
       }
+      exitPending = false;
       const prompt = new ExitConfirmation(impact, (confirmed) => {
         if (exitPrompt !== prompt) return;
         exitPrompt = undefined;
-        if (tui.hasOverlay()) tui.hideOverlay();
+        handle.hide();
         if (confirmed) stopped();
-        else {
-          tui.setFocus(navigation);
-          tui.requestRender();
-        }
+        else tui.requestRender();
       });
       exitPrompt = prompt;
-      tui.showOverlay(prompt, { width: "75%", maxHeight: "80%" });
-      tui.setFocus(prompt);
+      const handle: OverlayHandle = tui.showOverlay(prompt, { width: "75%", maxHeight: "80%" });
       tui.requestRender();
     }).catch((error: unknown) => {
       if (!closed) {
@@ -127,10 +125,12 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
         attemptExit();
         return { consume: true };
       }
+      if (exitPrompt !== undefined) return undefined;
+      if (exitPending) return { consume: true };
       if (matchesKey(data, "c") && chatPrompt === undefined && !modelSetupPending && !tui.hasOverlay()) {
         const prompt = new PiTuiPrompt(tui);
         chatPrompt = prompt;
-        const action = submitChat(prompt, chat).catch((error: unknown) => {
+        const action = submitChat(prompt, chat, () => !exitPending).catch((error: unknown) => {
           if (!closed) inspector.showProblem(safeProblem(error, "run_create_failed", "The Run could not be created."));
         }).finally(() => {
           if (chatPrompt === prompt) chatPrompt = undefined;
@@ -262,10 +262,15 @@ class ExitConfirmation implements Component {
   invalidate(): void { this.box.invalidate(); }
 }
 
-async function submitChat(prompt: PiTuiPrompt, chat: ChatScreen): Promise<void> {
+async function submitChat(
+  prompt: PiTuiPrompt,
+  chat: ChatScreen,
+  canSubmit: () => boolean,
+): Promise<void> {
   const agentId = await prompt.input("Agent ID");
   const sessionKey = await prompt.input("Session Key");
   const text = await prompt.input("Message");
+  if (!canSubmit()) return;
   await chat.submit({ agentId, sessionKey, text });
 }
 
