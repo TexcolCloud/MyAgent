@@ -118,18 +118,24 @@ export async function bootstrap(
   options: BootstrapOptions = {},
 ): Promise<BootstrappedService> {
   assertSupportedRuntime();
+  const injectedAuth = options.auth === undefined ? undefined : Object.freeze({
+    bearerToken: options.auth.bearerToken,
+    adminToken: options.auth.adminToken,
+  });
+  if (injectedAuth !== undefined) {
+    assertValidHttpAuth(injectedAuth);
+    Object.freeze(options.auth);
+  }
   const absoluteConfigPath = path.resolve(configPath);
   const bootConfig = await loadBootConfig(absoluteConfigPath);
   const redactionRegistry = new MutableDynamicRedactionRegistry();
   const environmentSecrets = new EnvironmentSecretResolver();
-  const auth = options.auth === undefined ? {
+  const auth = injectedAuth ?? {
     bearerToken: environmentSecrets.resolve(bootConfig.server.bearerToken),
     adminToken: environmentSecrets.resolve(bootConfig.server.adminToken),
-  } : Object.freeze(options.auth);
+  };
   const { bearerToken, adminToken } = auth;
-  if (bearerToken.length === 0) throw new Error("http_bearer_token_required");
-  if (adminToken.length === 0) throw new Error("http_admin_token_required");
-  if (bearerToken === adminToken) throw new Error("http_admin_token_must_differ");
+  assertValidHttpAuth(auth);
   redactionRegistry.register(bearerToken);
   redactionRegistry.register(adminToken);
   const logger = createStructuredLogger({
@@ -481,6 +487,12 @@ function readMigrationVersions(database: DatabaseSync): number[] {
 
 function arraysEqual(left: readonly number[], right: readonly number[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function assertValidHttpAuth(auth: { bearerToken: string; adminToken: string }): void {
+  if (auth.bearerToken.length === 0) throw new Error("http_bearer_token_required");
+  if (auth.adminToken.length === 0) throw new Error("http_admin_token_required");
+  if (auth.bearerToken === auth.adminToken) throw new Error("http_admin_token_must_differ");
 }
 
 function isLoopbackHost(host: string): boolean {
