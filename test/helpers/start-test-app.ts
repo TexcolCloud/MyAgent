@@ -26,6 +26,7 @@ import { SqliteBackupWriter } from "../../src/adapters/sqlite/backup.js";
 import { UuidIdGenerator } from "../../src/adapters/uuid-id-generator.js";
 import { CancelRunService } from "../../src/application/cancel-run.js";
 import { CreateBackupService } from "../../src/application/create-backup.js";
+import { CreateManagedAgentService } from "../../src/application/create-managed-agent.js";
 import { CreateRunService } from "../../src/application/create-run.js";
 import { DecideApprovalService } from "../../src/application/decide-approval.js";
 import { DeleteSessionService } from "../../src/application/delete-session.js";
@@ -58,6 +59,7 @@ export async function startTestApp(
     databasePath?: string;
     modelDiscovery?: ModelDiscoveryPort;
     logger?: FastifyBaseLogger;
+    includeOptionalRoutes?: boolean;
   } = {},
 ) {
   const connection = openDatabase({
@@ -141,6 +143,23 @@ export async function startTestApp(
     deleteSession: new DeleteSessionService(sessions),
     ...(options.sse === undefined ? {} : { sse: options.sse }),
     createBackups: new CreateBackupService(new SqliteBackupWriter(connection.db), catalog, clock),
+    ...(options.includeOptionalRoutes
+      ? {
+          createManagedAgents: new CreateManagedAgentService(catalog),
+          diagnostics: async () => ({
+            checks: [
+              { id: "config", status: "ok" as const, detail: "config_readable" },
+              { id: "permissions", status: "ok" as const, detail: "project_permissions_ok" },
+              { id: "sqlite", status: "ok" as const, detail: "sqlite_migrations_current" },
+              { id: "secrets", status: "ok" as const, detail: "secret_references_resolved" },
+              { id: "workers", status: "ok" as const, detail: "worker_ready" },
+              { id: "gateway", status: "ok" as const, detail: "provider_gateway_available" },
+              { id: "tty", status: "ok" as const, detail: "interactive_tty_available" },
+              { id: "binding", status: "ok" as const, detail: "loopback_binding" },
+            ],
+          }),
+        }
+      : {}),
   });
   return { app, approvals, catalog, clock, connection, managedSecrets, modelRegistry, runs, sessions, tools, close: async () => { await app.close(); connection.close(); } };
 }

@@ -27,12 +27,16 @@ describe("HTTP Automation Surface v1", () => {
 
   it("documents every registered /v1 route", async () => {
     const document = await readFile("docs/operations/http-automation-v1.md", "utf8");
-    const app = await startTestApp();
+    const app = await startTestApp({ includeOptionalRoutes: true });
     try {
       await app.app.ready();
       const routes = routeInventory(app.app.printRoutes({ commonPrefix: false }));
 
       expect(routes.length).toBeGreaterThan(0);
+      expect(routes).toEqual(expect.arrayContaining([
+        "POST /v1/admin/agents",
+        "GET /v1/admin/diagnostics",
+      ]));
       expect(automationDocumentRoutes(document)).toEqual(routes);
     } finally {
       await app.close();

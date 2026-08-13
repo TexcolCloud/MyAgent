@@ -65,6 +65,8 @@ loopback authority.
 | PUT /v1/admin/default-model-profile | Admin | Set the default Model Profile with `expectedRevision`. |
 | POST /v1/admin/managed-secret-versions/:secretVersionId/destruction | Admin | Confirmed Secret Version destruction with `expectedRevision`. |
 | POST /v1/admin/managed-secrets/master-key-rotation | Admin | Rotate the managed Secret master key with `expectedRevision`. |
+| POST /v1/admin/agents | Admin | Create a managed Agent with `expectedCatalogRevision`. |
+| GET /v1/admin/diagnostics | Admin | Read secret-safe operator diagnostics. |
 
 ## CLI Migration
 
