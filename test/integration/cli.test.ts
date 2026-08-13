@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { fileURLToPath } from "node:url";
@@ -330,6 +330,50 @@ describe("CLI HTTP boundary", () => {
     const runLocalHost = vi.fn(async () => 0);
 
     await expect(executeCli(["tui", "--config", configPath], {
+      workspace,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      inspectProjectState,
+      runLocalHost,
+      writeError: () => {},
+    })).resolves.toBe(2);
+
+    expect(inspectProjectState).not.toHaveBeenCalled();
+    expect(runLocalHost).not.toHaveBeenCalled();
+    expect(await readdir(outside)).toEqual(["keep.txt"]);
+  });
+
+  it("rejects a dangling local database link before host startup", async (context) => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-dangling-db-${randomUUID()}`);
+    const root = path.join(workspace, ".myagent");
+    const outside = tempPath(`cli-local-dangling-db-outside-${randomUUID()}`);
+    const missingTarget = path.join(outside, "missing.sqlite");
+    await mkdir(root, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(path.join(outside, "keep.txt"), "keep\n");
+    await writeFile(path.join(root, "myagent.yaml"), [
+      "version: 2",
+      "server:",
+      "  bearerToken: { fromEnvironment: RUN_TOKEN }",
+      "  adminToken: { fromEnvironment: ADMIN_TOKEN }",
+      "database: { path: state.sqlite }",
+      "agentRoots: [agents]",
+      "skillRoots: [skills]",
+      "toolEnvironmentAllowlist: []",
+      "",
+    ].join("\n"));
+    try {
+      await symlink(missingTarget, path.join(root, "state.sqlite"), "file");
+    } catch (error) {
+      if (!hasCode(error, "EPERM") && !hasCode(error, "EACCES")) throw error;
+      context.skip(`file symlink creation unavailable: ${String((error as Error).message)}`);
+    }
+    expect((await lstat(path.join(root, "state.sqlite"))).isSymbolicLink()).toBe(true);
+    const inspectProjectState = vi.fn(async () => "ready" as const);
+    const runLocalHost = vi.fn(async () => 0);
+
+    await expect(executeCli([], {
       workspace,
       stdinIsTTY: true,
       stdoutIsTTY: true,

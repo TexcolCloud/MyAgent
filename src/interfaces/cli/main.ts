@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { realpath, stat } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { loadBootConfig } from "../../config/boot-config.js";
@@ -323,18 +323,30 @@ async function assertPhysicallyConfinedLocalState(
   }
 }
 
-async function assertPhysicallyConfinedPath(
+interface LocalStateFilesystem {
+  readonly lstat: (candidate: string) => Promise<unknown>;
+  readonly realpath: (candidate: string) => Promise<string>;
+}
+
+export async function assertPhysicallyConfinedPath(
   root: string,
   candidate: string,
+  filesystem: LocalStateFilesystem = { lstat, realpath },
 ): Promise<void> {
-  const canonicalRoot = await canonicalizeExistingPath(root);
+  const canonicalRoot = await canonicalizeExistingPath(root, filesystem.realpath);
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   let current = canonicalRoot;
   for (const segment of relative.split(path.sep).filter(Boolean)) {
+    const next = path.join(current, segment);
     try {
-      current = await realpath(path.join(current, segment));
+      await filesystem.lstat(next);
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) return;
+      throw localConfigOutsideProjectState();
+    }
+    try {
+      current = await filesystem.realpath(next);
+    } catch {
       throw localConfigOutsideProjectState();
     }
     if (!isPathWithin(canonicalRoot, current)) {
@@ -343,12 +355,15 @@ async function assertPhysicallyConfinedPath(
   }
 }
 
-async function canonicalizeExistingPath(candidate: string): Promise<string> {
+async function canonicalizeExistingPath(
+  candidate: string,
+  resolveRealpath: (candidate: string) => Promise<string> = realpath,
+): Promise<string> {
   let current = path.resolve(candidate);
   const missing: string[] = [];
   while (true) {
     try {
-      const canonical = await realpath(current);
+      const canonical = await resolveRealpath(current);
       return path.join(canonical, ...missing.reverse());
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT")) throw error;
