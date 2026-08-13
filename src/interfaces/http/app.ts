@@ -59,7 +59,7 @@ export interface HttpAppOptions {
   catalog?: CatalogService;
   prepareCatalogReload?: (candidate: CatalogSnapshot) => void;
   createRuns?: CreateRunService;
-  runs?: Pick<RunStore, "getRun" | "listEventsAfter">;
+  runs?: Pick<RunStore, "getRun" | "listActiveRuns" | "listEventsAfter">;
   cancelRuns?: CancelRunService;
   approvals?: Pick<ApprovalStore, "listPending">;
   decideApprovals?: DecideApprovalService;

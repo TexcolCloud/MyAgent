@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { bootstrap } from "../../bootstrap.js";
 import { TuiClient } from "../tui/tui-client.js";
 import { runWorkbench, type RunWorkbenchOptions } from "../tui/workbench.js";
+import { inspectExitImpact } from "./exit-impact.js";
 
 export interface LocalHostDependencies {
   readonly bootstrapService: typeof bootstrap;
@@ -26,8 +27,10 @@ export async function runLocalHost(input: {
     signals: false,
   });
   try {
+    const client = new TuiClient({ apiUrl: service.url, runToken, adminToken });
     return await runTui({
-      client: new TuiClient({ apiUrl: service.url, runToken, adminToken }),
+      client,
+      beforeExit: () => inspectExitImpact(client),
     });
   } finally {
     await service.shutdown();

@@ -13,6 +13,17 @@ import type { Run } from "../domain/run.js";
 import type { JsonValue } from "../domain/json.js";
 import type { ModelFinishReason, ModelUsage } from "./model.js";
 
+export type ActiveRunStatus =
+  | "queued"
+  | "running"
+  | "waiting_approval"
+  | "cancelling";
+
+export interface ActiveRun {
+  readonly runId: RunId;
+  readonly status: ActiveRunStatus;
+}
+
 export interface CreateStoredRunInput {
   agentId: AgentId;
   sessionKey: SessionKey;
@@ -89,6 +100,7 @@ export interface StartDelegationInput {
 export interface RunStore {
   create(input: CreateStoredRunInput): CreateStoredRunResult;
   getRun(runId: RunId): Run;
+  listActiveRuns(): readonly ActiveRun[];
   listEventsAfter(runId: RunId, sequence: number): readonly RunEvent[];
   appendEvent(
     runId: RunId,

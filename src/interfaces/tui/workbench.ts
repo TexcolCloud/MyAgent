@@ -1,13 +1,20 @@
 import {
+  Box,
   ProcessTerminal,
+  SelectList,
+  Text,
   TUI,
   matchesKey,
   truncateToWidth,
   visibleWidth,
   type Component,
   type Terminal,
+  type SelectItem,
+  type SelectListTheme,
 } from "@mariozechner/pi-tui";
 
+import type { ExitImpact } from "../local/exit-impact.js";
+import { safeDisplayLines } from "./safe-display-text.js";
 import { PiTuiPrompt } from "./pi-tui-prompt.js";
 import { ApprovalScreen } from "./screens/approvals.js";
 import { ChatScreen } from "./screens/chat.js";
@@ -24,6 +31,7 @@ type WorkbenchClient = Pick<TuiClient,
 export interface RunWorkbenchOptions {
   readonly client: WorkbenchClient;
   readonly terminal?: Terminal;
+  readonly beforeExit?: () => Promise<ExitImpact>;
 }
 
 export async function runWorkbench(options: RunWorkbenchOptions): Promise<number> {
@@ -40,6 +48,9 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   let chatPrompt: PiTuiPrompt | undefined;
   let latestChatAction: Promise<void> | undefined;
   let approvals: ApprovalScreen | undefined;
+  let exitPending = false;
+  let exitPrompt: ExitConfirmation | undefined;
+  let latestExitAttempt: Promise<void> | undefined;
   let resolveExit: (() => void) | undefined;
   const stopped = () => {
     if (closed) return;
@@ -50,6 +61,48 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     chatPrompt?.cancel();
     if (tui.hasOverlay()) tui.hideOverlay();
     resolveExit?.();
+  };
+  const attemptExit = () => {
+    if (exitPending || exitPrompt !== undefined) return;
+    const beforeExit = options.beforeExit;
+    if (beforeExit === undefined) {
+      stopped();
+      return;
+    }
+    exitPending = true;
+    const attempt = beforeExit().then((impact) => {
+      if (closed) return;
+      if (impact.activeRuns.length === 0 && impact.pendingApprovalCount === 0) {
+        stopped();
+        return;
+      }
+      const prompt = new ExitConfirmation(impact, (confirmed) => {
+        if (exitPrompt !== prompt) return;
+        exitPrompt = undefined;
+        if (tui.hasOverlay()) tui.hideOverlay();
+        if (confirmed) stopped();
+        else {
+          tui.setFocus(navigation);
+          tui.requestRender();
+        }
+      });
+      exitPrompt = prompt;
+      tui.showOverlay(prompt, { width: "75%", maxHeight: "80%" });
+      tui.setFocus(prompt);
+      tui.requestRender();
+    }).catch((error: unknown) => {
+      if (!closed) {
+        inspector.showProblem(safeProblem(
+          error,
+          "exit_impact_unavailable",
+          "Active work could not be inspected. Exit was not performed.",
+        ));
+      }
+    }).finally(() => {
+      exitPending = false;
+      tui.requestRender();
+    });
+    latestExitAttempt = attempt;
   };
   const refresh = (destination: WorkbenchDestination) => {
     const startedAtReloadEpoch = modelSetupReloadEpoch;
@@ -71,7 +124,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   try {
     tui.addInputListener((data) => {
       if (matchesKey(data, "ctrl+c")) {
-        stopped();
+        attemptExit();
         return { consume: true };
       }
       if (matchesKey(data, "c") && chatPrompt === undefined && !modelSetupPending && !tui.hasOverlay()) {
@@ -162,6 +215,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     await finished;
     await latestModelSetup;
     await latestChatAction;
+    await latestExitAttempt;
     await approvals?.settled();
     return 0;
   } finally {
@@ -169,6 +223,43 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     closed = true;
     tui.stop();
   }
+}
+
+const exitSelectTheme: SelectListTheme = {
+  selectedPrefix: (value) => `> ${value}`,
+  selectedText: (value) => value,
+  description: (value) => value,
+  scrollInfo: (value) => value,
+  noMatch: (value) => value,
+};
+
+class ExitConfirmation implements Component {
+  focused = false;
+  private readonly box = new Box(1, 1);
+  private readonly choices: SelectList;
+
+  constructor(impact: ExitImpact, complete: (confirmed: boolean) => void) {
+    this.box.addChild(new Text("Exit MyAgent?"));
+    const summary = [
+      ...impact.activeRuns.map((run) => `Run ${run.runId} (${run.status})`),
+      ...(impact.pendingApprovalCount === 0
+        ? []
+        : [`${String(impact.pendingApprovalCount)} pending Approvals`]),
+    ].flatMap(safeDisplayLines);
+    this.box.addChild(new Text(summary.join("\n")));
+    const items: SelectItem[] = [
+      { value: "yes", label: "Yes, exit" },
+      { value: "no", label: "No, resume" },
+    ];
+    this.choices = new SelectList(items, items.length, exitSelectTheme);
+    this.choices.onSelect = (item) => complete(item.value === "yes");
+    this.choices.onCancel = () => complete(false);
+    this.box.addChild(this.choices);
+  }
+
+  handleInput(data: string): void { this.choices.handleInput(data); }
+  render(width: number): string[] { return this.box.render(width); }
+  invalidate(): void { this.box.invalidate(); }
 }
 
 async function submitChat(prompt: PiTuiPrompt, chat: ChatScreen): Promise<void> {

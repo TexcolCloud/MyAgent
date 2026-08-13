@@ -27,6 +27,7 @@ export type RunStatus =
   | "queued"
   | "running"
   | "waiting_approval"
+  | "cancelling"
   | "waiting_reconciliation"
   | "completed"
   | "failed"
@@ -53,6 +54,13 @@ export interface RunView {
   readonly failure?: { readonly code: string };
   readonly createdAt: string;
   readonly updatedAt: string;
+}
+
+export interface ActiveRunView {
+  readonly runId: string;
+  readonly status: Extract<RunStatus,
+    "queued" | "running" | "waiting_approval" | "cancelling"
+  >;
 }
 
 export interface PendingApproval {
@@ -147,6 +155,10 @@ export class TuiClient {
 
   getRun(runId: string): Promise<RunView> {
     return this.runClient.request(`/v1/runs/${encodeURIComponent(runId)}`);
+  }
+
+  listActiveRuns(): Promise<{ readonly runs: readonly ActiveRunView[] }> {
+    return this.runClient.request("/v1/runs?state=active");
   }
 
   decideApproval(approvalId: string, decision: "approve" | "deny"): Promise<ApprovalDecision> {

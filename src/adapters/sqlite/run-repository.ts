@@ -12,6 +12,7 @@ import type { RunState } from "../../domain/states.js";
 import { ApplicationError, DomainError } from "../../domain/errors.js";
 import type {
   BeginModelAttemptInput,
+  ActiveRun,
   CompleteRunInput,
   CreateStoredRunInput,
   CreateStoredRunResult,
@@ -263,6 +264,25 @@ export class SqliteRunRepository implements RunStore {
       throw new Error("run_not_found");
     }
     return mapRun(row);
+  }
+
+  listActiveRuns(): readonly ActiveRun[] {
+    const rows = this.db.prepare(
+      `SELECT run_id, state, cancellation_requested_at
+       FROM runs
+       WHERE state IN ('queued', 'running', 'waiting_approval')
+       ORDER BY created_at, run_id`,
+    ).all() as unknown as Array<{
+      run_id: string;
+      state: "queued" | "running" | "waiting_approval";
+      cancellation_requested_at: string | null;
+    }>;
+    return rows.map((row) => ({
+      runId: row.run_id as RunId,
+      status: row.state === "running" && row.cancellation_requested_at !== null
+        ? "cancelling"
+        : row.state,
+    }));
   }
 
   listEventsAfter(runId: RunId, sequence: number): readonly RunEvent[] {

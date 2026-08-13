@@ -27,6 +27,59 @@ describe("HTTP Runs", () => {
     } finally { await harness.close(); }
   });
 
+  it("lists only active durable impact without mutating Run state", async () => {
+    const harness = await startTestApp({
+      databasePath: tempPath("http-active-runs.db"),
+    });
+    try {
+      const create = async (key: string, sessionKey: string) => {
+        const response = await harness.app.inject({
+          method: "POST",
+          url: "/v1/runs",
+          headers: { ...auth, "idempotency-key": key },
+          payload: {
+            agentId: "primary",
+            sessionKey,
+            input: { type: "text", text: key },
+          },
+        });
+        return response.json().runId as RunId;
+      };
+      const queuedRunId = await create("request-active-queued", "session:active-queued");
+      const cancellingRunId = await create("request-active-cancelling", "session:active-cancelling");
+      const completedRunId = await create("request-active-completed", "session:active-completed");
+      const now = harness.clock.now();
+      harness.connection.db.prepare(
+        "UPDATE runs SET state = 'running', cancellation_requested_at = ? WHERE run_id = ?",
+      ).run(now.toISOString(), cancellingRunId);
+      harness.connection.db.prepare(
+        "UPDATE runs SET state = 'completed', output_json = ? WHERE run_id = ?",
+      ).run('{"type":"text","text":"done"}', completedRunId);
+      const before = harness.connection.db.prepare(
+        "SELECT run_id, state, cancellation_requested_at FROM runs ORDER BY run_id",
+      ).all();
+
+      const response = await harness.app.inject({
+        method: "GET",
+        url: "/v1/runs?state=active",
+        headers: auth,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json() as { runs: unknown[] };
+      expect(body.runs).toHaveLength(2);
+      expect(body.runs).toEqual(expect.arrayContaining([
+        { runId: cancellingRunId, status: "cancelling" },
+        { runId: queuedRunId, status: "queued" },
+      ]));
+      expect(harness.connection.db.prepare(
+        "SELECT run_id, state, cancellation_requested_at FROM runs ORDER BY run_id",
+      ).all()).toEqual(before);
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("makes duplicate creation idempotent and rejects a conflicting payload", async () => {
     const harness = await startTestApp();
     try {
@@ -218,7 +271,11 @@ describe("HTTP Runs", () => {
     const createRuns = {
       execute: () => { throw Object.assign(new Error("database is locked at C:\\secret\\kernel.db"), { errcode: 5 }); },
     } as unknown as CreateRunService;
-    const runs = { getRun: () => { throw new Error("unused"); }, listEventsAfter: () => [] } as unknown as Pick<RunStore, "getRun" | "listEventsAfter">;
+    const runs = {
+      getRun: () => { throw new Error("unused"); },
+      listActiveRuns: () => [],
+      listEventsAfter: () => [],
+    } as unknown as Pick<RunStore, "getRun" | "listActiveRuns" | "listEventsAfter">;
     const cancelRuns = { execute: () => { throw new Error("unused"); } } as unknown as CancelRunService;
     const app = createHttpApp({ bearerToken: "test-token", createRuns, runs, cancelRuns });
     try {

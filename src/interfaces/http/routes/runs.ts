@@ -4,12 +4,12 @@ import type { CancelRunService } from "../../../application/cancel-run.js";
 import type { CreateRunService } from "../../../application/create-run.js";
 import type { RunStore } from "../../../ports/run-store.js";
 import type { RunId } from "../../../domain/ids.js";
-import { createRunResponseSchema, createRunSchema, idempotencyKeySchema, identifierSchema, parseSchema, runResponseSchema } from "../schemas.js";
+import { activeRunsQuerySchema, activeRunsResponseSchema, createRunResponseSchema, createRunSchema, idempotencyKeySchema, identifierSchema, parseSchema, runResponseSchema } from "../schemas.js";
 import { parseLastEventId, streamRunEvents, type SseStreamOptions } from "../sse.js";
 
 export function registerRunRoutes(app: FastifyInstance, services: {
   createRuns: CreateRunService;
-  runs: Pick<RunStore, "getRun" | "listEventsAfter">;
+  runs: Pick<RunStore, "getRun" | "listActiveRuns" | "listEventsAfter">;
   cancelRuns: CancelRunService;
   sse?: SseStreamOptions;
 }): void {
@@ -19,6 +19,10 @@ export function registerRunRoutes(app: FastifyInstance, services: {
     const source = body.source?.externalId === undefined ? { kind: "http" as const } : { kind: "http" as const, externalId: body.source.externalId };
     const result = services.createRuns.execute({ ...body, idempotencyKey: key, source });
     return reply.code(202).send({ runId: result.runId, status: result.state, eventsUrl: `/v1/runs/${result.runId}/events` });
+  });
+  app.get("/runs", { schema: { response: { 200: activeRunsResponseSchema } } }, async (request) => {
+    parseSchema(activeRunsQuerySchema, request.query);
+    return { runs: services.runs.listActiveRuns() };
   });
   app.get("/runs/:runId", { schema: { response: { 200: runResponseSchema } } }, async (request) => runView(services.runs.getRun(parseSchema(identifierSchema, (request.params as { runId: unknown }).runId) as RunId)));
   app.post("/runs/:runId/cancel", { schema: { response: { 200: runResponseSchema } } }, async (request) => runView(services.cancelRuns.execute({ runId: parseSchema(identifierSchema, (request.params as { runId: unknown }).runId) as RunId }) as ReturnType<RunStore["getRun"]>));

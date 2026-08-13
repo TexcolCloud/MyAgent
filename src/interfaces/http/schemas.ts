@@ -22,6 +22,16 @@ const runStateSchema = z.enum([
   "queued", "running", "waiting_approval", "waiting_reconciliation",
   "completed", "failed", "cancelled",
 ]);
+const activeRunStateSchema = z.enum([
+  "queued", "running", "waiting_approval", "cancelling",
+]);
+export const activeRunsQuerySchema = z.strictObject({ state: z.literal("active") });
+export const activeRunsResponseSchema = z.strictObject({
+  runs: z.array(z.strictObject({
+    runId: z.string(),
+    status: activeRunStateSchema,
+  })),
+});
 const runBudgetSchema = z.strictObject({
   modelTurns: z.number().int().nonnegative(),
   toolCalls: z.number().int().nonnegative(),

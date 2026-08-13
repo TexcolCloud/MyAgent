@@ -11,6 +11,48 @@ import { runModelSetupScreen } from "../../src/interfaces/tui/screens/model-setu
 import { TuiClient } from "../../src/interfaces/tui/tui-client.js";
 
 describe("TUI workbench", () => {
+  it("exits immediately without a prompt when no durable work is active", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const beforeExit = vi.fn(async () => ({ activeRuns: [], pendingApprovalCount: 0 }));
+    const workbench = runWorkbench({ client: safeClient(), terminal, beforeExit });
+
+    await terminal.ready();
+    terminal.input("\u0003");
+
+    await expect(workbench).resolves.toBe(0);
+    expect(beforeExit).toHaveBeenCalledOnce();
+    expect(plainLines(terminal.frames.join("\n")).join("\n")).not.toContain("Exit MyAgent?");
+  });
+
+  it("shows active Run IDs and pending Approval count, then resumes after exit is declined", async () => {
+    const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
+    const beforeExit = vi.fn(async () => ({
+      activeRuns: [
+        { runId: "run_queued", status: "queued" as const },
+        { runId: "run_cancelling", status: "cancelling" as const },
+      ],
+      pendingApprovalCount: 3,
+    }));
+    const workbench = runWorkbench({ client: safeClient(), terminal, beforeExit });
+
+    await terminal.ready();
+    terminal.input("\u0003");
+    await terminal.waitForFrame("run_cancelling");
+    expect(plainLines(terminal.frames.at(-1) ?? "").join("\n")).toContain("3 pending Approvals");
+    terminal.input("\u001b[B");
+    terminal.input("\r");
+    await terminal.waitForFrame("Navigation");
+    expect(terminal.stopCalls).toBe(0);
+
+    terminal.input("\u0003");
+    await terminal.waitForFrame("Exit MyAgent?");
+    terminal.input("\r");
+
+    await expect(workbench).resolves.toBe(0);
+    expect(beforeExit).toHaveBeenCalledTimes(2);
+    expect(terminal.stopCalls).toBe(1);
+  });
+
   it("aborts and awaits a stalled Run creation without letting reconnect displace it", async () => {
     const terminal = new FakeTuiTerminal({ width: 120, height: 36 });
     let createSignal: AbortSignal | undefined;
