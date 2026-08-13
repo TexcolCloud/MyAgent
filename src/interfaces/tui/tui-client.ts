@@ -2,6 +2,28 @@ import { randomUUID } from "node:crypto";
 
 import type { JsonValue } from "../../domain/json.js";
 import { CliClient, CliHttpError } from "../cli/client.js";
+import type {
+  ConfirmedDestructionInput,
+  CreateModelProfileInput,
+  CreateProviderConnectionInput,
+  DefaultModelProfileResponse,
+  DiscoveryResponse,
+  DiscoverModelsInput,
+  ExpectedRevisionInput,
+  MasterKeyRotationResponse,
+  ModelAssignmentResponse,
+  ModelProfileResponse,
+  ModelVerificationResponse,
+  PromoteModelProfileInput,
+  PromoteProviderConnectionInput,
+  ProviderConnectionResponse,
+  ProviderDriversResponse,
+  PutDefaultModelProfileInput,
+  PutModelAssignmentInput,
+  QueuedModelVerificationResponse,
+  QueueModelVerificationInput,
+  ReviseProviderConnectionInput,
+} from "../http/model-control-schemas.js";
 import { TuiTokensMustDifferError, type TuiCredentials } from "./credentials.js";
 
 export interface TuiClientOptions extends TuiCredentials {
@@ -81,18 +103,7 @@ export interface ApprovalDecision {
   readonly resolvedAt: string | null;
 }
 
-export interface ProviderDriverCatalog {
-  readonly piVersion: "0.73.1";
-  readonly drivers: readonly {
-    readonly driverId: string;
-    readonly candidates: readonly {
-      readonly candidateId: string;
-      readonly displayName: string;
-      readonly modelId: string;
-      readonly credentialSupport: "bearer" | "none" | "unsupported";
-    }[];
-  }[];
-}
+export type ProviderDriverCatalog = ReadonlyResponse<ProviderDriversResponse>;
 
 export interface AgentListView {
   readonly agents: readonly { readonly id: string; readonly revisionId: string; readonly displayName: string }[];
@@ -100,21 +111,26 @@ export interface AgentListView {
 }
 
 export interface ProviderConnectionsView {
-  readonly connections: readonly {
-    readonly connectionId: string;
-    readonly displayName: string;
-    readonly activeRevisionId: string | null;
-    readonly retiredAt: string | null;
-  }[];
+  readonly connections: readonly Pick<
+    ProviderConnectionResponse,
+    "connectionId" | "displayName" | "activeRevisionId" | "retiredAt"
+  >[];
 }
 
 export interface ModelProfilesView {
-  readonly profiles: readonly {
-    readonly profileId: string;
-    readonly displayName: string;
-    readonly activeRevisionId: string | null;
-    readonly retiredAt: string | null;
-  }[];
+  readonly profiles: readonly Pick<
+    ModelProfileResponse,
+    "profileId" | "displayName" | "activeRevisionId" | "retiredAt"
+  >[];
+}
+
+export class TuiRevisionConflictError extends CliHttpError {
+  readonly reloadRequired = true;
+
+  constructor(error: CliHttpError) {
+    super(error.status, error.code, error.detail, error.traceId);
+    this.name = "TuiRevisionConflictError";
+  }
 }
 
 export function isRevisionConflict(error: unknown): error is CliHttpError {
@@ -177,15 +193,171 @@ export class TuiClient {
   }
 
   listProviderConnections(): Promise<ProviderConnectionsView> {
-    return this.adminClient.request("/v1/admin/provider-connections", { authority: "admin" });
+    return this.adminRequest("/v1/admin/provider-connections");
+  }
+
+  getProviderConnection(connectionId: string): Promise<ProviderConnectionResponse> {
+    return this.adminRequest(`/v1/admin/provider-connections/${resourceId(connectionId)}`);
+  }
+
+  createProvider(input: CreateProviderConnectionInput): Promise<ProviderConnectionResponse> {
+    return this.adminRequest("/v1/admin/provider-connections", { method: "POST", body: input });
+  }
+
+  reviseProvider(
+    connectionId: string,
+    input: ReviseProviderConnectionInput,
+  ): Promise<ProviderConnectionResponse> {
+    return this.adminRequest(
+      `/v1/admin/provider-connections/${resourceId(connectionId)}/revisions`,
+      { method: "POST", body: input },
+    );
+  }
+
+  promoteProvider(
+    connectionId: string,
+    input: PromoteProviderConnectionInput,
+  ): Promise<ProviderConnectionResponse> {
+    return this.adminRequest(
+      `/v1/admin/provider-connections/${resourceId(connectionId)}/promotions`,
+      { method: "POST", body: input },
+    );
+  }
+
+  retireProvider(
+    connectionId: string,
+    input: ExpectedRevisionInput,
+  ): Promise<ProviderConnectionResponse> {
+    return this.adminRequest(
+      `/v1/admin/provider-connections/${resourceId(connectionId)}/retirement`,
+      { method: "POST", body: input },
+    );
+  }
+
+  purgeProvider(connectionId: string, input: ConfirmedDestructionInput): Promise<void> {
+    return this.adminRequest(
+      `/v1/admin/provider-connections/${resourceId(connectionId)}/purge`,
+      { method: "POST", body: input },
+    );
+  }
+
+  discoverProviderModels(
+    connectionRevisionId: string,
+    input: DiscoverModelsInput,
+  ): Promise<DiscoveryResponse> {
+    return this.adminRequest(
+      `/v1/admin/provider-connection-revisions/${resourceId(connectionRevisionId)}/discover`,
+      { method: "POST", body: input },
+    );
+  }
+
+  getProviderModels(connectionRevisionId: string): Promise<DiscoveryResponse> {
+    return this.adminRequest(
+      `/v1/admin/provider-connection-revisions/${resourceId(connectionRevisionId)}/models`,
+    );
   }
 
   listModelProfiles(): Promise<ModelProfilesView> {
-    return this.adminClient.request("/v1/admin/model-profiles", { authority: "admin" });
+    return this.adminRequest("/v1/admin/model-profiles");
+  }
+
+  getModelProfile(profileId: string): Promise<ModelProfileResponse> {
+    return this.adminRequest(`/v1/admin/model-profiles/${resourceId(profileId)}`);
+  }
+
+  createModelProfile(input: CreateModelProfileInput): Promise<ModelProfileResponse> {
+    return this.adminRequest("/v1/admin/model-profiles", { method: "POST", body: input });
+  }
+
+  promoteModelProfile(
+    profileId: string,
+    input: PromoteModelProfileInput,
+  ): Promise<ModelProfileResponse> {
+    return this.adminRequest(
+      `/v1/admin/model-profiles/${resourceId(profileId)}/promotions`,
+      { method: "POST", body: input },
+    );
+  }
+
+  retireModelProfile(
+    profileId: string,
+    input: ExpectedRevisionInput,
+  ): Promise<ModelProfileResponse> {
+    return this.adminRequest(
+      `/v1/admin/model-profiles/${resourceId(profileId)}/retirement`,
+      { method: "POST", body: input },
+    );
+  }
+
+  purgeModelProfile(profileId: string, input: ConfirmedDestructionInput): Promise<void> {
+    return this.adminRequest(
+      `/v1/admin/model-profiles/${resourceId(profileId)}/purge`,
+      { method: "POST", body: input },
+    );
+  }
+
+  verifyModel(
+    profileRevisionId: string,
+    input: QueueModelVerificationInput,
+  ): Promise<QueuedModelVerificationResponse> {
+    return this.adminRequest(
+      `/v1/admin/model-profile-revisions/${resourceId(profileRevisionId)}/verifications`,
+      { method: "POST", body: input },
+    );
+  }
+
+  getModelVerification(verificationId: string): Promise<ModelVerificationResponse> {
+    return this.adminRequest(`/v1/admin/model-verifications/${resourceId(verificationId)}`);
+  }
+
+  cancelModelVerification(
+    verificationId: string,
+    input: ExpectedRevisionInput,
+  ): Promise<ModelVerificationResponse> {
+    return this.adminRequest(
+      `/v1/admin/model-verifications/${resourceId(verificationId)}/cancel`,
+      { method: "POST", body: input },
+    );
+  }
+
+  getModelAssignment(agentId: string): Promise<ModelAssignmentResponse> {
+    return this.adminRequest(`/v1/admin/agents/${resourceId(agentId)}/model-assignment`);
+  }
+
+  assignModel(agentId: string, input: PutModelAssignmentInput): Promise<ModelAssignmentResponse> {
+    return this.adminRequest(`/v1/admin/agents/${resourceId(agentId)}/model-assignment`, {
+      method: "PUT",
+      body: input,
+    });
+  }
+
+  getDefaultModelProfile(): Promise<DefaultModelProfileResponse> {
+    return this.adminRequest("/v1/admin/default-model-profile");
+  }
+
+  setDefaultModelProfile(input: PutDefaultModelProfileInput): Promise<DefaultModelProfileResponse> {
+    return this.adminRequest("/v1/admin/default-model-profile", { method: "PUT", body: input });
   }
 
   listProviderDrivers(): Promise<ProviderDriverCatalog> {
-    return this.adminClient.request("/v1/admin/provider-drivers", { authority: "admin" });
+    return this.adminRequest("/v1/admin/provider-drivers");
+  }
+
+  destroyManagedSecretVersion(
+    secretVersionId: string,
+    input: ConfirmedDestructionInput,
+  ): Promise<void> {
+    return this.adminRequest(
+      `/v1/admin/managed-secret-versions/${resourceId(secretVersionId)}/destruction`,
+      { method: "POST", body: input },
+    );
+  }
+
+  rotateManagedSecretsMasterKey(input: ExpectedRevisionInput): Promise<MasterKeyRotationResponse> {
+    return this.adminRequest("/v1/admin/managed-secrets/master-key-rotation", {
+      method: "POST",
+      body: input,
+    });
   }
 
   adminRequest<T>(path: string, init: {
@@ -193,10 +365,26 @@ export class TuiClient {
     body?: unknown;
     idempotencyKey?: string;
   } = {}): Promise<T> {
-    return this.adminClient.request<T>(path, { ...init, authority: "admin" });
+    return this.adminClient.request<T>(path, { ...init, authority: "admin" })
+      .catch((error: unknown) => {
+        if (error instanceof CliHttpError && error.status === 409 && isRevisionConflict(error)) {
+          throw new TuiRevisionConflictError(error);
+        }
+        throw error;
+      });
   }
 
   stream(path: string, lastEventId?: string, signal?: AbortSignal): Promise<Response> {
     return this.runClient.stream(path, lastEventId, signal);
   }
 }
+
+function resourceId(value: string): string {
+  return encodeURIComponent(value);
+}
+
+type ReadonlyResponse<T> = T extends readonly (infer Item)[]
+  ? readonly ReadonlyResponse<Item>[]
+  : T extends object
+    ? { readonly [Key in keyof T]: ReadonlyResponse<T[Key]> }
+    : T;

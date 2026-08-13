@@ -113,6 +113,13 @@ export const backupResponseSchema = z.strictObject({
   activeRevisionIds: z.array(z.string()),
 });
 
+export type ActiveRunsResponse = z.infer<typeof activeRunsResponseSchema>;
+export type AgentsResponse = z.infer<typeof agentsResponseSchema>;
+export type CreateRunResponse = z.infer<typeof createRunResponseSchema>;
+export type RunResponse = z.infer<typeof runResponseSchema>;
+export type ApprovalsResponse = z.infer<typeof approvalsResponseSchema>;
+export type ApprovalDecisionResponse = z.infer<typeof approvalDecisionResponseSchema>;
+
 export function parseSchema<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (!result.success) throw new Error("invalid_request");
