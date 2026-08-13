@@ -111,4 +111,44 @@ describe("local project state", () => {
       await rm(workspace, { recursive: true, force: true });
     }
   });
+
+  it("preserves a competing exclusive temporary file", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+    const paths = resolveLocalProjectPaths(workspace);
+    const competingTemporaryPath = path.join(paths.root, "competing-temporary.yaml");
+    try {
+      await mkdir(paths.root, { recursive: true });
+      await writeFile(competingTemporaryPath, "competitor bytes");
+
+      await expect(initializeProjectState(paths, {
+        temporaryPath: () => competingTemporaryPath,
+      })).rejects.toThrow();
+
+      expect(await readFile(competingTemporaryPath, "utf8")).toBe("competitor bytes");
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("does not replace configuration created after inspection", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "myagent-project-state-"));
+    const paths = resolveLocalProjectPaths(workspace);
+    const competingConfig = "competitor configuration\n";
+    try {
+      await expect(initializeProjectState(paths, {
+        beforeCommit: async () => {
+          await writeFile(paths.configPath, competingConfig);
+        },
+      })).rejects.toThrow();
+
+      expect(await readFile(paths.configPath, "utf8")).toBe(competingConfig);
+      expect((await readdir(paths.root)).sort()).toEqual([
+        "agents",
+        "myagent.yaml",
+        "skills",
+      ]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
 });

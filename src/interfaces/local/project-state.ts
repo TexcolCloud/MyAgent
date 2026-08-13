@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, rename, rm, stat } from "node:fs/promises";
+import { link, mkdir, open, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { stringify as stringifyYaml } from "yaml";
@@ -13,6 +13,11 @@ export interface LocalProjectPaths {
   readonly databasePath: string;
   readonly agentsRoot: string;
   readonly skillsRoot: string;
+}
+
+interface InitializeProjectStateDependencies {
+  readonly temporaryPath?: (paths: LocalProjectPaths) => string;
+  readonly beforeCommit?: () => Promise<void>;
 }
 
 export function resolveLocalProjectPaths(
@@ -47,7 +52,10 @@ export async function inspectProjectState(
   return "partial";
 }
 
-export async function initializeProjectState(paths: LocalProjectPaths): Promise<void> {
+export async function initializeProjectState(
+  paths: LocalProjectPaths,
+  dependencies: InitializeProjectStateDependencies = {},
+): Promise<void> {
   const state = await inspectProjectState(paths);
   if (state !== "absent") {
     throw new Error(`project state is ${state}; initialization requires absent state`);
@@ -70,23 +78,42 @@ export async function initializeProjectState(paths: LocalProjectPaths): Promise<
     skillRoots: ["skills"],
     toolEnvironmentAllowlist: [],
   });
-  const temporaryPath = path.join(
+  const temporaryPath = dependencies.temporaryPath?.(paths) ?? path.join(
     paths.root,
     `.${path.basename(paths.configPath)}.tmp-${randomUUID()}`,
   );
   let temporary: Awaited<ReturnType<typeof open>> | undefined;
+  let ownsTemporaryFile = false;
   try {
     temporary = await open(temporaryPath, "wx");
+    ownsTemporaryFile = true;
     await temporary.writeFile(stringifyYaml(config), "utf8");
     await temporary.sync();
     await temporary.close();
     temporary = undefined;
-    await rename(temporaryPath, paths.configPath);
+    await dependencies.beforeCommit?.();
+    await installCreateOnly(temporaryPath, paths.configPath);
+    await rm(temporaryPath);
+    ownsTemporaryFile = false;
   } catch (error) {
     try {
       await temporary?.close();
     } finally {
-      await rm(temporaryPath, { force: true });
+      if (ownsTemporaryFile) await rm(temporaryPath, { force: true });
+    }
+    throw error;
+  }
+}
+
+async function installCreateOnly(
+  temporaryPath: string,
+  configPath: string,
+): Promise<void> {
+  try {
+    await link(temporaryPath, configPath);
+  } catch (error) {
+    if (hasErrorCode(error, "EEXIST")) {
+      throw new Error("project state was created concurrently");
     }
     throw error;
   }
@@ -106,4 +133,13 @@ async function isFile(candidate: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object"
+    && error !== null
+    && "code" in error
+    && error.code === code
+  );
 }
