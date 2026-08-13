@@ -29,6 +29,7 @@ describe("consumeRunEvents", () => {
             eventsUrl: "/v1/runs/run_1/events",
           }, { status: 202 });
         }
+        if (url.pathname === "/v1/runs/run_1") return Response.json(completedRunDetail());
         lastEventIds.push(new Headers(init?.headers).get("last-event-id"));
         streamAttempt += 1;
         return streamAttempt === 1
@@ -72,6 +73,7 @@ describe("consumeRunEvents", () => {
             eventsUrl: "/v1/runs/run_1/events",
           }, { status: 202 });
         }
+        if (url.pathname === "/v1/runs/run_1") return Response.json(completedRunDetail());
         lastEventIds.push(new Headers(init?.headers).get("last-event-id"));
         streamAttempt += 1;
         return streamAttempt === 1
@@ -298,4 +300,27 @@ function eventFrame(sequence: number, type: string, payload: unknown): string {
     occurredAt: "2026-08-12T00:00:00.000Z",
     payload,
   })}\n\n`;
+}
+
+function completedRunDetail() {
+  return {
+    runId: "run_1",
+    sessionId: "session_1",
+    agentId: "primary",
+    status: "completed",
+    fifoSequence: 1,
+    parentRunId: null,
+    rootRunId: "run_1",
+    delegationDepth: 0,
+    budget: {
+      modelTurns: 1,
+      toolCalls: 0,
+      childRuns: 0,
+      delegationDepth: 0,
+      activeExecutionSeconds: 0,
+      toolOutputBytes: 0,
+    },
+    createdAt: "2026-08-12T00:00:00.000Z",
+    updatedAt: "2026-08-12T00:00:01.000Z",
+  };
 }
