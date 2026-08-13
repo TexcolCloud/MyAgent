@@ -179,6 +179,119 @@ describe("RunWorker", () => {
     }
   });
 
+  it("executes a restarted historical Pi Run as none without rewriting its snapshot", async () => {
+    const databasePath = tempPath("run-worker-historical-pi-recovery.db");
+    const clock = new SystemClock();
+    const ids = new FakeIds({
+      sessionIds: [sessionIdFromUuid("00000000-0000-7000-8000-000000000045")],
+      runIds: [runIdFromUuid("00000000-0000-7000-8000-000000000045")],
+      attemptIds: [attemptIdFromUuid("00000000-0000-7000-8000-000000000045")],
+    });
+    const initial = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    const seeded = (() => {
+      try {
+        migrate(initial.db);
+        const catalog = new SqliteCatalogRepository(initial.db);
+        const created = new CreateRunService(
+          resolvedAgents(new CatalogService(catalogSnapshot), {
+            invocationProtocol: "pi_ai",
+            modelId: "deepseek-v4-flash",
+            piRuntime: {
+              kind: "pi_ai",
+              piVersion: "0.73.1",
+              driverId: "pi/deepseek",
+              catalogProviderId: "deepseek",
+              api: "openai-completions",
+              providerCompatibilityContract: "none",
+              modelId: "deepseek-v4-flash",
+              contextWindow: 1_000_000,
+              maxOutputTokens: 384_000,
+              compatibility: {
+                requiresReasoningContentOnAssistantMessages: true,
+                thinkingFormat: "deepseek",
+              },
+            },
+          }),
+          new SqliteRunRepository(initial.db, catalog),
+          clock,
+          ids,
+        ).execute({
+          agentId: "primary",
+          sessionKey: "integration:historical-pi-recovery",
+          input: { type: "text", text: "recover historical Pi runtime" },
+          idempotencyKey: "run-worker-historical-pi-recovery-0001",
+          source: { kind: "http" },
+        });
+        const stored = initial.db.prepare(
+          `SELECT agent_revisions.content_json
+           FROM agent_revisions
+           JOIN runs ON runs.agent_revision_id = agent_revisions.revision_id
+           WHERE runs.run_id = ?`,
+        ).get(created.runId) as { content_json: string };
+        const snapshot = JSON.parse(stored.content_json) as {
+          model: { piRuntime: Record<string, unknown> };
+        };
+        delete snapshot.model.piRuntime.providerCompatibilityContract;
+        const historicalJson = JSON.stringify(snapshot);
+        initial.db.prepare(
+          `UPDATE agent_revisions SET content_json = ?
+           WHERE revision_id = (SELECT agent_revision_id FROM runs WHERE run_id = ?)`,
+        ).run(historicalJson, created.runId);
+        return { created, historicalJson };
+      } finally {
+        initial.close();
+      }
+    })();
+
+    const restarted = openDatabase({ path: databasePath, busyTimeoutMs: 5_000 });
+    try {
+      const catalog = new SqliteCatalogRepository(restarted.db);
+      const runs = new SqliteRunRepository(restarted.db, catalog);
+      const sessions = new SqliteSessionRepository(restarted.db);
+      const model = new ScriptedModel();
+      model.script(completedText("historical Pi recovered"));
+      const advance = new AdvanceRunService({
+        runs,
+        tools: new SqliteToolRepository(restarted.db),
+        approvals: new SqliteApprovalRepository(restarted.db),
+        sessions,
+        model,
+        prompts: new PromptAssembler(sessions),
+        registry: new ToolRegistry(),
+        policy: new PolicyEngine(),
+        clock,
+        ids,
+        modelRegistry: noOpProviderHealthSink,
+      });
+      const worker = new RunWorker({
+        runs,
+        advance,
+        clock,
+        workerId: "worker-historical-pi-recovery",
+        concurrency: 1,
+        leaseDurationMs: 1_000,
+        idleDelayMs: 5,
+      });
+
+      worker.start();
+      try {
+        await waitFor(() => runs.getRun(seeded.created.runId).state === "completed");
+      } finally {
+        await worker.stop();
+      }
+
+      expect(model.requests[0]?.model.piRuntime?.providerCompatibilityContract).toBe("none");
+      expect(restarted.db.prepare(
+        `SELECT agent_revisions.content_json
+         FROM agent_revisions
+         JOIN runs ON runs.agent_revision_id = agent_revisions.revision_id
+         WHERE runs.run_id = ?`,
+      ).get(seeded.created.runId)).toEqual({ content_json: seeded.historicalJson });
+    } finally {
+      restarted.close();
+    }
+  });
+
   it("feeds a completed Tool result into the next model turn", async () => {
     const connection = openDatabase({ path: tempPath("run-worker-tool-loop.db"), busyTimeoutMs: 5_000 });
     try {

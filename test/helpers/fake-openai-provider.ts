@@ -33,6 +33,15 @@ export type FakeProviderTurn =
       readonly delayMs?: number;
     }
   | {
+      readonly type: "multi_tool";
+      readonly calls: readonly [
+        { readonly callId: string; readonly name: string; readonly arguments: JsonValue },
+        { readonly callId: string; readonly name: string; readonly arguments: JsonValue },
+      ];
+      readonly rawBody?: string;
+      readonly delayMs?: number;
+    }
+  | {
       readonly type: "error";
       readonly status: number;
       readonly body?: JsonValue;
@@ -278,14 +287,15 @@ function chatEvents(
       chatUsageFrame(),
     ];
   }
+  const calls = turn.type === "multi_tool" ? turn.calls : [turn];
   return [
     chatFrame({
-      tool_calls: [{
-        index: 0,
-        id: turn.callId,
+      tool_calls: calls.map((call, index) => ({
+        index,
+        id: call.callId,
         type: "function",
-        function: { name: turn.name, arguments: JSON.stringify(turn.arguments) },
-      }],
+        function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+      })),
     }),
     chatFrame({}, "tool_calls"),
     chatUsageFrame(),
@@ -335,34 +345,35 @@ function responsesEvents(
       },
     ];
   }
-  const item = {
-    id: `fc_${turn.callId}`,
+  const calls = turn.type === "multi_tool" ? turn.calls : [turn];
+  const items = calls.map((call) => ({
+    id: `fc_${call.callId}`,
     type: "function_call",
-    call_id: turn.callId,
-    name: turn.name,
-    arguments: JSON.stringify(turn.arguments),
+    call_id: call.callId,
+    name: call.name,
+    arguments: JSON.stringify(call.arguments),
     status: "completed",
-  };
+    ...(turn.type !== "multi_tool" || turn.rawBody === undefined
+      ? {}
+      : { raw_provider_body: turn.rawBody }),
+  }));
   return [
-    {
+    ...items.flatMap((item, outputIndex) => [{
       type: "response.output_item.added",
-      output_index: 0,
+      output_index: outputIndex,
       item: { ...item, arguments: "", status: "in_progress" },
-    },
-    {
+    }, {
       type: "response.function_call_arguments.delta",
-      output_index: 0,
+      output_index: outputIndex,
       item_id: item.id,
       delta: item.arguments,
-    },
-    {
+    }, {
       type: "response.function_call_arguments.done",
-      output_index: 0,
+      output_index: outputIndex,
       item_id: item.id,
       arguments: item.arguments,
-    },
-    { type: "response.output_item.done", output_index: 0, item },
-    { type: "response.completed", response: completedResponse([item]) },
+    }, { type: "response.output_item.done", output_index: outputIndex, item }]),
+    { type: "response.completed", response: completedResponse(items) },
   ];
 }
 

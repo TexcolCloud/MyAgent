@@ -979,6 +979,66 @@ describe("HTTP model control plane", () => {
     }
   });
 
+  it("projects exact DeepSeek catalog Candidates with a shared model ID", async () => {
+    const harness = await startTestApp({
+      modelDiscovery: {
+        discover: async () => ({
+          state: "fresh",
+          models: [{ id: "deepseek-v4-flash", owner: "deepseek" }],
+          fetchedAt: new Date("2026-08-07T00:00:00.000Z"),
+        }),
+      },
+    });
+    try {
+      const connection = await harness.app.inject({
+        method: "POST",
+        url: "/v1/admin/provider-connections",
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: {
+          slug: "deepseek-catalog",
+          displayName: "DeepSeek Catalog",
+          driverId: "pi/deepseek",
+          auth: { type: "environment", fromEnvironment: "DEEPSEEK_API_KEY" },
+        },
+      });
+      expect(connection.statusCode).toBe(201);
+      const connectionRevisionId = connection.json().revisions[0].revisionId as string;
+      const discovery = await harness.app.inject({
+        method: "POST",
+        url: `/v1/admin/provider-connection-revisions/${connectionRevisionId}/discover`,
+        remoteAddress: "127.0.0.1",
+        headers: adminHeaders,
+        payload: { expectedRevision: 0 },
+      });
+      expect(discovery.statusCode).toBe(200);
+
+      for (const [slug, catalogCandidateId] of [
+        ["deepseek-responses", "pi/deepseek:deepseek-v4-flash-responses"],
+        ["deepseek-chat", "pi/deepseek:deepseek-v4-flash"],
+      ] as const) {
+        const response = await harness.app.inject({
+          method: "POST",
+          url: "/v1/admin/model-profiles",
+          remoteAddress: "127.0.0.1",
+          headers: adminHeaders,
+          payload: {
+            slug,
+            displayName: slug,
+            connectionRevisionId,
+            catalogCandidateId,
+          },
+        });
+        expect(response.statusCode).toBe(201);
+        expect(response.json()).toMatchObject({
+          revisions: [expect.objectContaining({ catalogCandidateId })],
+        });
+      }
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("rejects a catalog Candidate when an inconsistent native Connection has no bearer credential", async () => {
     const harness = await startTestApp({
       modelDiscovery: {
@@ -1212,6 +1272,7 @@ describe("HTTP model control plane", () => {
             driverId: "pi/openai-compatible",
             catalogProviderId: "openai-compatible",
             api: "openai-completions",
+            providerCompatibilityContract: "none",
             modelId: "custom-model",
             contextWindow: 32_768,
             compatibility: {
@@ -1267,6 +1328,7 @@ describe("HTTP model control plane", () => {
             driverId: "pi/openai-compatible",
             catalogProviderId: "openai-compatible",
             api: "openai-responses",
+            providerCompatibilityContract: "none",
             modelId: "custom-model",
             contextWindow: 12_345,
             compatibility: {

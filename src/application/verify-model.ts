@@ -672,6 +672,7 @@ function boundedAbortSignal(
 function snapshotPiRuntime(runtime: PiRuntimeContract): PiRuntimeContract {
   return Object.freeze({
     ...runtime,
+    providerCompatibilityContract: runtime.providerCompatibilityContract,
     compatibility: Object.freeze({ ...runtime.compatibility }),
   });
 }

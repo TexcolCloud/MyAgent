@@ -57,6 +57,7 @@ describe("AgentResolver", () => {
       driverId: "pi/openai" as const,
       catalogProviderId: "openai",
       api: "openai-completions",
+      providerCompatibilityContract: "none" as const,
       modelId: "gpt-test-old",
       contextWindow: 8_192,
       compatibility: {},

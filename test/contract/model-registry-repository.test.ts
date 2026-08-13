@@ -20,12 +20,29 @@ const ANTHROPIC_CONTRACT: PiRuntimeContract = {
   driverId: "pi/anthropic",
   catalogProviderId: "anthropic",
   api: "anthropic-messages",
+  providerCompatibilityContract: "none",
   modelId: "claude-sonnet-4-20250514",
   contextWindow: 200_000,
   maxOutputTokens: 64_000,
   compatibility: {
     supportsDeveloperRole: false,
     supportsStrictMode: false,
+  },
+};
+
+const DEEPSEEK_RESPONSES_CONTRACT: PiRuntimeContract = {
+  kind: "pi_ai",
+  piVersion: "0.73.1",
+  driverId: "pi/deepseek",
+  catalogProviderId: "deepseek",
+  api: "openai-responses",
+  providerCompatibilityContract: "deepseek-responses-v1",
+  modelId: "deepseek-v4-flash",
+  contextWindow: 1_000_000,
+  maxOutputTokens: 384_000,
+  compatibility: {
+    requiresReasoningContentOnAssistantMessages: true,
+    thinkingFormat: "deepseek",
   },
 };
 
@@ -56,7 +73,7 @@ describe("SqliteModelRegistryRepository", () => {
           '"compatibility":{"supportsDeveloperRole":false,"supportsStrictMode":false},' +
           '"contextWindow":200000,"driverId":"pi/anthropic","kind":"pi_ai",' +
           '"maxOutputTokens":64000,"modelId":"claude-sonnet-4-20250514",' +
-          '"piVersion":"0.73.1"}',
+          '"piVersion":"0.73.1","providerCompatibilityContract":"none"}',
       });
       expect(() => db.prepare(
         "UPDATE model_profile_revisions SET runtime_contract_json = ? WHERE revision_id = ?",
@@ -201,6 +218,64 @@ describe("SqliteModelRegistryRepository", () => {
         .toThrowError(expect.objectContaining({ code: "invalid_model_profile" }));
     });
   });
+
+  it("reads a historical Pi contract without a compatibility field as none", () => {
+    usingFixture("historical-pi-runtime-contract", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-pi", "pcr-pi"));
+      insertRawRuntimeContract(db, "profile-historical", "mpr-historical", "pcr-pi", {
+        ...ANTHROPIC_CONTRACT,
+        providerCompatibilityContract: undefined,
+      });
+
+      expect(repository.getProfile(profileId("profile-historical")).revisions[0]?.piRuntime)
+        .toMatchObject({ providerCompatibilityContract: "none" });
+      expect(db.prepare(
+        "SELECT runtime_contract_json FROM model_profile_revisions WHERE revision_id = ?",
+      ).get("mpr-historical")).toEqual({
+        runtime_contract_json: expect.not.stringContaining("providerCompatibilityContract"),
+      });
+    });
+  });
+
+  it("rejects an unknown persisted compatibility contract", () => {
+    usingFixture("unknown-pi-runtime-contract", ({ db, repository }) => {
+      repository.createConnection(createConnectionInput("connection-pi", "pcr-pi"));
+      insertRawRuntimeContract(db, "profile-unknown", "mpr-unknown", "pcr-pi", {
+        ...ANTHROPIC_CONTRACT,
+        providerCompatibilityContract: "unreleased-v99",
+      });
+
+      expect(() => repository.getProfile(profileId("profile-unknown")))
+        .toThrowError(expect.objectContaining({ code: "invalid_model_profile" }));
+    });
+  });
+
+  it.each([
+    ["driver", { driverId: "pi/openai" }],
+    ["provider", { catalogProviderId: "openai" }],
+    ["API", { api: "openai-completions" }],
+    ["model", { modelId: "deepseek-chat" }],
+    ["Pi version", { piVersion: "0.74.0" }],
+    ["context window", { contextWindow: 128_000 }],
+    ["output limit", { maxOutputTokens: 8_192 }],
+    ["compatibility", { compatibility: { supportsUsageInStreaming: true } }],
+    ["null compatibility", { compatibility: null }],
+    ["missing compatibility", { compatibility: undefined }],
+  ] as const)(
+    "rejects a persisted DeepSeek Responses contract paired with another %s",
+    (_case, override) => {
+      usingFixture(`corrupt-deepseek-responses-${_case}`, ({ db, repository }) => {
+        repository.createConnection(createConnectionInput("connection-pi", "pcr-pi"));
+        insertRawRuntimeContract(db, "profile-corrupt", "mpr-corrupt", "pcr-pi", {
+          ...DEEPSEEK_RESPONSES_CONTRACT,
+          ...override,
+        });
+
+        expect(() => repository.getProfile(profileId("profile-corrupt")))
+          .toThrowError(expect.objectContaining({ code: "invalid_model_profile" }));
+      });
+    },
+  );
 
   it("replaces discovery generations atomically and preserves stale models on refresh failure", () => {
     usingFixture("discovery-generations", ({ db, repository }) => {
@@ -1704,6 +1779,36 @@ function profileRevision(
     createdAt: NOW,
     ...overrides,
   };
+}
+
+function insertRawRuntimeContract(
+  db: DatabaseSync,
+  profile: string,
+  revision: string,
+  connectionRevision: string,
+  runtime: object,
+): void {
+  const runtimeModelId = "modelId" in runtime && typeof runtime.modelId === "string"
+    ? runtime.modelId
+    : ANTHROPIC_CONTRACT.modelId;
+  db.prepare(
+    `INSERT INTO model_profiles (
+       profile_id, display_name, active_revision_id, retired_at,
+       record_revision, created_at, updated_at
+     ) VALUES (?, ?, NULL, NULL, 0, ?, ?)`,
+  ).run(profile, profile, NOW.toISOString(), NOW.toISOString());
+  db.prepare(
+    `INSERT INTO model_profile_revisions (
+       revision_id, profile_id, connection_revision_id, state,
+       provider_model_id, invocation_protocol, max_input_tokens,
+       context_window_source, capability_baseline,
+       verified_capabilities_json, runtime_contract_json, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    revision, profile, connectionRevision, "draft", runtimeModelId,
+    "pi_ai", ANTHROPIC_CONTRACT.contextWindow, "preset",
+    "text_and_single_tool_call_v1", "[]", JSON.stringify(runtime), NOW.toISOString(),
+  );
 }
 
 function context(event: string, now: Date): MutationContext {

@@ -17,23 +17,31 @@ export function listProviderCatalogCandidates(): readonly ProviderCatalogCandida
 }
 
 export function resolveProviderCatalogCandidate(
-  driverId: ProviderDriverId,
-  modelId: string,
+  candidateId: string,
 ): ProviderCatalogCandidate | undefined {
   const exact = providerCatalogCandidates.find(
-    (candidate) => candidate.driverId === driverId && candidate.modelId === modelId,
+    (candidate) => candidate.candidateId === candidateId,
   );
   if (exact !== undefined) return exact;
 
   // Unsupported providers are catalog-only: this wildcard supports explaining
   // their unavailable credential mode without selecting a runtime model.
-  if (modelId === "any") {
+  if (candidateId.endsWith(":any")) {
+    const driverId = candidateId.slice(0, -":any".length) as ProviderDriverId;
     return providerCatalogCandidates.find(
       (candidate) =>
         candidate.driverId === driverId && candidate.credentialSupport === "unsupported",
     );
   }
   return undefined;
+}
+
+export function resolveProviderCatalogCandidateForRuntime(
+  runtime: Omit<PiRuntimeContract, "kind">,
+): ProviderCatalogCandidate | undefined {
+  return providerCatalogCandidates.find(
+    (candidate) => invocationMatches(candidate.invocation, runtime),
+  );
 }
 
 function buildCandidates(): ProviderCatalogCandidate[] {
@@ -54,6 +62,7 @@ function buildCandidates(): ProviderCatalogCandidate[] {
         driverId,
         catalogProviderId,
         api: model.api,
+        providerCompatibilityContract: "none",
         modelId: model.id,
         contextWindow: model.contextWindow,
         ...(model.maxTokens > 0 ? { maxOutputTokens: model.maxTokens } : {}),
@@ -69,7 +78,52 @@ function buildCandidates(): ProviderCatalogCandidate[] {
       });
     }
   }
+  appendDeepSeekResponsesCandidate(candidates);
   return candidates;
+}
+
+function appendDeepSeekResponsesCandidate(candidates: ProviderCatalogCandidate[]): void {
+  const nativeCandidate = candidates.find(
+    (candidate) => candidate.candidateId === "pi/deepseek:deepseek-v4-flash",
+  );
+  if (nativeCandidate === undefined) return;
+
+  candidates.push({
+    ...nativeCandidate,
+    candidateId: "pi/deepseek:deepseek-v4-flash-responses",
+    displayName: "DeepSeek V4 Flash (Responses)",
+    invocation: {
+      ...nativeCandidate.invocation,
+      api: "openai-responses",
+      providerCompatibilityContract: "deepseek-responses-v1",
+    },
+  });
+}
+
+function invocationMatches(
+  candidate: Omit<PiRuntimeContract, "kind">,
+  runtime: Omit<PiRuntimeContract, "kind">,
+): boolean {
+  const providerCompatibilityContract =
+    runtime.providerCompatibilityContract ?? "none";
+  return candidate.piVersion === runtime.piVersion &&
+    candidate.driverId === runtime.driverId &&
+    candidate.catalogProviderId === runtime.catalogProviderId &&
+    candidate.api === runtime.api &&
+    candidate.providerCompatibilityContract === providerCompatibilityContract &&
+    candidate.modelId === runtime.modelId &&
+    candidate.contextWindow === runtime.contextWindow &&
+    candidate.maxOutputTokens === runtime.maxOutputTokens &&
+    primitiveRecordsMatch(candidate.compatibility, runtime.compatibility);
+}
+
+function primitiveRecordsMatch(
+  left: Readonly<Record<string, boolean | number | string>>,
+  right: Readonly<Record<string, boolean | number | string>>,
+): boolean {
+  const leftEntries = Object.entries(left);
+  if (leftEntries.length !== Object.keys(right).length) return false;
+  return leftEntries.every(([key, value]) => right[key] === value);
 }
 
 function primitiveCompatibility(

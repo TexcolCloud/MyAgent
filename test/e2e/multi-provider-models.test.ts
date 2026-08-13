@@ -374,6 +374,125 @@ describe("multi-provider model registry release isolation", () => {
     }
   }, 30_000);
 
+  it("fails a native DeepSeek Responses run before proposing either of two tool calls", async () => {
+    const rawProviderBody = "RAW_MULTI_TOOL_PROVIDER_BODY_SENTINEL_16";
+    const effectFileName = "multi-tool-must-not-execute.log";
+    const cleanup = createAsyncCleanupStack();
+
+    try {
+      const provider = cleanup.use(await FakeOpenAiProvider.start({
+        models: ["deepseek-v4-flash"],
+        responses: [
+          { type: "verification_text", text: "DeepSeek Responses verification passed" },
+          { type: "verification_tool", callId: "verify-deepseek-responses-multi" },
+          {
+            type: "multi_tool",
+            calls: [
+              {
+                callId: "provider-multi-call-1",
+                name: "run_command",
+                arguments: {
+                  program: process.execPath,
+                  args: [
+                    "-e",
+                    `require('node:fs').appendFileSync('${effectFileName}','executed\\n')`,
+                  ],
+                  cwd: ".",
+                  env: {},
+                  timeoutMs: 5_000,
+                },
+              },
+              {
+                callId: "provider-multi-call-2",
+                name: "write_file",
+                arguments: {
+                  path: effectFileName,
+                  content: "executed",
+                  expectedSha256: null,
+                },
+              },
+            ],
+            rawBody: rawProviderBody,
+          },
+        ],
+      }), (active) => active.close());
+      const service = cleanup.use(await startRealTestApp(), (active) => active.close());
+      await service.setupVerifiedModel({
+        connectionSlug: "deepseek-responses-multi",
+        profileSlug: "deepseek-responses-multi",
+        providerBaseUrl: provider.baseUrl,
+        modelId: "deepseek-v4-flash",
+        protocol: "responses",
+        driverId: "pi/deepseek",
+        catalogCandidateId: "pi/deepseek:deepseek-v4-flash-responses",
+        apiKeyEnvironment: "MYAGENT_BEARER_TOKEN",
+        agentId: "primary",
+      });
+      provider.clearCapturedRequests();
+
+      const run = await service.createRun({
+        agentId: "primary",
+        sessionKey: "deepseek:responses:multiple-tools",
+        text: "This malformed response must fail closed.",
+        idempotencyKey: "deepseek-responses-multiple-tools-run",
+      });
+      expect(await service.waitForRunStatus(run.runId, "failed")).toBeDefined();
+      await expect(service.onlyPendingApproval()).rejects.toThrow();
+
+      const runResponse = await service.runRequest(`/v1/runs/${run.runId}`);
+      expect(runResponse.status).toBe(200);
+      const runView = await runResponse.json() as Record<string, unknown>;
+      expect(runView).toMatchObject({
+        status: "failed",
+        failure: { code: "model_protocol_error" },
+      });
+      expect((runView.failure as Record<string, unknown>)).toEqual({
+        code: "model_protocol_error",
+      });
+
+      const events = await service.readRunEvents(run.runId);
+      expect(events.map(({ type }) => type)).not.toEqual(expect.arrayContaining([
+        "tool.proposed",
+        "tool.policy_decided",
+        "approval.required",
+        "tool.started",
+        "tool.completed",
+        "tool.failed",
+      ]));
+      expect(existsSync(path.join(service.primaryWorkspace, effectFileName))).toBe(false);
+
+      const database = new DatabaseSync(service.databasePath, { readOnly: true });
+      let databaseStrings = "";
+      try {
+        expect(database.prepare(
+          "SELECT COUNT(*) AS count FROM tool_calls WHERE run_id = ?",
+        ).get(run.runId)).toEqual({ count: 0 });
+        databaseStrings = JSON.stringify({
+          run: database.prepare(
+            "SELECT state, failure_code FROM runs WHERE run_id = ?",
+          ).get(run.runId),
+          events: database.prepare(
+            "SELECT event_type, payload_json FROM run_events WHERE run_id = ? ORDER BY sequence",
+          ).all(run.runId),
+          health: database.prepare(
+            "SELECT outcome, code, safe_status FROM provider_health WHERE profile_revision_id IS NOT NULL",
+          ).all(),
+          approvals: database.prepare(
+            "SELECT state FROM approvals WHERE run_id = ?",
+          ).all(run.runId),
+        });
+      } finally {
+        database.close();
+      }
+
+      expect(provider.rawResponseBodies.join("\n")).toContain(rawProviderBody);
+      expect(JSON.stringify({ events, logs: service.logs, runView, databaseStrings }))
+        .not.toContain(rawProviderBody);
+    } finally {
+      await cleanup.dispose();
+    }
+  }, 30_000);
+
   it("cleans partial service startup before closing an earlier provider", async () => {
     const cleanup = createAsyncCleanupStack();
     let providerModelsUrl = "";
