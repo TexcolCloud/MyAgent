@@ -102,6 +102,7 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
       : undefined;
     if (requestPath === "/v1/admin" || requestPath.startsWith("/v1/admin/")) {
       if (options.adminToken === undefined || !isAuthorized(authorization, options.adminToken)) {
+        request.log.warn({ code: "unauthorized" }, "HTTP request authentication failed");
         return sendProblem(reply, request, 401, "unauthorized", "Authentication is required.");
       }
       if (!isLoopbackPeer(request.raw.socket.remoteAddress)) {
@@ -111,6 +112,7 @@ export function createHttpApp(options: HttpAppOptions): FastifyInstance {
     }
     if (requestPath === "/v1" || requestPath.startsWith("/v1/")) {
       if (!isAuthorized(authorization, options.bearerToken)) {
+        request.log.warn({ code: "unauthorized" }, "HTTP request authentication failed");
         return sendProblem(reply, request, 401, "unauthorized", "Authentication is required.");
       }
     }

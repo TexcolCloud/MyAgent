@@ -40,6 +40,16 @@ describe("Secret containment", () => {
       expect(response.status).toBe(401);
       await service.shutdown();
 
+      const events = logs.map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ level: "info", message: expect.stringContaining("Server listening") }),
+      ]));
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ level: "warn", code: "unauthorized" }),
+      ]));
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ level: "info", code: "service_stopped" }),
+      ]));
       expect(logs.join("\n")).not.toContain(auth.bearerToken);
       expect(logs.join("\n")).not.toContain(auth.adminToken);
     } finally {

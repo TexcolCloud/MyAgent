@@ -122,10 +122,10 @@ export async function bootstrap(
   const bootConfig = await loadBootConfig(absoluteConfigPath);
   const redactionRegistry = new MutableDynamicRedactionRegistry();
   const environmentSecrets = new EnvironmentSecretResolver();
-  const auth = options.auth ?? {
+  const auth = options.auth === undefined ? {
     bearerToken: environmentSecrets.resolve(bootConfig.server.bearerToken),
     adminToken: environmentSecrets.resolve(bootConfig.server.adminToken),
-  };
+  } : Object.freeze(options.auth);
   const { bearerToken, adminToken } = auth;
   if (bearerToken.length === 0) throw new Error("http_bearer_token_required");
   if (adminToken.length === 0) throw new Error("http_admin_token_required");
@@ -403,6 +403,7 @@ export async function bootstrap(
         () => providerGateway?.stop(),
         () => connection.close(),
       ]);
+      logger.info({ code: "service_stopped" }, "service shutdown completed");
     };
     if (options.signals !== false) {
       const onSignal = (): void => {

@@ -25,14 +25,17 @@ describe("bootstrap", () => {
     const configRoot = path.join(root, "config");
     await cp(path.join(FIXTURES, "valid"), configRoot, { recursive: true });
     const environmentResolve = vi.spyOn(EnvironmentSecretResolver.prototype, "resolve");
+    const auth = { bearerToken: "local-run", adminToken: "local-admin" };
     let service: Awaited<ReturnType<typeof bootstrap>> | undefined;
     try {
       service = await bootstrap(path.join(configRoot, "myagent.yaml"), {
-        auth: { bearerToken: "local-run", adminToken: "local-admin" },
+        auth,
         listen: { host: "127.0.0.1", port: 0 },
         signals: false,
         log: { write: () => {} },
       });
+      expect(Object.isFrozen(auth)).toBe(true);
+      expect(() => { auth.bearerToken = "mutated-run"; }).toThrow(TypeError);
       const response = await fetch(`${service.url}/v1/agents`, {
         headers: { authorization: "Bearer local-run" },
       });
