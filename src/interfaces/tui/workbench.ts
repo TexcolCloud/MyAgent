@@ -22,12 +22,16 @@ import { ChatScreen } from "./screens/chat.js";
 import { InspectorScreen } from "./screens/inspector.js";
 import { NavigationScreen, type WorkbenchDestination } from "./screens/navigation.js";
 import { runModelSetupScreen } from "./screens/model-setup.js";
+import { ProviderScreen } from "./screens/providers.js";
 import type { TuiClient } from "./tui-client.js";
 
 type WorkbenchClient = Pick<TuiClient,
   "listAgents" | "listProviderConnections" | "listModelProfiles" | "runModelSetup" |
   "createRun" | "stream" | "listPendingApprovals" | "decideApproval"
->;
+> & Partial<Pick<TuiClient,
+  "getProviderConnection" | "createProvider" | "reviseProvider" | "discoverProviderModels" |
+  "getProviderModels" | "promoteProvider" | "retireProvider" | "listProviderDrivers" | "getModelProfile"
+>>;
 
 export interface RunWorkbenchOptions {
   readonly client: WorkbenchClient;
@@ -40,6 +44,8 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
   const tui = new TUI(terminal);
   const inspector = new InspectorScreen();
   const chat = new ChatScreen({ client: options.client, onChange: () => tui.requestRender() });
+  let providerScreen: ProviderScreen | undefined;
+  let center: Component = chat;
   let closed = false;
   let modelSetupPending = false;
   let modelSetupReloadRequired = false;
@@ -103,19 +109,39 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     latestExitAttempt = attempt;
   };
   const refresh = (destination: WorkbenchDestination) => {
+    if (destination === "providers" && isProviderClient(options.client)) {
+      const screen = new ProviderScreen({
+        client: options.client,
+        inspector,
+        promptFactory: () => new PiTuiPrompt(tui),
+        onChange: () => tui.requestRender(),
+        onExit: () => {
+          center = chat;
+          tui.setFocus(navigation);
+          tui.requestRender();
+        },
+      });
+      providerScreen = screen;
+      center = screen;
+      tui.setFocus(screen);
+      void screen.load().finally(() => tui.requestRender());
+      return;
+    }
+    center = chat;
+    tui.setFocus(navigation);
     const startedAtReloadEpoch = modelSetupReloadEpoch;
     void loadDestination(options.client, destination, chat, inspector).then((loaded) => {
       if (
         loaded &&
         startedAtReloadEpoch === modelSetupReloadEpoch &&
-        (destination === "providers" || destination === "profiles")
+        destination === "profiles"
       ) {
         modelSetupReloadRequired = false;
       }
     }).finally(() => tui.requestRender());
   };
   const navigation = new NavigationScreen(refresh);
-  tui.addChild(new WorkbenchLayout(navigation, chat, inspector));
+  tui.addChild(new WorkbenchLayout(navigation, () => center, inspector));
   tui.setFocus(navigation);
   const finished = new Promise<void>((resolve) => { resolveExit = resolve; });
 
@@ -127,7 +153,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
       }
       if (exitPrompt !== undefined) return undefined;
       if (exitPending) return { consume: true };
-      if (matchesKey(data, "c") && chatPrompt === undefined && !modelSetupPending && !tui.hasOverlay()) {
+      if (matchesKey(data, "c") && center === chat && chatPrompt === undefined && !modelSetupPending && !tui.hasOverlay()) {
         const prompt = new PiTuiPrompt(tui);
         chatPrompt = prompt;
         const action = submitChat(prompt, chat, () => !exitPending).catch((error: unknown) => {
@@ -141,6 +167,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
         return { consume: true };
       }
       if (matchesKey(data, "r") && !tui.hasOverlay()) {
+        if (center !== chat) return undefined;
         if (chat.busy) return { consume: true };
         const action = chat.reconnect().then(() => undefined).catch((error: unknown) => {
           inspector.showProblem(safeProblem(error, "run_stream_failed", "The committed Run stream is unavailable."));
@@ -148,7 +175,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
         latestChatAction = action;
         return { consume: true };
       }
-      if (matchesKey(data, "a") && !modelSetupPending && !tui.hasOverlay()) {
+      if (matchesKey(data, "a") && center === chat && !modelSetupPending && !tui.hasOverlay()) {
         const screen = new ApprovalScreen({
           client: options.client,
           onChange: () => tui.requestRender(),
@@ -166,7 +193,7 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
         void screen.load();
         return { consume: true };
       }
-      if (!matchesKey(data, "m") || modelSetupPending) return undefined;
+      if (!matchesKey(data, "m") || center !== chat || modelSetupPending || tui.hasOverlay()) return undefined;
       if (modelSetupReloadRequired) {
         inspector.showConflict();
         tui.requestRender();
@@ -217,12 +244,25 @@ export async function runWorkbench(options: RunWorkbenchOptions): Promise<number
     await latestChatAction;
     await latestExitAttempt;
     await approvals?.settled();
+    await providerScreen?.settled();
     return 0;
   } finally {
     if (!closed && tui.hasOverlay()) tui.hideOverlay();
     closed = true;
     tui.stop();
   }
+}
+
+function isProviderClient(client: WorkbenchClient): client is WorkbenchClient & ConstructorParameters<typeof ProviderScreen>[0]["client"] {
+  return typeof client.getProviderConnection === "function" &&
+    typeof client.createProvider === "function" &&
+    typeof client.reviseProvider === "function" &&
+    typeof client.discoverProviderModels === "function" &&
+    typeof client.getProviderModels === "function" &&
+    typeof client.promoteProvider === "function" &&
+    typeof client.retireProvider === "function" &&
+    typeof client.listProviderDrivers === "function" &&
+    typeof client.getModelProfile === "function";
 }
 
 const exitSelectTheme: SelectListTheme = {
@@ -339,21 +379,21 @@ function modelSetupLabel(progress: string): string {
 class WorkbenchLayout implements Component {
   constructor(
     private readonly navigation: NavigationScreen,
-    private readonly chat: ChatScreen,
+    private readonly center: () => Component,
     private readonly inspector: InspectorScreen,
   ) {}
 
   render(width: number): string[] {
     if (width < 36) return [
       ...this.navigation.render(width),
-      ...this.chat.render(width),
+      ...this.center().render(width),
       ...this.inspector.render(width),
     ];
     const navigationWidth = Math.max(14, Math.floor(width * 0.22));
     const inspectorWidth = Math.max(18, Math.floor(width * 0.28));
     const chatWidth = Math.max(1, width - navigationWidth - inspectorWidth - 2);
     const navigation = this.navigation.render(navigationWidth);
-    const chat = this.chat.render(chatWidth);
+    const chat = this.center().render(chatWidth);
     const inspector = this.inspector.render(inspectorWidth);
     const height = Math.max(navigation.length, chat.length, inspector.length);
     return Array.from({ length: height }, (_, index) => line(
