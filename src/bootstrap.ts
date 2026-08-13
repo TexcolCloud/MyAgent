@@ -106,6 +106,13 @@ export interface BootstrappedService {
   shutdown(): Promise<void>;
 }
 
+export function resolveBootstrapProjectStateRoot(
+  configPath: string,
+  projectStateRoot?: string,
+): string {
+  return path.resolve(projectStateRoot ?? path.dirname(path.resolve(configPath)));
+}
+
 const DEFAULT_MODEL_CONTROL = Object.freeze({
   discoveryCacheSeconds: 600,
   discoveryTimeoutMs: 10_000,
@@ -130,7 +137,10 @@ export async function bootstrap(
     Object.freeze(options.auth);
   }
   const absoluteConfigPath = path.resolve(configPath);
-  const projectStateRoot = path.resolve(options.projectStateRoot ?? path.join(process.cwd(), ".myagent"));
+  const projectStateRoot = resolveBootstrapProjectStateRoot(
+    absoluteConfigPath,
+    options.projectStateRoot,
+  );
   const bootConfig = await loadBootConfig(absoluteConfigPath);
   const redactionRegistry = new MutableDynamicRedactionRegistry();
   const environmentSecrets = new EnvironmentSecretResolver();

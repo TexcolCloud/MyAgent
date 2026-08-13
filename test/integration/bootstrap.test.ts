@@ -10,7 +10,7 @@ import { EnvironmentSecretResolver } from "../../src/adapters/environment-secret
 import { openDatabase } from "../../src/adapters/sqlite/database.js";
 import { migrate } from "../../src/adapters/sqlite/migrator.js";
 import { SqliteModelRegistryRepository } from "../../src/adapters/sqlite/model-registry-repository.js";
-import { bootstrap } from "../../src/bootstrap.js";
+import { bootstrap, resolveBootstrapProjectStateRoot } from "../../src/bootstrap.js";
 import {
   modelRegistryEventIdFromUuid,
   parseModelProfileId,
@@ -20,6 +20,28 @@ import { seedVerifiedChatAssignments } from "../helpers/verified-chat-model-regi
 const FIXTURES = fileURLToPath(new URL("../fixtures/config", import.meta.url));
 
 describe("bootstrap", () => {
+  it("derives the project state root from a non-CWD config path", () => {
+    const configPath = path.join(
+      os.tmpdir(),
+      "myagent-bootstrap-project",
+      ".myagent",
+      "myagent.yaml",
+    );
+
+    expect(resolveBootstrapProjectStateRoot(configPath)).toBe(
+      path.dirname(path.resolve(configPath)),
+    );
+  });
+
+  it("prefers an explicit project state root over the config directory", () => {
+    const configPath = path.join(os.tmpdir(), "project", ".myagent", "myagent.yaml");
+    const explicitRoot = path.join(os.tmpdir(), "explicit-project-state");
+
+    expect(resolveBootstrapProjectStateRoot(configPath, explicitRoot)).toBe(
+      path.resolve(explicitRoot),
+    );
+  });
+
   it("uses injected authentication without resolving configured token references", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "myagent-bootstrap-auth-"));
     const configRoot = path.join(root, "config");
