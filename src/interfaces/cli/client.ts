@@ -38,6 +38,14 @@ export class CliValidationError extends Error {
   }
 }
 
+export class CliProtocolError extends Error {
+  readonly code = "invalid_diagnostic_response";
+  readonly detail = "The service returned an invalid diagnostic report.";
+  readonly traceId = "cli";
+
+  constructor() { super("invalid_diagnostic_response"); }
+}
+
 export class CliClient {
   private readonly fetcher: typeof fetch;
   private readonly baseUrl: string;

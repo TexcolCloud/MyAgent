@@ -28,6 +28,7 @@ describe("CLI HTTP boundary", () => {
 
       expect(runLocalHost).toHaveBeenCalledWith({
         configPath: path.join(workspace, ".myagent", "myagent.yaml"),
+        projectStateRoot: path.join(workspace, ".myagent"),
       });
     },
   );
@@ -50,13 +51,14 @@ describe("CLI HTTP boundary", () => {
         secret: async () => { throw new Error("unexpected_secret"); },
         confirm: async () => { events.push("confirm"); return true; },
       },
-      runLocalHost: async ({ configPath: selectedConfigPath }) => {
+      runLocalHost: async ({ configPath: selectedConfigPath, projectStateRoot }) => {
         events.push(`host:${selectedConfigPath}`);
+        events.push(`root:${projectStateRoot}`);
         return 0;
       },
     })).resolves.toBe(0);
 
-    expect(events).toEqual(["confirm", "initialize", `host:${configPath}`]);
+    expect(events).toEqual(["confirm", "initialize", `host:${configPath}`, `root:${path.join(workspace, ".myagent")}`]);
   });
 
   it("fails noninteractively before creating absent project state", async () => {

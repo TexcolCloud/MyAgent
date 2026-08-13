@@ -81,6 +81,7 @@ export interface BootstrapOptions {
     readonly adminToken: string;
   };
   listen?: { host?: string; port?: number };
+  projectStateRoot?: string;
   signals?: boolean;
   log?: {
     write?: (line: string) => void;
@@ -129,6 +130,7 @@ export async function bootstrap(
     Object.freeze(options.auth);
   }
   const absoluteConfigPath = path.resolve(configPath);
+  const projectStateRoot = path.resolve(options.projectStateRoot ?? path.join(process.cwd(), ".myagent"));
   const bootConfig = await loadBootConfig(absoluteConfigPath);
   const redactionRegistry = new MutableDynamicRedactionRegistry();
   const environmentSecrets = new EnvironmentSecretResolver();
@@ -394,7 +396,7 @@ export async function bootstrap(
       ),
       diagnostics: () => collectDiagnostics({
         config: async () => { await loadBootConfig(absoluteConfigPath); },
-        permissions: () => projectStatePermissionsAvailable(path.dirname(databaseConfig.path), databaseConfig.path, access),
+        permissions: () => projectStatePermissionsAvailable(projectStateRoot, databaseConfig.path, access),
         sqlite: () => arraysEqual(readMigrationVersions(connection.db), expectedMigrationVersions),
         secrets: () => activeSecretReferencesResolvable(modelRegistry, process.env, (versionId) => manageSecrets.assertVersionActive(versionId)),
         workers: () => runWorker?.isHealthy() === true && verificationWorker?.isHealthy() === true && expirer?.isHealthy() === true,

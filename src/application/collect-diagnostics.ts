@@ -1,4 +1,5 @@
 import { constants as fsConstants } from "node:fs";
+import path from "node:path";
 
 import type { ManagedSecretVersionId } from "../domain/ids.js";
 
@@ -54,6 +55,7 @@ export async function projectStatePermissionsAvailable(
 ): Promise<boolean> {
   try {
     await access(root, fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK);
+    await access(path.dirname(databasePath), fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK);
     await access(databasePath, fsConstants.R_OK | fsConstants.W_OK);
     return true;
   } catch { return false; }
@@ -89,7 +91,8 @@ export function activeSecretReferencesResolvable(
       if (revision.auth.type === "none") continue;
       const reference = revision.auth.secret;
       if ("fromEnvironment" in reference) {
-        if (!Object.hasOwn(environment, reference.fromEnvironment)) return false;
+        const value = environment[reference.fromEnvironment];
+        if (value === undefined || value.length === 0) return false;
       } else {
         assertManaged(reference.managedSecretVersionId as ManagedSecretVersionId);
       }

@@ -11,6 +11,7 @@ describe("runLocalHost", () => {
       options: BootstrapOptions = {},
     ): Promise<BootstrappedService> => {
       expect(configPath).toBe("C:/project/.myagent/myagent.yaml");
+      expect(options.projectStateRoot).toBe("C:/project/.myagent");
       expect(options.listen).toEqual({ host: "127.0.0.1", port: 0 });
       expect(options.signals).toBe(false);
       expect(options.auth).toBeDefined();
@@ -37,7 +38,7 @@ describe("runLocalHost", () => {
       if (url.pathname === "/v1/admin/model-profiles") {
         return Response.json({ profiles: [] });
       }
-      return Response.json({ agents: [], unavailable: [] });
+      return Response.json({ catalogRevision: "catalog_local_host", agents: [], unavailable: [] });
     }) as typeof fetch;
     const runTui = vi.fn(async (options: RunWorkbenchOptions) => {
       await options.client.listAgents();
@@ -52,6 +53,7 @@ describe("runLocalHost", () => {
     try {
       await expect(runLocalHost({
         configPath: "C:/project/.myagent/myagent.yaml",
+        projectStateRoot: "C:/project/.myagent",
         dependencies: { bootstrapService, runTui },
       })).resolves.toBe(23);
     } finally {
@@ -85,6 +87,7 @@ describe("runLocalHost", () => {
 
     await expect(runLocalHost({
       configPath: "C:/project/.myagent/myagent.yaml",
+      projectStateRoot: "C:/project/.myagent",
       dependencies: { bootstrapService, runTui },
     })).rejects.toBe(tuiError);
 
@@ -102,6 +105,7 @@ describe("runLocalHost", () => {
 
     await expect(runLocalHost({
       configPath: "C:/project/.myagent/myagent.yaml",
+      projectStateRoot: "C:/project/.myagent",
       dependencies: { bootstrapService, runTui },
     })).rejects.toBe(startupError);
 

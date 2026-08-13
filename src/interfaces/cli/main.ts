@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { CliClient, CliCredentialError, CliHttpError, CliValidationError } from "./client.js";
+import { CliClient, CliCredentialError, CliHttpError, CliProtocolError, CliValidationError } from "./client.js";
 import { listAgents, setAgentModel } from "./commands/agents.js";
 import { listApprovals, decideApproval } from "./commands/approvals.js";
 import { createBackup } from "./commands/backup.js";
@@ -47,7 +47,7 @@ export interface ExecuteCliOptions {
   workspace?: string;
   inspectProjectState?: (paths: LocalProjectPaths) => Promise<"ready" | "absent" | "partial">;
   initializeProjectState?: (paths: LocalProjectPaths) => Promise<void>;
-  runLocalHost?: (input: { readonly configPath: string }) => Promise<number>;
+  runLocalHost?: (input: { readonly configPath: string; readonly projectStateRoot: string }) => Promise<number>;
   credentialHelper?: TuiCredentialHelper;
   serveService?: typeof serve;
   validateConfiguration?: typeof validateConfig;
@@ -260,10 +260,10 @@ async function executeLocalTui(flags: CliFlags, options: ExecuteCliOptions): Pro
     await (options.initializeProjectState ?? initializeProjectState)(paths);
   }
   if (options.runLocalHost !== undefined) {
-    return await options.runLocalHost({ configPath: paths.configPath });
+    return await options.runLocalHost({ configPath: paths.configPath, projectStateRoot: paths.root });
   }
   const { runLocalHost } = await import("../local/local-host.js");
-  return await runLocalHost({ configPath: paths.configPath });
+  return await runLocalHost({ configPath: paths.configPath, projectStateRoot: paths.root });
 }
 
 function normalizeAttachedOrigin(value: string): URL {
@@ -431,6 +431,7 @@ function cliFailure(error: unknown): { exitCode: number; problem: CliProblemOutp
   if (error instanceof TuiTokensMustDifferError) return { exitCode: 3, problem: error };
   if (error instanceof TuiCredentialRequiredError) return { exitCode: 3, problem: error };
   if (error instanceof CliValidationError) return { exitCode: 2, problem: error };
+  if (error instanceof CliProtocolError) return { exitCode: 7, problem: error };
   if (error instanceof CliCredentialError) return { exitCode: 3, problem: error };
   if (error instanceof CliHttpError) {
     const problem = { code: error.code, detail: error.detail, traceId: error.traceId };

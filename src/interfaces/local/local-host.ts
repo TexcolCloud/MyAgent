@@ -13,6 +13,7 @@ export interface LocalHostDependencies {
 
 export async function runLocalHost(input: {
   readonly configPath: string;
+  readonly projectStateRoot: string;
   readonly dependencies?: Partial<LocalHostDependencies>;
 }): Promise<number> {
   const bootstrapService = input.dependencies?.bootstrapService ?? bootstrap;
@@ -24,6 +25,7 @@ export async function runLocalHost(input: {
   const service = await bootstrapService(input.configPath, {
     auth: Object.freeze({ bearerToken: runToken, adminToken }),
     listen: { host: "127.0.0.1", port: 0 },
+    projectStateRoot: input.projectStateRoot,
     signals: false,
   });
   try {

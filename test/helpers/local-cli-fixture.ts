@@ -80,8 +80,9 @@ export async function runLocalCliFixture(
       input: async () => "",
       secret: async () => "",
     },
-    runLocalHost: async ({ configPath }) => runLocalHost({
+    runLocalHost: async ({ configPath, projectStateRoot }) => runLocalHost({
       configPath,
+      projectStateRoot,
       dependencies: {
         ...(generatedTokens === undefined
           ? {}

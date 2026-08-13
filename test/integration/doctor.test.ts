@@ -62,9 +62,28 @@ describe("doctor diagnostics", () => {
       writeError: (line) => stderr.push(line),
     });
 
-    expect(exitCode).toBe(6);
-    expect(JSON.parse(stdout[0]!)).toMatchObject({ code: "service_unavailable" });
+    expect(exitCode).toBe(7);
+    expect(JSON.parse(stdout[0]!)).toEqual({
+      code: "invalid_diagnostic_response",
+      detail: "The service returned an invalid diagnostic report.",
+      traceId: "cli",
+    });
     expect(stdout.join("\n")).not.toContain("secret-value");
+    expect(stderr.join("\n")).not.toContain("secret-value");
+  });
+
+  it("reports malformed human responses as a safe protocol error on stderr", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const exitCode = await executeCli(["doctor", "--api-url", "http://127.0.0.1:8787", "--admin-token", "admin-token"], {
+      fetcher: async () => Response.json({ checks: [], raw: "secret-value" }),
+      write: (line) => stdout.push(line),
+      writeError: (line) => stderr.push(line),
+    });
+
+    expect(exitCode).toBe(7);
+    expect(stdout).toEqual([]);
+    expect(stderr).toEqual(["invalid_diagnostic_response: The service returned an invalid diagnostic report. (traceId: cli)"]);
     expect(stderr.join("\n")).not.toContain("secret-value");
   });
 
