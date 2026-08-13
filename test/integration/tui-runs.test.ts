@@ -127,6 +127,35 @@ describe("TUI Run history transport", () => {
     expect(screen.render(120).join("\n")).toContain("Run is not terminal.");
   });
 
+  it("renders allowlisted active Run context without serializing unapproved fields", async () => {
+    const active = {
+      ...run("run_active", "running", "2026-08-13T00:00:01.000Z"),
+      sessionId: "ses_context",
+      agentId: "context-agent",
+      fifoSequence: 7,
+      parentRunId: "run_parent",
+      rootRunId: "run_root",
+      delegationDepth: 2,
+      budget: { modelTurns: 3, toolCalls: 4, childRuns: 1, delegationDepth: 2, activeExecutionSeconds: 12.5, toolOutputBytes: 256 },
+      providerPayload: { authorization: "Bearer secret-value" },
+      toolArguments: { token: "raw-token-value" },
+      internalError: "private-stack-trace",
+    };
+    const screen = new RunsScreen({
+      client: { listRunHistory: vi.fn(async () => ({ items: [active] })), getRun: vi.fn(async () => active), cancelRun: vi.fn() },
+      inspector: new InspectorScreen(),
+      promptFactory: () => ({ input: async () => "", confirm: async () => true } as never),
+    });
+
+    await screen.loadFor("researcher", "session:review");
+    screen.handleInput("\r");
+    await screen.settled();
+
+    const frame = screen.render(120).join("\n");
+    for (const expected of ["context-agent", "ses_context", "run_parent", "run_root", "FIFO: 7", "Delegation depth: 2", "Model turns: 3", "Tool calls: 4"]) expect(frame).toContain(expected);
+    for (const forbidden of ["secret-value", "raw-token-value", "private-stack-trace", "providerPayload", "toolArguments", "internalError"]) expect(frame).not.toContain(forbidden);
+  });
+
   it("locks Run controls after a revision conflict and does not retry cancellation", async () => {
     const initial = run("run_1", "running", "2026-08-13T00:00:00.000Z");
     const cancelRun = vi.fn(async () => { throw new CliHttpError(409, "revision_conflict", "changed", "trace"); });

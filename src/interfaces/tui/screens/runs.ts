@@ -100,7 +100,22 @@ export class RunsScreen implements Component, Focusable {
   private detailLines(): readonly string[] {
     const detail = this.selectedDetail;
     if (detail === undefined) return [];
-    const lines = [`Detail: ${detail.runId}`, `State: ${detail.status}`, `Updated: ${detail.updatedAt}`];
+    const lines = [
+      `Detail: ${detail.runId}`,
+      `State: ${detail.status}`,
+      `Agent: ${detail.agentId}`,
+      `Session: ${detail.sessionId}`,
+      `Root Run: ${detail.rootRunId}`,
+      `Parent Run: ${detail.parentRunId ?? "none"}`,
+      `FIFO: ${detail.fifoSequence}`,
+      `Delegation depth: ${detail.delegationDepth}`,
+      `Model turns: ${detail.budget.modelTurns}`,
+      `Tool calls: ${detail.budget.toolCalls}`,
+      `Child Runs: ${detail.budget.childRuns}`,
+      `Active seconds: ${detail.budget.activeExecutionSeconds}`,
+      `Tool output bytes: ${detail.budget.toolOutputBytes}`,
+      `Updated: ${detail.updatedAt}`,
+    ];
     if (detail.status === "completed") return [...lines, ...displayResult(detail.result)];
     if (detail.status === "failed") return [...lines, `Failure: ${detail.failure?.code ?? "run_failed"}`];
     return [...lines, "Run is not terminal."];
