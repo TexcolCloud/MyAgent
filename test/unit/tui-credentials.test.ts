@@ -9,12 +9,16 @@ describe("readTuiCredentials", () => {
     await expect(readTuiCredentials({
       environment: {},
       promptSecret: async (label) => { labels.push(label); return `${labels.length}`; },
-    })).resolves.toEqual({ runToken: "1", adminToken: "2" });
+    })).resolves.toEqual({
+      runToken: "1",
+      adminToken: "2",
+      sources: { run: "masked prompt", admin: "masked prompt" },
+    });
 
     expect(labels).toEqual(["Run token", "Admin token"]);
   });
 
-  it("uses configured tokens without prompting and freezes the returned credentials", async () => {
+  it("uses controlled environment tokens without prompting and reports only their source", async () => {
     const promptSecret = async (): Promise<string> => { throw new Error("unexpected_prompt"); };
 
     const credentials = await readTuiCredentials({
@@ -22,8 +26,27 @@ describe("readTuiCredentials", () => {
       promptSecret,
     });
 
-    expect(credentials).toEqual({ runToken: "run-secret", adminToken: "admin-secret" });
+    expect(credentials).toEqual({
+      runToken: "run-secret",
+      adminToken: "admin-secret",
+      sources: { run: "environment", admin: "environment" },
+    });
     expect(Object.isFrozen(credentials)).toBe(true);
+    expect(Object.isFrozen(credentials.sources)).toBe(true);
+  });
+
+  it("prefers a credential helper and fills only missing credentials from controlled environment", async () => {
+    const credentialHelper = async () => ({ runToken: "helper-run" });
+
+    await expect(readTuiCredentials({
+      environment: { MYAGENT_RUN_TOKEN: "environment-run", MYAGENT_ADMIN_TOKEN: "environment-admin" },
+      credentialHelper,
+      promptSecret: async () => { throw new Error("unexpected_prompt"); },
+    })).resolves.toEqual({
+      runToken: "helper-run",
+      adminToken: "environment-admin",
+      sources: { run: "credential helper", admin: "environment" },
+    });
   });
 
   it("rejects blank hidden Run credentials without returning token text", async () => {

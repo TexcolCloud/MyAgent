@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { fileURLToPath } from "node:url";
 
@@ -9,6 +11,206 @@ import { startTestApp } from "../helpers/start-test-app.js";
 import { tempPath } from "../helpers/temp-dir.js";
 
 describe("CLI HTTP boundary", () => {
+  it.each([[[]], [["tui"]], [["tui", "--local"]]])(
+    "routes %j to a workspace-scoped Local Integrated Host",
+    async (argumentsList) => {
+      const { executeCli } = await import("../../src/interfaces/cli/main.js");
+      const workspace = tempPath(`cli-local-ready-${randomUUID()}`);
+      const runLocalHost = vi.fn(async () => 0);
+
+      await expect(executeCli(argumentsList, {
+        workspace,
+        stdinIsTTY: true,
+        stdoutIsTTY: true,
+        inspectProjectState: async () => "ready",
+        runLocalHost,
+      })).resolves.toBe(0);
+
+      expect(runLocalHost).toHaveBeenCalledWith({
+        configPath: path.join(workspace, ".myagent", "myagent.yaml"),
+      });
+    },
+  );
+
+  it("requires first-run consent before initialization and honors an explicit local config", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-init-${randomUUID()}`);
+    const configPath = path.join(workspace, "controlled", "local.yaml");
+    const events: string[] = [];
+
+    await expect(executeCli(["tui", "--config", configPath], {
+      workspace,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      inspectProjectState: async () => "absent",
+      initializeProjectState: async () => { events.push("initialize"); },
+      prompt: {
+        select: async () => { throw new Error("unexpected_select"); },
+        input: async () => { throw new Error("unexpected_input"); },
+        secret: async () => { throw new Error("unexpected_secret"); },
+        confirm: async () => { events.push("confirm"); return true; },
+      },
+      runLocalHost: async ({ configPath: selectedConfigPath }) => {
+        events.push(`host:${selectedConfigPath}`);
+        return 0;
+      },
+    })).resolves.toBe(0);
+
+    expect(events).toEqual(["confirm", "initialize", `host:${configPath}`]);
+  });
+
+  it("fails noninteractively before creating absent project state", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-noninteractive-${randomUUID()}`);
+    const initializeProjectState = vi.fn(async () => undefined);
+
+    await expect(executeCli([], {
+      workspace,
+      stdinIsTTY: false,
+      stdoutIsTTY: false,
+      initializeProjectState,
+    })).resolves.toBe(2);
+
+    expect(initializeProjectState).not.toHaveBeenCalled();
+    await expect(stat(path.join(workspace, ".myagent"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not initialize project state when first-run consent is declined", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-declined-${randomUUID()}`);
+    const initializeProjectState = vi.fn(async () => undefined);
+
+    await expect(executeCli([], {
+      workspace,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      inspectProjectState: async () => "absent",
+      initializeProjectState,
+      prompt: {
+        select: async () => { throw new Error("unexpected_select"); },
+        input: async () => { throw new Error("unexpected_input"); },
+        secret: async () => { throw new Error("unexpected_secret"); },
+        confirm: async () => false,
+      },
+    })).resolves.toBe(2);
+
+    expect(initializeProjectState).not.toHaveBeenCalled();
+    await expect(stat(path.join(workspace, ".myagent"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects partial local state without initializing or starting a host", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const workspace = tempPath(`cli-local-partial-${randomUUID()}`);
+    const root = path.join(workspace, ".myagent");
+    await mkdir(root, { recursive: true });
+    await writeFile(path.join(root, "myagent.yaml"), "version: 2\n");
+    const initializeProjectState = vi.fn(async () => undefined);
+    const runLocalHost = vi.fn(async () => 0);
+
+    await expect(executeCli([], {
+      workspace,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      initializeProjectState,
+      runLocalHost,
+    })).resolves.toBe(2);
+
+    expect(initializeProjectState).not.toHaveBeenCalled();
+    expect(runLocalHost).not.toHaveBeenCalled();
+  });
+
+  it("rejects ambiguous local and attached syntax before acquiring credentials", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const prompt = {
+      select: vi.fn(), input: vi.fn(), secret: vi.fn(), confirm: vi.fn(),
+    };
+
+    await expect(executeCli([
+      "tui", "--local", "--api-url", "http://127.0.0.1:8787",
+    ], { stdinIsTTY: true, stdoutIsTTY: true, prompt })).resolves.toBe(2);
+
+    expect(prompt.secret).not.toHaveBeenCalled();
+  });
+
+  it("attaches to a normalized loopback origin without probing and reports credential sources", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const output: string[] = [];
+    const fetcher = vi.fn();
+    const runTui = vi.fn();
+
+    await expect(executeCli(["tui", "--api-url", "http://127.0.0.1:8787"], {
+      environment: { MYAGENT_RUN_TOKEN: "run-secret", MYAGENT_ADMIN_TOKEN: "admin-secret" },
+      fetcher,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      runTui,
+      write: (line) => output.push(line),
+    })).resolves.toBe(0);
+
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(runTui).toHaveBeenCalledOnce();
+    expect(output).toEqual([
+      "Origin: http://127.0.0.1:8787",
+      "TLS: disabled",
+      "Run credential source: environment",
+      "Admin credential source: environment",
+    ]);
+    expect(output.join("\n")).not.toContain("run-secret");
+    expect(output.join("\n")).not.toContain("admin-secret");
+  });
+
+  it("requires an override and exact normalized-origin confirmation for remote attachment", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const origin = "https://example.com";
+    const environment = { MYAGENT_RUN_TOKEN: "run-secret", MYAGENT_ADMIN_TOKEN: "admin-secret" };
+    const runTui = vi.fn();
+    const secret = vi.fn();
+
+    const credentialHelper = vi.fn(async () => ({ runToken: "helper-run", adminToken: "helper-admin" }));
+    await expect(executeCli(["tui", "--api-url", `${origin}:443`], {
+      environment: {}, credentialHelper, stdinIsTTY: true, stdoutIsTTY: true, runTui,
+    })).resolves.toBe(2);
+    expect(credentialHelper).not.toHaveBeenCalled();
+    await expect(executeCli(["tui", "--api-url", `${origin}:443`, "--allow-remote"], {
+      environment,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      prompt: {
+        select: async () => { throw new Error("unexpected_select"); },
+        input: async () => `${origin}:443`,
+        secret,
+        confirm: async () => false,
+      },
+      runTui,
+    })).resolves.toBe(2);
+    await expect(executeCli(["tui", "--api-url", `${origin}:443`, "--allow-remote"], {
+      environment,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      prompt: {
+        select: async () => { throw new Error("unexpected_select"); },
+        input: async () => origin,
+        secret,
+        confirm: async () => false,
+      },
+      runTui,
+    })).resolves.toBe(0);
+
+    expect(secret).not.toHaveBeenCalled();
+    expect(runTui).toHaveBeenCalledOnce();
+  });
+
+  it("preserves root myagent.yaml defaults for serve and config validate", async () => {
+    const { executeCli } = await import("../../src/interfaces/cli/main.js");
+    const serveService = vi.fn(async () => undefined);
+    const validateConfiguration = vi.fn(async () => undefined);
+
+    await expect(executeCli(["serve"], { serveService })).resolves.toBe(0);
+    await expect(executeCli(["config", "validate"], { validateConfiguration })).resolves.toBe(0);
+
+    expect(serveService).toHaveBeenCalledWith("myagent.yaml");
+    expect(validateConfiguration).toHaveBeenCalledWith("myagent.yaml", expect.any(Function));
+  });
   it("returns one Problem and does not invoke the TUI boundary without an interactive terminal", async () => {
     const { executeCli } = await import("../../src/interfaces/cli/main.js");
     const output: string[] = [];
@@ -55,6 +257,10 @@ describe("CLI HTTP boundary", () => {
 
     expect(output).toEqual([
       "invalid_cli_command: The CLI command is invalid. (traceId: cli)",
+      "Origin: http://127.0.0.1:8787",
+      "TLS: disabled",
+      "Run credential source: environment",
+      "Admin credential source: environment",
     ]);
     expect(runTui).toHaveBeenCalledOnce();
     expect(output.join("\n")).not.toContain("token");

@@ -3,8 +3,20 @@ export interface TuiCredentials {
   readonly adminToken: string;
 }
 
+export type TuiCredentialSource = "credential helper" | "environment" | "masked prompt";
+
+export interface ReadTuiCredentialsResult extends TuiCredentials {
+  readonly sources: {
+    readonly run: TuiCredentialSource;
+    readonly admin: TuiCredentialSource;
+  };
+}
+
+export type TuiCredentialHelper = () => Promise<Partial<TuiCredentials> | undefined>;
+
 export interface ReadTuiCredentialsOptions {
   readonly environment: Readonly<Record<string, string | undefined>>;
+  readonly credentialHelper?: TuiCredentialHelper;
   readonly promptSecret: (label: "Run token" | "Admin token") => Promise<string>;
 }
 
@@ -30,30 +42,43 @@ export class TuiTokensMustDifferError extends Error {
   }
 }
 
-export async function readTuiCredentials(options: ReadTuiCredentialsOptions): Promise<TuiCredentials> {
-  const runToken = await readCredential(
+export async function readTuiCredentials(options: ReadTuiCredentialsOptions): Promise<ReadTuiCredentialsResult> {
+  const helped = await options.credentialHelper?.() ?? {};
+  const run = await readCredential(
+    helped.runToken,
     options.environment.MYAGENT_RUN_TOKEN,
     "Run token",
     "run_token_required",
     options.promptSecret,
   );
-  const adminToken = await readCredential(
+  const admin = await readCredential(
+    helped.adminToken,
     options.environment.MYAGENT_ADMIN_TOKEN,
     "Admin token",
     "admin_token_required",
     options.promptSecret,
   );
-  if (runToken === adminToken) throw new TuiTokensMustDifferError();
-  return Object.freeze({ runToken, adminToken });
+  if (run.value === admin.value) throw new TuiTokensMustDifferError();
+  return Object.freeze({
+    runToken: run.value,
+    adminToken: admin.value,
+    sources: Object.freeze({ run: run.source, admin: admin.source }),
+  });
 }
 
 async function readCredential(
+  helped: string | undefined,
   configured: string | undefined,
   label: "Run token" | "Admin token",
   code: "run_token_required" | "admin_token_required",
   promptSecret: ReadTuiCredentialsOptions["promptSecret"],
-): Promise<string> {
-  const value = configured ?? await promptSecret(label);
+): Promise<{ readonly value: string; readonly source: TuiCredentialSource }> {
+  const source = helped !== undefined
+    ? "credential helper"
+    : configured !== undefined
+      ? "environment"
+      : "masked prompt";
+  const value = helped ?? configured ?? await promptSecret(label);
   if (value.trim().length === 0) throw new TuiCredentialRequiredError(code);
-  return value;
+  return { value, source };
 }

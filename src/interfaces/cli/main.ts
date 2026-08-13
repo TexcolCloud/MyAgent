@@ -14,7 +14,18 @@ import { deleteSession, listSessions } from "./commands/sessions.js";
 import { reconcileTool } from "./commands/tools.js";
 import { getVerification } from "./commands/verifications.js";
 import { writeProblem, type CliProblemOutput, type CliWrite } from "./formatters.js";
-import { readTuiCredentials, TuiCredentialRequiredError, TuiTokensMustDifferError } from "../tui/credentials.js";
+import {
+  readTuiCredentials,
+  TuiCredentialRequiredError,
+  TuiTokensMustDifferError,
+  type TuiCredentialHelper,
+} from "../tui/credentials.js";
+import {
+  initializeProjectState,
+  inspectProjectState,
+  resolveLocalProjectPaths,
+  type LocalProjectPaths,
+} from "../local/project-state.js";
 import { assertInteractiveTty, InteractiveTtyRequiredError } from "../tui/tty.js";
 import { TuiClient } from "../tui/tui-client.js";
 import { runWorkbench, type RunWorkbenchOptions } from "../tui/workbench.js";
@@ -32,6 +43,13 @@ export interface ExecuteCliOptions {
   stdinIsTTY?: boolean;
   stdoutIsTTY?: boolean;
   runTui?: (options: RunWorkbenchOptions) => Promise<void>;
+  workspace?: string;
+  inspectProjectState?: (paths: LocalProjectPaths) => Promise<"ready" | "absent" | "partial">;
+  initializeProjectState?: (paths: LocalProjectPaths) => Promise<void>;
+  runLocalHost?: (input: { readonly configPath: string }) => Promise<number>;
+  credentialHelper?: TuiCredentialHelper;
+  serveService?: typeof serve;
+  validateConfiguration?: typeof validateConfig;
 }
 
 export async function executeCli(argumentsList: readonly string[], options: ExecuteCliOptions = {}): Promise<number> {
@@ -42,22 +60,56 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
   try {
     const { positional, flags } = parseArguments(argumentsList);
     json = booleanFlag(flags, "json");
-    const command = positional[0] === "backup" ? "backup" : positional.slice(0, 2).join(" ");
+    const command = positional.length === 0
+      ? "local"
+      : positional[0] === "backup"
+        ? "backup"
+        : positional.slice(0, 2).join(" ");
     assertCommandGrammar(command, positional.length, flags);
     if (command === "tui") {
+      if (booleanFlag(flags, "local") && stringFlag(flags, "api-url") !== undefined) {
+        throw new CliUsageError("tui_mode_conflict", "Choose Local or Attached TUI Mode.");
+      }
+      if (stringFlag(flags, "api-url") === undefined) {
+        if (booleanFlag(flags, "allow-remote")) {
+          throw new CliUsageError("invalid_cli_option", "Remote attachment requires an API URL.");
+        }
+        return await executeLocalTui(flags, options);
+      }
+      if (stringFlag(flags, "config") !== undefined) {
+        throw new CliUsageError("invalid_cli_option", "Attached TUI Mode does not use project configuration.");
+      }
       assertInteractiveTty({
         stdinIsTTY: options.stdinIsTTY ?? process.stdin.isTTY === true,
         stdoutIsTTY: options.stdoutIsTTY ?? process.stdout.isTTY === true,
       });
+      const origin = normalizeAttachedOrigin(requiredFlag(flags, "api-url"));
+      const remote = !isLoopbackHostname(origin.hostname);
+      if (remote && !booleanFlag(flags, "allow-remote")) {
+        throw new CliUsageError("remote_tui_forbidden", "Remote TUI attachment requires --allow-remote.");
+      }
       const credentials = await readTuiCredentials({
         environment,
+        ...(options.credentialHelper === undefined ? {} : { credentialHelper: options.credentialHelper }),
         promptSecret: (label) => (options.prompt ?? createConsolePrompt()).secret(label),
       });
+      writeAttachedSummary(write, origin, credentials.sources);
+      if (remote) {
+        const confirmation = await (options.prompt ?? createConsolePrompt()).input(
+          `Type ${origin.origin} to confirm remote attachment`,
+        );
+        if (confirmation !== origin.origin) {
+          throw new CliUsageError(
+            "remote_origin_confirmation_required",
+            "Remote attachment requires the exact normalized origin.",
+          );
+        }
+      }
       const workbenchOptions: RunWorkbenchOptions = {
         client: new TuiClient({
           runToken: credentials.runToken,
           adminToken: credentials.adminToken,
-          ...(stringFlag(flags, "api-url") === undefined ? {} : { apiUrl: requiredFlag(flags, "api-url") }),
+          apiUrl: origin.origin,
           ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
         }),
       };
@@ -65,12 +117,16 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
       else await runWorkbench(workbenchOptions);
       return 0;
     }
+    if (command === "local") return await executeLocalTui(flags, options);
     if (command === "serve") {
-      await serve(stringFlag(flags, "config") ?? "myagent.yaml");
+      await (options.serveService ?? serve)(stringFlag(flags, "config") ?? "myagent.yaml");
       return 0;
     }
     if (command === "config validate") {
-      await validateConfig(stringFlag(flags, "config") ?? "myagent.yaml", write);
+      await (options.validateConfiguration ?? validateConfig)(
+        stringFlag(flags, "config") ?? "myagent.yaml",
+        write,
+      );
       return 0;
     }
 
@@ -169,6 +225,81 @@ export async function executeCli(argumentsList: readonly string[], options: Exec
   }
 }
 
+async function executeLocalTui(flags: CliFlags, options: ExecuteCliOptions): Promise<number> {
+  assertInteractiveTty({
+    stdinIsTTY: options.stdinIsTTY ?? process.stdin.isTTY === true,
+    stdoutIsTTY: options.stdoutIsTTY ?? process.stdout.isTTY === true,
+  });
+  const paths = resolveLocalProjectPaths(
+    options.workspace ?? process.cwd(),
+    stringFlag(flags, "config"),
+  );
+  const inspect = options.inspectProjectState ?? inspectProjectState;
+  const state = await inspect(paths);
+  if (state === "partial") {
+    throw new CliUsageError(
+      "partial_project_state",
+      "Project Agent State is incomplete and cannot be initialized automatically.",
+    );
+  }
+  if (state === "absent") {
+    const consent = await (options.prompt ?? createConsolePrompt()).confirm(
+      `Initialize Project Agent State at ${paths.root}?`,
+    );
+    if (!consent) {
+      throw new CliUsageError(
+        "project_initialization_declined",
+        "Project Agent State initialization was not approved.",
+      );
+    }
+    await (options.initializeProjectState ?? initializeProjectState)(paths);
+  }
+  if (options.runLocalHost !== undefined) {
+    return await options.runLocalHost({ configPath: paths.configPath });
+  }
+  const { runLocalHost } = await import("../local/local-host.js");
+  return await runLocalHost({ configPath: paths.configPath });
+}
+
+function normalizeAttachedOrigin(value: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new CliUsageError("invalid_api_url", "The API URL must be an HTTP origin.");
+  }
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:")
+    || url.username.length > 0
+    || url.password.length > 0
+    || (url.pathname !== "/" && url.pathname !== "")
+    || url.search.length > 0
+    || url.hash.length > 0
+  ) {
+    throw new CliUsageError("invalid_api_url", "The API URL must be an HTTP origin.");
+  }
+  return new URL(url.origin);
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  if (hostname === "localhost" || hostname === "[::1]") return true;
+  const octets = hostname.split(".");
+  return octets.length === 4
+    && octets.every((octet) => /^\d{1,3}$/u.test(octet) && Number(octet) <= 255)
+    && octets[0] === "127";
+}
+
+function writeAttachedSummary(
+  write: CliWrite,
+  origin: URL,
+  sources: { readonly run: string; readonly admin: string },
+): void {
+  write(`Origin: ${origin.origin}`);
+  write(`TLS: ${origin.protocol === "https:" ? "enabled" : "disabled"}`);
+  write(`Run credential source: ${sources.run}`);
+  write(`Admin credential source: ${sources.admin}`);
+}
+
 type CliFlags = Readonly<Record<string, string | true>>;
 
 class CliUsageError extends Error {
@@ -179,7 +310,9 @@ class CliUsageError extends Error {
 function parseArguments(argumentsList: readonly string[]): { positional: string[]; flags: CliFlags } {
   const positional: string[] = [];
   const flags: Record<string, string | true> = {};
-  const switches = new Set(["json", "api-key-stdin", "allow-insecure-http", "manual-entry"]);
+  const switches = new Set([
+    "json", "api-key-stdin", "allow-insecure-http", "manual-entry", "local", "allow-remote",
+  ]);
   for (let index = 0; index < argumentsList.length; index += 1) {
     const argument = argumentsList[index]!;
     if (!argument.startsWith("--")) { positional.push(argument); continue; }
@@ -322,12 +455,13 @@ const ADMIN_COMMANDS = new Set([
 
 const RUN_FLAGS = ["api-url", "token", "json"] as const;
 const ADMIN_FLAGS = ["api-url", "admin-token", "json"] as const;
-const TUI_FLAGS = ["api-url"] as const;
+const TUI_FLAGS = ["api-url", "local", "config", "allow-remote"] as const;
 const COMMAND_GRAMMAR: Readonly<Record<string, {
   readonly positional: number;
   readonly flags: readonly string[];
 }>> = {
   serve: { positional: 1, flags: ["config"] },
+  local: { positional: 0, flags: ["config"] },
   tui: { positional: 1, flags: TUI_FLAGS },
   "config validate": { positional: 2, flags: ["config", "json"] },
   "config reload": { positional: 2, flags: RUN_FLAGS },
